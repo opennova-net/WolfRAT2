@@ -6,7 +6,8 @@ All commands go through the same protocol.py path as the desktop UI.
 """
 
 import asyncio
-from dataclasses import fields, is_dataclass
+from concurrent.futures import Future, InvalidStateError
+from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum
 import json
 import os
@@ -18,17 +19,12 @@ import time
 import logging
 from collections.abc import Mapping
 
-# Suppress aiohttp access logs (noisy GET /api/status every 5s)
-logging.getLogger('aiohttp.access').setLevel(logging.WARNING)
-
-try:
-    from aiohttp import web
-    HAS_AIOHTTP = True
-except ImportError:
-    HAS_AIOHTTP = False
+from aiohttp import web
 
 from wolfrat.protocol import wire_log
 
+# Suppress aiohttp access logs (noisy GET /api/status every 5s)
+logging.getLogger('aiohttp.access').setLevel(logging.WARNING)
 
 _SECRET_SETTING_NAMES = frozenset({
     'serverpassword',
@@ -66,61 +62,78 @@ def generate_token():
     return secrets.token_urlsafe(32)
 
 
+@dataclass(frozen=True)
+class WebServerStartResult:
+    """The observable outcome of binding one web-server lifecycle."""
+
+    ok: bool
+    error: str | None = None
+
+
 class WolfWebServer:
     """Embedded web server for WolfRAT mobile access."""
 
     def __init__(self, server_manager, host='0.0.0.0', port=8070):
         self.sm = server_manager
-        self._enabled = False
         self._running = False
+        self._lifecycle_lock = threading.RLock()
+        self._state_lock = threading.Lock()
+        self._lifecycle_id = 0
+        self._stop_requested = None
+        self._start_future = None
         self._auth_lock = threading.Lock()
         self._web_username = "admin"
         self._web_token = None
-
-        if not HAS_AIOHTTP:
-            wire_log("WEB SERVER: aiohttp not installed, web server disabled")
-            return
-
-        self._enabled = True
-        self._template_path = _get_template_path()
-        wire_log(f"WEB SERVER: template path = {self._template_path} (exists={os.path.exists(self._template_path)})")
         self.host = host
         self.port = port
-        self._app = web.Application()
         self._ws_clients = set()
         self._loop = None
         self._thread = None
         self._runner = None
         self._last_broadcast = 0
-        self._broadcast_interval = 1.0  # seconds between WebSocket pushes
+        self._broadcast_interval = 1.0
+
+        self._template_path = _get_template_path()
+        wire_log(f"WEB SERVER: template path = {self._template_path} (exists={os.path.exists(self._template_path)})")
 
         # Auth state — separate from JO server credentials
         self._login_ips = {}  # {ip: last_login_timestamp}
         self.on_login = None  # callback(ip, timestamp) for persistence
 
+    def _create_application(self):
+        """Build one aiohttp application for one event-loop lifecycle."""
+        application = web.Application()
+
         # Routes (public)
-        self._app.router.add_get('/', self._handle_index)
-        self._app.router.add_post('/api/auth', self._handle_auth)
-        self._app.router.add_get('/static/style.css', self._handle_css)
-        self._app.router.add_get('/static/app.js', self._handle_js)
+        application.router.add_get('/', self._handle_index)
+        application.router.add_post('/api/auth', self._handle_auth)
+        application.router.add_get('/static/style.css', self._handle_css)
+        application.router.add_get('/static/app.js', self._handle_js)
 
         # Routes (protected)
-        self._app.router.add_get('/api/status', self._handle_status)
-        self._app.router.add_get('/api/players', self._handle_players)
-        self._app.router.add_get('/api/chat', self._handle_chat)
-        self._app.router.add_get('/api/maps', self._handle_maps)
-        self._app.router.add_get('/api/settings', self._handle_settings)
-        self._app.router.add_get('/api/login-ips', self._handle_login_ips)
-        self._app.router.add_post('/api/action', self._handle_quick_action)
-        self._app.router.add_post('/api/command', self._handle_command)
-        self._app.router.add_post('/api/chat/send', self._handle_send_chat)
-        self._app.router.add_post('/api/player/action', self._handle_player_action)
-        self._app.router.add_post('/api/map/switch', self._handle_map_switch)
-        self._app.router.add_get('/ws', self._handle_websocket)
+        application.router.add_get('/api/status', self._handle_status)
+        application.router.add_get('/api/players', self._handle_players)
+        application.router.add_get('/api/chat', self._handle_chat)
+        application.router.add_get('/api/maps', self._handle_maps)
+        application.router.add_get('/api/settings', self._handle_settings)
+        application.router.add_get('/api/login-ips', self._handle_login_ips)
+        application.router.add_post('/api/action', self._handle_quick_action)
+        application.router.add_post('/api/command', self._handle_command)
+        application.router.add_post('/api/chat/send', self._handle_send_chat)
+        application.router.add_post('/api/player/action', self._handle_player_action)
+        application.router.add_post('/api/map/switch', self._handle_map_switch)
+        application.router.add_get('/ws', self._handle_websocket)
+        return application
 
     @property
     def is_running(self):
-        return self._running
+        with self._state_lock:
+            return self._running
+
+    @property
+    def application(self):
+        """Return the aiohttp application for an external HTTP host."""
+        return self._create_application()
 
     def set_auth(self, username, token):
         """Set the web admin credentials (called from WebAdminTab)."""
@@ -130,67 +143,212 @@ class WolfWebServer:
 
     def start(self):
         """Start the web server in a background thread."""
-        if not self._enabled or self._running:
-            return
-        self._running = True
-        self._thread = threading.Thread(target=self._run, daemon=True, name="WolfWeb")
-        self._thread.start()
+        with self._lifecycle_lock:
+            with self._state_lock:
+                if self._thread is not None and self._thread.is_alive():
+                    return self._start_future
+
+                self._lifecycle_id += 1
+                lifecycle_id = self._lifecycle_id
+                stop_requested = threading.Event()
+                start_future = Future()
+                host = self.host
+                port = self.port
+                thread = threading.Thread(
+                    target=self._run,
+                    args=(
+                        lifecycle_id,
+                        stop_requested,
+                        start_future,
+                        host,
+                        port,
+                    ),
+                    daemon=True,
+                    name="WolfWeb",
+                )
+                self._running = False
+                self._loop = None
+                self._runner = None
+                self._stop_requested = stop_requested
+                self._start_future = start_future
+                self._thread = thread
+            thread.start()
+            return start_future
 
     def stop(self):
         """Stop the web server completely. Port is released, thread exits."""
-        if not self._running:
-            return  # Already stopped
-        self._running = False
-        if self._loop:
-            # Schedule cleanup in the event loop
-            async def _shutdown():
-                # Close all WebSocket connections
-                for ws in list(self._ws_clients):
+        with self._lifecycle_lock:
+            with self._state_lock:
+                thread = self._thread
+                if thread is None:
+                    self._running = False
+                    return
+                if thread is threading.current_thread():
+                    raise RuntimeError("WolfWeb cannot join its own worker thread")
+                was_running = self._running
+                self._running = False
+                loop = self._loop
+                stop_requested = self._stop_requested
+                start_future = self._start_future
+                if stop_requested is not None:
+                    stop_requested.set()
+            if start_future is not None and not start_future.done():
+                self._resolve_start(
+                    start_future,
+                    WebServerStartResult(
+                        ok=False,
+                        error="Web server startup was stopped",
+                    ),
+                )
+
+            if (
+                was_running
+                and loop
+                and not loop.is_closed()
+                and loop.is_running()
+            ):
+                async def _shutdown():
+                    for ws in list(self._ws_clients):
+                        try:
+                            await ws.close()
+                        except Exception:
+                            pass
+                    self._ws_clients.clear()
+
+                shutdown = _shutdown()
+                try:
+                    future = asyncio.run_coroutine_threadsafe(
+                        shutdown,
+                        loop,
+                    )
+                except RuntimeError:
+                    shutdown.close()
+                else:
                     try:
-                        await ws.close()
+                        future.result(timeout=3)
                     except Exception:
                         pass
-                self._ws_clients.clear()
-                # Stop the runner (releases port)
-                if self._runner:
-                    await self._runner.cleanup()
-                    self._runner = None
-                self._loop.stop()
+                    try:
+                        loop.call_soon_threadsafe(loop.stop)
+                    except RuntimeError:
+                        pass
 
-            future = asyncio.run_coroutine_threadsafe(_shutdown(), self._loop)
-            try:
-                future.result(timeout=3)
-            except Exception:
-                pass
-        self._loop = None
-        self._thread = None
-        wire_log("WEB SERVER: stopped, port released")
+            thread.join(timeout=3)
+            if thread.is_alive():
+                raise RuntimeError("WolfWeb worker did not stop")
+
+            with self._state_lock:
+                if self._thread is thread:
+                    self._loop = None
+                    self._runner = None
+                    self._stop_requested = None
+                    self._thread = None
+            wire_log("WEB SERVER: stopped, port released")
 
     def restart(self):
         """Restart the web server (e.g. after port change)."""
-        self.stop()
-        self.start()
+        with self._lifecycle_lock:
+            self.stop()
+            return self.start()
 
-    def _run(self):
-        """Run the aiohttp event loop in a background thread."""
-        self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
-        self._runner = web.AppRunner(self._app)
-        self._loop.run_until_complete(self._runner.setup())
-        site = web.TCPSite(self._runner, self.host, self.port)
+    @staticmethod
+    def _resolve_start(future, result):
         try:
-            self._loop.run_until_complete(site.start())
-            wire_log(f"WEB SERVER: listening on {self.host}:{self.port}")
-            self._loop.run_forever()
+            future.set_result(result)
+        except InvalidStateError:
+            pass
+
+    def _run(
+        self,
+        lifecycle_id,
+        stop_requested,
+        start_future,
+        host,
+        port,
+    ):
+        """Run the aiohttp event loop in a background thread."""
+        loop = asyncio.new_event_loop()
+        with self._state_lock:
+            if lifecycle_id != self._lifecycle_id:
+                loop.close()
+                return
+            self._loop = loop
+        asyncio.set_event_loop(loop)
+        runner = None
+        try:
+            if stop_requested.is_set():
+                return
+            runner = web.AppRunner(self._create_application())
+            with self._state_lock:
+                if lifecycle_id != self._lifecycle_id:
+                    return
+                self._runner = runner
+            loop.run_until_complete(runner.setup())
+            if stop_requested.is_set():
+                return
+            site = web.TCPSite(runner, host, port)
+            loop.run_until_complete(site.start())
+            if stop_requested.is_set():
+                return
+            with self._state_lock:
+                if (
+                    lifecycle_id != self._lifecycle_id
+                    or stop_requested.is_set()
+                ):
+                    return
+                self._running = True
+            wire_log(f"WEB SERVER: listening on {host}:{port}")
+            self._resolve_start(
+                start_future,
+                WebServerStartResult(ok=True),
+            )
+            if not stop_requested.is_set():
+                loop.run_forever()
         except OSError as e:
-            wire_log(f"WEB SERVER ERROR: port {self.port} may be in use: {e}")
-            self._running = False
+            error = f"Could not listen on {host}:{port}: {e}"
+            wire_log(f"WEB SERVER ERROR: {error}")
+            self._resolve_start(
+                start_future,
+                WebServerStartResult(ok=False, error=error),
+            )
         except Exception as e:
-            wire_log(f"WEB SERVER ERROR: {e}")
-            self._running = False
+            error = f"Web server startup failed: {e}"
+            wire_log(f"WEB SERVER ERROR: {error}")
+            self._resolve_start(
+                start_future,
+                WebServerStartResult(ok=False, error=error),
+            )
         finally:
-            if self._runner:
-                self._loop.run_until_complete(self._runner.cleanup())
+            if not start_future.done():
+                self._resolve_start(
+                    start_future,
+                    WebServerStartResult(
+                        ok=False,
+                        error=(
+                            "Web server startup was stopped"
+                            if stop_requested.is_set()
+                            else "Web server exited before becoming ready"
+                        ),
+                    ),
+                )
+            try:
+                if runner is not None:
+                    loop.run_until_complete(runner.cleanup())
+            except Exception as error:
+                wire_log(f"WEB SERVER CLEANUP ERROR: {error}")
+            finally:
+                with self._state_lock:
+                    if lifecycle_id == self._lifecycle_id:
+                        if self._runner is runner:
+                            self._runner = None
+                        if self._loop is loop:
+                            self._loop = None
+                        if self._thread is threading.current_thread():
+                            self._thread = None
+                        if self._stop_requested is stop_requested:
+                            self._stop_requested = None
+                        self._running = False
+                loop.close()
 
     def get_login_ips(self):
         """Return list of unique IPs with their last login time."""
@@ -232,7 +390,7 @@ class WolfWebServer:
     def broadcast_state(self):
         """Called by the desktop app when state changes. Pushes to all WebSocket clients.
         Throttled to avoid flooding — max once per _broadcast_interval seconds."""
-        if not self._enabled or not self._running or not self._loop or not self._ws_clients:
+        if not self._running or not self._loop or not self._ws_clients:
             return
         now = time.time()
         if now - self._last_broadcast < self._broadcast_interval:
@@ -243,7 +401,7 @@ class WolfWebServer:
 
     def broadcast_chat(self):
         """Push chat update immediately (no throttle). Called on new chat messages."""
-        if not self._enabled or not self._running or not self._loop or not self._ws_clients:
+        if not self._running or not self._loop or not self._ws_clients:
             return
         state = {
             'type': 'chat',
@@ -277,9 +435,12 @@ class WolfWebServer:
             if ext_match:
                 filename = line[:ext_match.end()].strip()
                 desc = line[ext_match.end():].strip()
-                if desc.startswith('-'): desc = desc[1:].strip()
-                if desc.startswith('('): desc = desc[1:].strip()
-                if desc.endswith(')'): desc = desc[:-1].strip()
+                if desc.startswith('-'):
+                    desc = desc[1:].strip()
+                if desc.startswith('('):
+                    desc = desc[1:].strip()
+                if desc.endswith(')'):
+                    desc = desc[:-1].strip()
                 name_map[filename.upper()] = desc if desc else filename
         return [
             {
@@ -552,6 +713,11 @@ class WolfWebServer:
         """POST /api/auth — Validate username + token."""
         try:
             body = await request.json()
+            if not isinstance(body, Mapping):
+                return web.json_response(
+                    {'error': 'Request body must be a JSON object'},
+                    status=400,
+                )
             username = body.get('username', '').strip()
             token = body.get('token', '').strip()
             if not username or not token:
@@ -581,8 +747,13 @@ class WolfWebServer:
 
             wire_log(f"WEB AUTH FAILED: {username}")
             return web.json_response({'error': 'Invalid username or token'}, status=401)
-        except Exception as e:
-            return web.json_response({'error': str(e)}, status=500)
+        except json.JSONDecodeError:
+            return web.json_response(
+                {'error': 'Request body must be valid JSON'},
+                status=400,
+            )
+        except Exception as error:
+            return web.json_response({'error': str(error)}, status=500)
 
     # --- HTTP Handlers ---
 

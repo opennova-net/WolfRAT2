@@ -208,6 +208,25 @@ class CommandCatalogTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             AdminCommands.tod_rate(0)
 
+    def test_typed_cmd_specs_require_the_exact_retail_envelope_ack(self):
+        for spec in (
+            AdminCommands.tod("1730"),
+            AdminCommands.tod_rate(5),
+        ):
+            with self.subTest(command=spec.text):
+                self.assertTrue(
+                    spec.accepts_replies(("OK - Command executed.",))
+                )
+                self.assertFalse(spec.accepts_replies(("OK",)))
+                self.assertFalse(
+                    spec.accepts_replies((" OK - Command executed. ",))
+                )
+                self.assertFalse(
+                    spec.accepts_replies(
+                        ("OK - Command executed.", "unexpected")
+                    )
+                )
+
     def test_reply_policies_encode_retail_multi_reply_behavior(self):
         self.assertTrue(ReplyPolicy.ONE.is_complete(("OK",)))
         self.assertFalse(ReplyPolicy.TWO.is_complete(("ERROR - In Game",)))

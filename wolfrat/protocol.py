@@ -9,7 +9,7 @@ request ordering, reply correlation, and snapshots all live in
 from __future__ import annotations
 
 from concurrent.futures import Future, InvalidStateError
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import logging
 import random
 import threading
@@ -48,6 +48,14 @@ _SECRET_SETTING_NAMES = frozenset(
 
 class _MissionNotFoundError(ValueError):
     """A mission target is absent, rather than present but ambiguous."""
+
+
+@dataclass(frozen=True)
+class TeamWorkflow:
+    """One planned team mutation and the messages describing that plan."""
+
+    messages: tuple[str, ...]
+    completion: Future
 
 
 def wire_log(message: str) -> None:
@@ -102,6 +110,8 @@ class ServerManager:
         self._polling = False
         self._lock = threading.RLock()
         self._mutation_tail = completed_future(None)
+        self._closed = False
+        self._connection_generation = 0
 
         self.players: list[dict[str, object]] = []
         self.missions: list[str] = []
@@ -184,13 +194,27 @@ class ServerManager:
         self._on_raw_chat = callback
 
     def connect(self, host, port=4000, username="", password=""):
-        self.disconnect()
+        generation = self.disconnect()
+        with self._lock:
+            if self._closed:
+                return False, "Connection failed: server manager is closed"
+        session = None
         try:
             session = self._session_factory(
                 host, port, username, password
             )
             with self._lock:
-                self._session = session
+                if (
+                    self._closed
+                    or generation != self._connection_generation
+                ):
+                    cancelled = True
+                else:
+                    self._session = session
+                    cancelled = False
+            if cancelled:
+                session.close()
+                return False, "Connection failed: server manager is closed"
             first = session.execute(AdminCommands.game_state()).result()
             if not first.accepted:
                 session.close()
@@ -200,30 +224,66 @@ class ServerManager:
                         self._mutation_tail = completed_future(None)
                 detail = first.replies[-1] if first.replies else "rejected"
                 return False, f"Connection failed: {detail}"
+            if not self._connection_is_current(session, generation):
+                session.close()
+                return False, "Connection failed: connection was cancelled"
             self._apply_result(first)
             self._log(f"Connected to {host}:{port}")
-            if self._on_connect_done:
+            if (
+                self._on_connect_done
+                and self._connection_is_current(session, generation)
+            ):
                 self._on_connect_done()
+            if not self._connection_is_current(session, generation):
+                session.close()
+                return False, "Connection failed: connection was cancelled"
             self.refresh_all()
             self.start_polling(self._poll_interval)
+            if not self._connection_is_current(session, generation):
+                session.close()
+                return False, "Connection failed: connection was cancelled"
             return True, f"Connected to {host}:{port}"
         except Exception as error:
             with self._lock:
-                session = self._session
-                self._session = None
-                self._mutation_tail = completed_future(None)
+                if self._session is session:
+                    self._session = None
+                    self._mutation_tail = completed_future(None)
             if session is not None:
                 session.close()
             self._log(f"Connection failed: {error}")
             return False, f"Connection failed: {error}"
 
-    def disconnect(self) -> None:
+    def disconnect(self) -> int:
+        """Disconnect and return the generation that invalidated prior work."""
+
         self.stop_polling()
         with self._lock:
+            self._connection_generation += 1
+            generation = self._connection_generation
             session, self._session = self._session, None
             self._mutation_tail = completed_future(None)
         if session is not None:
             session.close()
+        return generation
+
+    def close(self) -> None:
+        """Permanently close this manager and invalidate pending connects."""
+
+        with self._lock:
+            self._closed = True
+        self.disconnect()
+
+    def _connection_is_current(
+        self,
+        session: RetailAdminSession,
+        generation: int,
+    ) -> bool:
+        with self._lock:
+            return (
+                not self._closed
+                and self._connection_generation == generation
+                and self._session is session
+            )
 
     def execute_raw(self, user_text: str) -> Future:
         """The sole untyped command entry point, for an explicit raw console."""
@@ -670,9 +730,12 @@ class ServerManager:
 
         def workflow(session: RetailAdminSession) -> Future:
             player = self._resolve_current_player(target)
-            predicate = lambda readback: (
-                _player_by_id(readback.value, player.server_id) is None
-            )
+
+            def predicate(readback):
+                return _player_by_id(
+                    readback.value, player.server_id
+                ) is None
+
             return self._execute(
                 AdminCommands.punt(player),
                 confirm=lambda: self._eventual_confirmation(
@@ -692,9 +755,12 @@ class ServerManager:
 
         def workflow(session: RetailAdminSession) -> Future:
             player = self._resolve_current_player(target)
-            predicate = lambda readback: (
-                _player_by_id(readback.value, player.server_id) is None
-            )
+
+            def predicate(readback):
+                return _player_by_id(
+                    readback.value, player.server_id
+                ) is None
+
             return self._execute(
                 AdminCommands.ban(player),
                 confirm=lambda: self._eventual_confirmation(
@@ -721,9 +787,10 @@ class ServerManager:
         session: RetailAdminSession,
     ) -> Future:
         player = self._resolve_current_player(target)
-        predicate = lambda readback: _kill_readback_matches(
-            player, readback.value
-        )
+
+        def predicate(readback):
+            return _kill_readback_matches(player, readback.value)
+
         return self._execute(
             AdminCommands.kill(player),
             confirm=lambda: self._eventual_confirmation(
@@ -1423,7 +1490,21 @@ class ServerManager:
 
     # ---- team workflows --------------------------------------------------
 
-    def mix_teams(self):
+    @staticmethod
+    def _completed_team_workflow(message: str) -> TeamWorkflow:
+        return TeamWorkflow(
+            (message,),
+            completed_future(
+                CommandResult(
+                    AdminOperation.PLAYER_SWAPTEAM,
+                    (message,),
+                    True,
+                    verified=True,
+                )
+            ),
+        )
+
+    def mix_teams(self) -> TeamWorkflow:
         players = [
             player
             for player in self.player_entries
@@ -1432,30 +1513,37 @@ class ServerManager:
         team_one = [player for player in players if player.team == 1]
         team_two = [player for player in players if player.team == 2]
         if len(team_one) + len(team_two) < 2:
-            return ["Need at least 2 players to mix"]
+            return self._completed_team_workflow(
+                "Need at least 2 players to mix"
+            )
         if abs(len(team_one) - len(team_two)) <= 1:
-            return ["Teams are already balanced (within 1 player)"]
+            return self._completed_team_workflow(
+                "Teams are already balanced (within 1 player)"
+            )
         larger = team_one if len(team_one) > len(team_two) else team_two
         moves = random.sample(
             larger, (abs(len(team_one) - len(team_two))) // 2
         )
         targets = tuple(moves)
         expected_roster = tuple(players)
-        self._last_team_workflow = self._serialize_mutation(
+        completion = self._serialize_mutation(
             lambda session: self._move_players_now(
                 targets, session, expected_roster
             )
         )
-        return [f"Swapping {player.name}" for player in moves]
+        return TeamWorkflow(
+            tuple(f"Swapping {player.name}" for player in moves),
+            completion,
+        )
 
-    def shuffle_teams(self):
+    def shuffle_teams(self) -> TeamWorkflow:
         players = [
             player
             for player in self.player_entries
             if player.server_id != 0
         ]
         if len(players) < 2:
-            return ["No players to shuffle"]
+            return self._completed_team_workflow("No players to shuffle")
         random.shuffle(players)
         midpoint = len(players) // 2
         intended = {
@@ -1468,21 +1556,18 @@ class ServerManager:
             if player.team != intended[player.server_id]
         ]
         if not moves:
-            self._last_team_workflow = completed_future(CommandResult(
-                AdminOperation.PLAYER_SWAPTEAM,
-                ("No changes needed",),
-                True,
-                verified=True,
-            ))
-            return ["No changes needed"]
+            return self._completed_team_workflow("No changes needed")
         targets = tuple(moves)
         expected_roster = tuple(players)
-        self._last_team_workflow = self._serialize_mutation(
+        completion = self._serialize_mutation(
             lambda session: self._move_players_now(
                 targets, session, expected_roster
             )
         )
-        return [f"Swapping {player.name}" for player in moves]
+        return TeamWorkflow(
+            tuple(f"Swapping {player.name}" for player in moves),
+            completion,
+        )
 
     def get_team_stats(self):
         players = [
@@ -1508,10 +1593,12 @@ class ServerManager:
     def start_polling(self, interval=5.0) -> None:
         with self._lock:
             self._poll_interval = float(interval)
-            if self._polling:
+            if self._closed or self._session is None or self._polling:
                 return
+            session = self._session
+            generation = self._connection_generation
             self._polling = True
-            self._schedule_poll(self._poll_interval)
+        self._schedule_poll(self._poll_interval, session, generation)
 
     def stop_polling(self) -> None:
         with self._lock:
@@ -1520,28 +1607,79 @@ class ServerManager:
         if timer is not None:
             timer.cancel()
 
-    def _schedule_poll(self, delay: float) -> None:
-        timer = threading.Timer(delay, self._poll_tick)
+    def _schedule_poll(
+        self,
+        delay: float,
+        session: RetailAdminSession,
+        generation: int,
+    ) -> None:
+        timer = threading.Timer(
+            delay,
+            lambda: self._poll_tick(session, generation),
+        )
         timer.daemon = True
         with self._lock:
-            if not self._polling:
+            if (
+                not self._polling
+                or self._closed
+                or self._connection_generation != generation
+                or self._session is not session
+                or not session.connected
+            ):
                 return
             self._poll_timer = timer
         timer.start()
 
-    def _poll_tick(self) -> None:
+    def _poll_tick(
+        self,
+        session: RetailAdminSession,
+        generation: int,
+    ) -> None:
         with self._lock:
-            if not self._polling or not self.is_connected:
+            if (
+                not self._polling
+                or self._closed
+                or self._connection_generation != generation
+                or self._session is not session
+                or not session.connected
+            ):
                 return
-        futures = (
-            self.refresh_game_state(quiet=True),
-            self.refresh_players(quiet=True),
-            self.refresh_chat(quiet=True),
-            self.refresh_missions(quiet=True),
-            self.refresh_settings(quiet=True),
-        )
+        try:
+            futures = (
+                self._execute(
+                    AdminCommands.game_state(),
+                    quiet=True,
+                    expected_session=session,
+                ),
+                self._execute(
+                    AdminCommands.players(),
+                    quiet=True,
+                    expected_session=session,
+                ),
+                self._execute(
+                    AdminCommands.chat(),
+                    quiet=True,
+                    expected_session=session,
+                ),
+                self._execute(
+                    AdminCommands.missions(),
+                    quiet=True,
+                    expected_session=session,
+                ),
+                self._execute(
+                    AdminCommands.game_settings(),
+                    quiet=True,
+                    expected_session=session,
+                ),
+            )
+        except ConnectionError:
+            return
         futures[-1].add_done_callback(
-            lambda _future: self._schedule_poll(self._poll_interval)
+            lambda _future: self._schedule_poll(
+                self._poll_interval,
+                session,
+                generation,
+            )
         )
 
     # ---- result adaptation ----------------------------------------------

@@ -1,111 +1,138 @@
-"""Anonymous startup and heartbeat analytics used by WolfRAT."""
+"""Pseudonymous startup and heartbeat analytics used by WolfRAT."""
 
 import json
+from pathlib import Path
 import platform
-import uuid
-import os
 import threading
-import time
-import urllib.request
 import urllib.error
+import urllib.request
+import uuid
+
 
 BSTATS_URL = "http://fmj-squad.com/bstats/ping"
-HEARTBEAT_INTERVAL = 30 * 60  # 30 minutes
-TIMEOUT = 5  # seconds
+HEARTBEAT_INTERVAL = 30 * 60
+TIMEOUT = 5
 
 _version = "0.0"
 _tool = "unknown"
 _os = "unknown"
 _client_id = "unknown"
-_running = False
+_lifecycle_lock = threading.RLock()
+_stop_event: threading.Event | None = None
+_threads: tuple[threading.Thread, ...] = ()
 
 
 def _get_os():
-    """Get a clean OS string."""
+    """Return a compact operating-system label."""
     try:
         system = platform.system()
         if system == "Windows":
-            ver = platform.version()
-            # Windows 10 → "10.0.xxxx", Windows 11 → "10.0.22000+"
-            build = int(ver.split(".")[-1]) if "." in ver else 0
-            if build >= 22000:
-                return "Windows 11"
-            return "Windows 10"
+            version = platform.version()
+            build = int(version.split(".")[-1]) if "." in version else 0
+            return "Windows 11" if build >= 22000 else "Windows 10"
         return system
     except Exception:
         return "unknown"
 
 
-def _get_client_id():
+def _get_client_id(data_dir: Path):
+    """Load or create the stable telemetry identity in application-owned state."""
     try:
-        appdata = os.getenv("APPDATA") or os.path.expanduser("~")
-        fmj_dir = os.path.join(appdata, "FMJSquad")
-        os.makedirs(fmj_dir, exist_ok=True)
-        cid_file = os.path.join(fmj_dir, "bstats_id.txt")
-        if os.path.exists(cid_file):
-            with open(cid_file, "r") as f:
-                return f.read().strip()
-        new_id = str(uuid.uuid4())
-        with open(cid_file, "w") as f:
-            f.write(new_id)
-        return new_id
-    except:
+        data_dir.mkdir(parents=True, exist_ok=True)
+        identity_path = data_dir / "bstats_id.txt"
+        if identity_path.exists():
+            return identity_path.read_text(encoding="utf-8").strip()
+        identity = str(uuid.uuid4())
+        identity_path.write_text(identity, encoding="utf-8")
+        return identity
+    except Exception:
         return str(uuid.uuid4())
 
+
 def _ping(ping_type="heartbeat"):
-    """Send a single ping. Fails silently."""
+    """Send one telemetry event without affecting the host application."""
     try:
-        data = json.dumps({
-            "tool": _tool,
-            "version": _version,
-            "os": _os,
-            "client_id": _client_id,
-            "type": ping_type
-        }).encode("utf-8")
-        req = urllib.request.Request(
+        data = json.dumps(
+            {
+                "tool": _tool,
+                "version": _version,
+                "os": _os,
+                "client_id": _client_id,
+                "type": ping_type,
+            }
+        ).encode("utf-8")
+        request = urllib.request.Request(
             BSTATS_URL,
             data=data,
             headers={"Content-Type": "application/json"},
-            method="POST"
+            method="POST",
         )
-        urllib.request.urlopen(req, timeout=TIMEOUT)
+        with urllib.request.urlopen(request, timeout=TIMEOUT):
+            pass
     except Exception:
-        pass  # Silent fail — never crash the host app
+        pass
 
 
-def _heartbeat_loop():
-    """Background loop that sends heartbeats every 30 minutes."""
-    while _running:
-        time.sleep(HEARTBEAT_INTERVAL)
-        if _running:
-            _ping("heartbeat")
+def _heartbeat_loop(stop_event):
+    """Wait interruptibly between heartbeat events."""
+    while not stop_event.wait(HEARTBEAT_INTERVAL):
+        _ping("heartbeat")
 
 
-def bstats_start(tool, version):
-    """
-    Start B-Stats tracking. Call once on app launch.
-    
-    Args:
-        tool: Tool name — "wolfrat" or "jomonitor"
-        version: Application version string.
-    """
-    global _tool, _version, _os, _client_id, _running
-    _tool = tool.lower()
-    _version = version
-    _os = _get_os()
-    _client_id = _get_client_id()
-    _running = True
+def _stop_locked():
+    """Stop owned workers while the caller holds ``_lifecycle_lock``."""
+    global _stop_event, _threads
 
-    # Startup ping in background (non-blocking)
-    t = threading.Thread(target=_ping, args=("startup",), daemon=True)
-    t.start()
+    stop_event = _stop_event
+    if stop_event is not None:
+        stop_event.set()
 
-    # Heartbeat loop in background
-    hb = threading.Thread(target=_heartbeat_loop, daemon=True)
-    hb.start()
+    current = threading.current_thread()
+    survivors = []
+    for thread in _threads:
+        if thread is not current and thread.is_alive():
+            thread.join(timeout=max(float(TIMEOUT) + 1.0, 0.0))
+        if thread.is_alive():
+            survivors.append(thread)
+
+    _threads = tuple(survivors)
+    if survivors:
+        names = ", ".join(repr(thread.name) for thread in survivors)
+        raise RuntimeError(f"telemetry workers did not stop: {names}")
+    _stop_event = None
+
+
+def bstats_start(tool, version, *, data_dir):
+    """Start one startup worker and one interruptible heartbeat worker."""
+    global _tool, _version, _os, _client_id
+    global _stop_event, _threads
+
+    with _lifecycle_lock:
+        _stop_locked()
+        stop_event = threading.Event()
+        startup = threading.Thread(
+            target=_ping,
+            args=("startup",),
+            daemon=True,
+            name="wolfrat-telemetry-startup",
+        )
+        heartbeat = threading.Thread(
+            target=_heartbeat_loop,
+            args=(stop_event,),
+            daemon=True,
+            name="wolfrat-telemetry-heartbeat",
+        )
+        _tool = str(tool).lower()
+        _version = str(version)
+        _os = _get_os()
+        _client_id = _get_client_id(Path(data_dir))
+        _stop_event = stop_event
+        _threads = (startup, heartbeat)
+        startup.start()
+        heartbeat.start()
 
 
 def bstats_stop():
-    """Stop B-Stats tracking. Call on app shutdown (optional — daemon threads die anyway)."""
-    global _running
-    _running = False
+    """Signal and join every telemetry worker; safe to call repeatedly."""
+    with _lifecycle_lock:
+        _stop_locked()

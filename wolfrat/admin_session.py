@@ -64,41 +64,87 @@ class SocketTransport:
     """Production byte transport backed by one TCP socket."""
 
     def __init__(self) -> None:
+        self._lock = threading.Lock()
         self._socket: socket.socket | None = None
+        self._closed = False
+
+    @staticmethod
+    def _enable_abortive_close(sock: socket.socket) -> None:
+        """Select the native ``linger`` ABI without weakening disconnects.
+
+        Winsock defines ``struct linger`` as two unsigned shorts, while the
+        POSIX implementations supported by Python use two native integers.
+        Trying both representations lets the socket API select its ABI.  If
+        neither is accepted, connection setup fails rather than falling back
+        to the orderly FIN that retail mishandles.
+        """
+
+        errors: list[OSError] = []
+        for packing in ("HH", "ii"):
+            try:
+                sock.setsockopt(
+                    socket.SOL_SOCKET,
+                    socket.SO_LINGER,
+                    struct.pack(packing, 1, 0),
+                )
+                return
+            except OSError as error:
+                errors.append(error)
+        raise errors[-1]
 
     def connect(self, host: str, port: int, timeout: float) -> None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        with self._lock:
+            if self._closed:
+                rejected = "transport is closed"
+            elif self._socket is not None:
+                rejected = "transport is already connecting or connected"
+            else:
+                self._socket = sock
+                rejected = None
+        if rejected is not None:
+            sock.close()
+            raise ConnectionError(rejected)
         try:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             # Retail mishandles an orderly FIN: recv()==0 leaves the admin
             # client slot retained, and its later table growth corrupts those
             # stale slots.  An abortive close makes recv fail with
             # WSAECONNRESET, which follows retail's working removal path.
-            sock.setsockopt(
-                socket.SOL_SOCKET,
-                socket.SO_LINGER,
-                struct.pack("hh", 1, 0),
-            )
+            self._enable_abortive_close(sock)
             sock.settimeout(timeout)
             sock.connect((host, port))
         except BaseException:
+            with self._lock:
+                if self._socket is sock:
+                    self._socket = None
             sock.close()
             raise
-        self._socket = sock
+        with self._lock:
+            interrupted = self._closed or self._socket is not sock
+        if interrupted:
+            sock.close()
+            raise ConnectionError("transport was closed during connect")
 
     def sendall(self, data: bytes) -> None:
-        if self._socket is None:
+        with self._lock:
+            sock = self._socket
+        if sock is None:
             raise ConnectionError("transport is not connected")
-        self._socket.sendall(data)
+        sock.sendall(data)
 
     def recv(self, size: int, timeout: float) -> bytes:
-        if self._socket is None:
+        with self._lock:
+            sock = self._socket
+        if sock is None:
             raise ConnectionError("transport is not connected")
-        self._socket.settimeout(timeout)
-        return self._socket.recv(size)
+        sock.settimeout(timeout)
+        return sock.recv(size)
 
     def close(self) -> None:
-        sock, self._socket = self._socket, None
+        with self._lock:
+            self._closed = True
+            sock, self._socket = self._socket, None
         if sock is not None:
             sock.close()
 
@@ -206,6 +252,7 @@ class RetailAdminSession:
         self._background_requests: deque[_Request] = deque()
         self._coalesced: dict[object, _Request] = {}
         self._transport: ByteTransport | None = None
+        self._connecting_transport: ByteTransport | None = None
         self._generation = 0
         self._closed = False
         self._worker: threading.Thread | None = None
@@ -325,7 +372,10 @@ class RetailAdminSession:
                 replies = self._receive_replies(
                     self._transport, request.spec.reply_policy
                 )
-                accepted = self._accepted(replies)
+                accepted = (
+                    self._accepted(replies)
+                    and request.spec.accepts_replies(replies)
+                )
                 with self._condition:
                     self._revision += 1
                     revision = self._revision
@@ -405,11 +455,23 @@ class RetailAdminSession:
                 pass
 
     def _ensure_authenticated(self) -> int:
-        if self._transport is not None:
-            return self._generation
+        with self._condition:
+            if self._closed:
+                raise AdminSessionError("session is closed")
+            if self._transport is not None:
+                return self._generation
         transport = self._transport_factory()
-        transport.connect(self._host, self._port, self._timeout)
+        with self._condition:
+            if self._closed:
+                close_before_connect = True
+            else:
+                self._connecting_transport = transport
+                close_before_connect = False
+        if close_before_connect:
+            transport.close()
+            raise AdminSessionError("session is closed")
         try:
+            transport.connect(self._host, self._port, self._timeout)
             challenge = self._read_frame(transport)
             if len(challenge) != 33 or challenge[-1:] != b"\x00":
                 raise RetailProtocolError(
@@ -424,16 +486,22 @@ class RetailAdminSession:
                 raise AdminSessionError(
                     login_reply or "server rejected the credentials"
                 )
+            with self._condition:
+                if (
+                    self._closed
+                    or self._connecting_transport is not transport
+                ):
+                    raise AdminSessionError("session is closed")
+                self._connecting_transport = None
+                self._generation += 1
+                self._transport = transport
+                return self._generation
         except BaseException:
+            with self._condition:
+                if self._connecting_transport is transport:
+                    self._connecting_transport = None
             transport.close()
             raise
-        with self._condition:
-            if self._closed:
-                transport.close()
-                raise AdminSessionError("session is closed")
-            self._generation += 1
-            self._transport = transport
-            return self._generation
 
     def _fail_generation(
         self, generation: int | None, error: BaseException, current: _Request
@@ -615,25 +683,40 @@ class RetailAdminSession:
     def close(self) -> None:
         with self._condition:
             if self._closed:
-                return
-            self._closed = True
-            pending = tuple(
-                self._interactive_requests
-            ) + tuple(self._background_requests)
-            self._interactive_requests.clear()
-            self._background_requests.clear()
-            self._coalesced.clear()
-            self._condition.notify_all()
-            transport, self._transport = self._transport, None
+                pending: tuple[_Request, ...] = ()
+                transports: tuple[ByteTransport | None, ...] = ()
+            else:
+                self._closed = True
+                pending = tuple(
+                    self._interactive_requests
+                ) + tuple(self._background_requests)
+                self._interactive_requests.clear()
+                self._background_requests.clear()
+                self._coalesced.clear()
+                self._condition.notify_all()
+                transports = (
+                    self._transport,
+                    self._connecting_transport,
+                )
+                self._transport = None
+                self._connecting_transport = None
             worker = self._worker
         error = AdminSessionError("session is closed")
         for request in pending:
             self._settle_exception(request.observers, error)
-        if transport is not None:
+        closed_transport_ids: set[int] = set()
+        for transport in transports:
+            if transport is None or id(transport) in closed_transport_ids:
+                continue
+            closed_transport_ids.add(id(transport))
             transport.close()
         if (
             worker is not None
             and worker is not threading.current_thread()
             and worker.is_alive()
         ):
-            worker.join(timeout=min(self._timeout, 1.0))
+            worker.join(timeout=max(self._timeout + 0.5, 1.0))
+            if worker.is_alive():
+                raise AdminSessionError(
+                    "session worker did not stop during close"
+                )

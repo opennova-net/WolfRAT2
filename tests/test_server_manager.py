@@ -1,4 +1,5 @@
 import inspect
+import threading
 import unittest
 from concurrent.futures import Future
 from dataclasses import replace
@@ -276,6 +277,99 @@ class ServerManagerFacadeTests(unittest.TestCase):
         self.assertTrue(self.manager.is_connected)
         source = inspect.getsource(type(self.manager))
         self.assertNotIn("socket.", source)
+
+    def test_close_invalidates_a_connection_attempt_before_it_can_be_adopted(self):
+        entered_factory = threading.Event()
+        release_factory = threading.Event()
+        sessions = []
+
+        def blocking_factory(*args, **kwargs):
+            entered_factory.set()
+            self.assertTrue(release_factory.wait(timeout=2))
+            session = FakeSession(*args, **kwargs)
+            sessions.append(session)
+            return session
+
+        manager = ServerManager(session_factory=blocking_factory)
+        outcome = []
+        worker = threading.Thread(
+            target=lambda: outcome.append(
+                manager.connect("127.0.0.1", 4000, "admin", "pw")
+            )
+        )
+        worker.start()
+        self.assertTrue(entered_factory.wait(timeout=2))
+
+        manager.close()
+        release_factory.set()
+        worker.join(timeout=2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(1, len(outcome))
+        self.assertFalse(outcome[0][0])
+        self.assertIn("closed", outcome[0][1].casefold())
+        self.assertEqual(1, len(sessions))
+        self.assertTrue(sessions[0].closed)
+        self.assertEqual([], sessions[0].specs)
+        self.assertFalse(manager.is_connected)
+
+    def test_newest_overlapping_connect_owns_the_only_open_session(self):
+        older_disconnected = threading.Event()
+        release_older = threading.Event()
+        sessions = []
+
+        def factory(*args, **kwargs):
+            session = FakeSession(*args, **kwargs)
+            sessions.append(session)
+            return session
+
+        manager = ServerManager(session_factory=factory)
+        original_disconnect = manager.disconnect
+
+        def pause_older_after_disconnect():
+            generation = original_disconnect()
+            if threading.current_thread().name == "older-connect":
+                older_disconnected.set()
+                self.assertTrue(release_older.wait(timeout=2))
+            return generation
+
+        manager.disconnect = pause_older_after_disconnect
+        outcomes = {}
+        older = threading.Thread(
+            name="older-connect",
+            target=lambda: outcomes.setdefault(
+                "older",
+                manager.connect("older.example", 4000, "admin", "pw"),
+            ),
+        )
+        newer = threading.Thread(
+            name="newer-connect",
+            target=lambda: outcomes.setdefault(
+                "newer",
+                manager.connect("newer.example", 4000, "admin", "pw"),
+            ),
+        )
+
+        try:
+            older.start()
+            self.assertTrue(older_disconnected.wait(timeout=2))
+            newer.start()
+            newer.join(timeout=2)
+            self.assertFalse(newer.is_alive())
+            release_older.set()
+            older.join(timeout=2)
+            self.assertFalse(older.is_alive())
+
+            by_host = {session.host: session for session in sessions}
+            self.assertTrue(outcomes["newer"][0])
+            self.assertFalse(outcomes["older"][0])
+            self.assertFalse(by_host["newer.example"].closed)
+            self.assertTrue(by_host["older.example"].closed)
+        finally:
+            release_older.set()
+            older.join(timeout=2)
+            newer.join(timeout=2)
+            manager.close()
 
     def test_every_refresh_uses_a_typed_catalog_operation(self):
         futures = (
@@ -1018,6 +1112,81 @@ class ServerManagerFacadeTests(unittest.TestCase):
         )
         self.assertTrue(any(line.startswith("__QUIET__") for line in seen))
 
+    def test_stale_poll_completion_cannot_start_a_new_connection_poll_chain(self):
+        timers = []
+
+        class ControlledTimer:
+            def __init__(self, _delay, callback):
+                self.callback = callback
+                self.started = False
+                self.cancelled = False
+                self.fired = False
+                timers.append(self)
+
+            def start(self):
+                self.started = True
+
+            def cancel(self):
+                self.cancelled = True
+
+            def fire(self):
+                self.fired = True
+                self.callback()
+
+        sessions = []
+
+        def factory(*args, **kwargs):
+            session = FakeSession(*args, **kwargs)
+            sessions.append(session)
+            return session
+
+        with patch("wolfrat.protocol.threading.Timer", ControlledTimer):
+            manager = ServerManager(session_factory=factory)
+            try:
+                self.assertTrue(manager.connect("older.example")[0])
+                manager.stop_polling()
+                older_session = sessions[-1]
+                stale_settings = Future()
+                older_session.result_overrides[
+                    AdminOperation.GET_GAMESETTINGS
+                ] = [stale_settings]
+
+                manager.start_polling(5)
+                timers[-1].fire()
+                self.assertFalse(stale_settings.done())
+
+                self.assertTrue(manager.connect("newer.example")[0])
+                active_before_stale_completion = [
+                    timer
+                    for timer in timers
+                    if (
+                        timer.started
+                        and not timer.cancelled
+                        and not timer.fired
+                    )
+                ]
+                self.assertEqual(1, len(active_before_stale_completion))
+
+                stale_settings.set_result(CommandResult(
+                    AdminOperation.GET_GAMESETTINGS,
+                    ("ServerName = Older",),
+                    True,
+                    older_session.snapshot.settings,
+                ))
+
+                active_after_stale_completion = [
+                    timer
+                    for timer in timers
+                    if (
+                        timer.started
+                        and not timer.cancelled
+                        and not timer.fired
+                    )
+                ]
+                self.assertEqual(1, len(active_after_stale_completion))
+            finally:
+                manager.close()
+
     def test_rejected_setnext_stops_before_confirmation_and_cycle(self):
         rejection = CommandResult(
             AdminOperation.MISSION_SETNEXT,
@@ -1309,10 +1478,12 @@ class ServerManagerFacadeTests(unittest.TestCase):
             ),
         )
 
+        mix = self.manager.mix_teams()
         self.assertEqual(
-            ["Teams are already balanced (within 1 player)"],
-            self.manager.mix_teams(),
+            ("Teams are already balanced (within 1 player)",),
+            mix.messages,
         )
+        self.assertTrue(mix.completion.result().verified)
         stats = self.manager.get_team_stats()
         self.assertEqual(1, stats["team_a_count"])
         self.assertEqual(1, stats["team_b_count"])
@@ -1323,10 +1494,9 @@ class ServerManagerFacadeTests(unittest.TestCase):
             self.session.snapshot,
             players=self.session.snapshot.players[:2],
         )
-        self.assertEqual(
-            ["No players to shuffle"],
-            self.manager.shuffle_teams(),
-        )
+        shuffle = self.manager.shuffle_teams()
+        self.assertEqual(("No players to shuffle",), shuffle.messages)
+        self.assertTrue(shuffle.completion.result().verified)
         self.assertEqual([], self.session.specs)
 
     def test_multi_player_team_workflow_holds_one_mutation_gate(self):
@@ -1353,8 +1523,7 @@ class ServerManagerFacadeTests(unittest.TestCase):
             "wolfrat.protocol.random.sample",
             lambda values, count: values[:count],
         ):
-            messages = self.manager.mix_teams()
-        workflow = self.manager._last_team_workflow
+            workflow = self.manager.mix_teams()
         setting = self.manager.set_setting("ServerName", "After")
         self.session.snapshot = replace(
             self.session.snapshot,
@@ -1375,9 +1544,9 @@ class ServerManagerFacadeTests(unittest.TestCase):
         ))
 
         self.assertEqual(
-            ["Swapping Alice", "Swapping Bob"], messages
+            ("Swapping Alice", "Swapping Bob"), workflow.messages
         )
-        self.assertTrue(workflow.result().verified)
+        self.assertTrue(workflow.completion.result().verified)
         self.assertTrue(setting.result().verified)
         self.assertEqual(
             [
@@ -1420,8 +1589,7 @@ class ServerManagerFacadeTests(unittest.TestCase):
             "wolfrat.protocol.random.sample",
             lambda values, count: values[:count],
         ):
-            self.manager.mix_teams()
-        planned = self.manager._last_team_workflow
+            planned = self.manager.mix_teams().completion
         self.session.snapshot = replace(
             self.session.snapshot,
             revision=9,
@@ -1462,10 +1630,10 @@ class ServerManagerFacadeTests(unittest.TestCase):
         )
 
         with patch("wolfrat.protocol.random.shuffle", lambda _items: None):
-            messages = self.manager.shuffle_teams()
+            workflow = self.manager.shuffle_teams()
 
-        result = self.manager._last_team_workflow.result()
-        self.assertEqual(["No changes needed"], messages)
+        result = workflow.completion.result()
+        self.assertEqual(("No changes needed",), workflow.messages)
         self.assertTrue(result.accepted)
         self.assertTrue(result.verified)
         self.assertEqual(("No changes needed",), result.replies)

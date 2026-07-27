@@ -13,22 +13,23 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QLineEdit, QPushButton, QTextEdit, QTableWidget,
     QTableWidgetItem, QHeaderView, QComboBox, QSpinBox, QCheckBox, QGroupBox, QRadioButton, QButtonGroup,
-    QScrollArea, QSplitter, QMessageBox, QStatusBar, QFrame, QListWidget, QListWidgetItem,
-    QAbstractItemView, QMenu, QSlider, QPlainTextEdit, QTableView, QProgressDialog
-, QDialog)
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread, QObject, QAbstractTableModel
-from PyQt6.QtGui import QFont, QColor, QIcon, QTextCursor
+    QScrollArea, QMessageBox, QFrame, QListWidget, QListWidgetItem,
+    QAbstractItemView, QMenu, QSlider, QPlainTextEdit, QTableView,
+)
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QAbstractTableModel
+from PyQt6.QtGui import QColor, QIcon, QTextCursor
 
-import math
 from wolfrat.protocol import (
     CHAT_MAX_LEN,
     ServerManager,
     player_entry_from_legacy,
     wire_log,
 )
-from wolfrat.admin_commands import MissionEntry, WeaponMode
+from wolfrat.admin_commands import WeaponMode
 from wolfrat.sounds import generate_all_sounds
 from wolfrat.web_server import WolfWebServer, generate_token
+from wolfrat.runtime import DesktopRuntime, parse_launch_args
+from wolfrat.qt_dispatcher import CompletionPolicy, QtAdminDispatcher
 from PyQt6.QtMultimedia import QSoundEffect
 from PyQt6.QtCore import QUrl
 
@@ -38,20 +39,19 @@ from PyQt6.QtCore import QUrl
 # =============================================================================
 class SoundManager:
     """Manages Hitchhiker's Guide style door sounds."""
-    _instance = None
-
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._initialized = False
-        return cls._instance
 
     def __init__(self):
-        if self._initialized:
-            return
-        self._initialized = True
+        self._initialized = False
+        self._enabled = True
         self._muted = False
         self._effects = {}
+
+    def initialize(self):
+        """Create multimedia objects only after a QApplication exists."""
+
+        if self._initialized or not self._enabled:
+            return
+        self._initialized = True
         try:
             sound_files = generate_all_sounds()
             for name, path in sound_files.items():
@@ -63,6 +63,9 @@ class SoundManager:
             print(f"Sound init failed: {e}")
 
     def play(self, name):
+        if not self._enabled:
+            return
+        self.initialize()
         if not self._muted and name in self._effects:
             try:
                 self._effects[name].play()
@@ -71,6 +74,9 @@ class SoundManager:
 
     def set_muted(self, muted):
         self._muted = muted
+
+    def set_enabled(self, enabled):
+        self._enabled = bool(enabled)
 
     @property
     def muted(self):
@@ -403,7 +409,7 @@ class SatisfyingButton(QPushButton):
         super().__init__(text, parent)
         self._hold_ms = hold_ms
         self._pending = False
-        self._timer = QTimer()
+        self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self._fire)
         # Disconnect the normal clicked signal - we'll fire it after the hold
@@ -451,103 +457,15 @@ class LogSignals(QObject):
     connect_signal = pyqtSignal(bool, str)
 
 
-class AdminFutureBridge(QObject):
-    """Deliver admin Future completion onto the owning widget's Qt thread."""
-
-    completed_signal = pyqtSignal(object, object, object, object, str, str)
-
-    def __init__(self, parent=None, on_error=None):
-        super().__init__(parent)
-        self._on_error = on_error
-        self.completed_signal.connect(
-            self._deliver, Qt.ConnectionType.QueuedConnection
-        )
-
-    def submit(
-        self,
-        operation,
-        on_success=None,
-        context="Admin operation",
-        on_failure=None,
-        *,
-        result_mode="typed",
-    ):
-        """Invoke an operation without blocking and observe its retail result."""
-
-        if result_mode not in {"typed", "raw"}:
-            raise ValueError(f"unknown admin result mode: {result_mode}")
-        try:
-            future = operation()
-        except BaseException as error:
-            self.completed_signal.emit(
-                None, error, on_success, on_failure, context, result_mode
-            )
-            return None
-
-        def finished(done):
-            try:
-                result = done.result()
-                error = None
-            except BaseException as caught:
-                result = None
-                error = caught
-            self.completed_signal.emit(
-                result, error, on_success, on_failure, context, result_mode
-            )
-
-        future.add_done_callback(finished)
-        return future
-
-    def _deliver(
-        self,
-        result,
-        error,
-        on_success,
-        on_failure,
-        context,
-        result_mode,
-    ):
-        message = None
-        if error is not None:
-            message = f"{context} failed: {error}"
-        elif getattr(result, "accepted", True) is False:
-            replies = getattr(result, "replies", ())
-            detail = replies[-1] if replies else "retail server rejected the command"
-            message = f"{context} rejected: {detail}"
-        elif (
-            result_mode == "typed"
-            and getattr(result, "verified", None) is not True
-        ):
-            detail = getattr(result, "verification_error", None)
-            if detail:
-                message = f"{context} was not verified: {detail}"
-            else:
-                message = (
-                    f"{context} was accepted but not verified by retail"
-                )
-        elif result_mode == "raw":
-            # Explicit raw-console commands have no typed readback contract.
-            # Their only success claim is the accepted retail RawResult.
-            message = None
-
-        if message is not None:
-            if on_failure is not None:
-                try:
-                    on_failure(message)
-                except Exception as callback_error:
-                    message = f"{message}; failure callback failed: {callback_error}"
-            if self._on_error is not None:
-                self._on_error(message)
-            return
-
-        if on_success is not None:
-            try:
-                on_success(result)
-            except Exception as callback_error:
-                if self._on_error is not None:
-                    self._on_error(
-                        f"{context} completion callback failed: {callback_error}"
-                    )
+def _admin_dispatcher(owner):
+    """Return the one owner-bound admin dispatcher for a Qt surface."""
+    bridge = getattr(owner, "_admin_futures", None)
+    if bridge is None:
+        server = getattr(owner, "server", None)
+        error_sink = getattr(server, "_log", None) or wire_log
+        bridge = QtAdminDispatcher(parent=owner, error_sink=error_sink)
+        owner._admin_futures = bridge
+    return bridge
 
 
 def submit_admin(
@@ -557,63 +475,62 @@ def submit_admin(
     context="Admin operation",
     on_failure=None,
     *,
-    result_mode="typed",
+    policy=CompletionPolicy.VERIFIED,
 ):
     """Use one queued completion bridge for every mutating desktop caller."""
 
-    bridge = getattr(owner, "_admin_futures", None)
-    if bridge is None:
-        server = getattr(owner, "server", None)
-        error_sink = getattr(server, "_log", None)
-        bridge = AdminFutureBridge(owner, error_sink)
-        owner._admin_futures = bridge
+    bridge = _admin_dispatcher(owner)
     return bridge.submit(
         operation,
-        on_success,
-        context,
-        on_failure,
-        result_mode=result_mode,
+        context=context,
+        policy=policy,
+        on_success=on_success,
+        on_failure=on_failure,
     )
 
 
 def submit_team_workflow(owner, operation, on_success, context):
-    """Observe the Future exposed by the facade's legacy team helpers."""
+    """Submit one facade-owned multi-player workflow."""
 
-    server = owner.server
-    previous = getattr(server, "_last_team_workflow", None)
-    try:
-        messages = operation()
-    except BaseException as error:
-        server._log(f"{context} failed: {error}")
-        return None
-
-    future = getattr(server, "_last_team_workflow", None)
-    if future is None or future is previous:
-        on_success(messages)
-        return None
-    return submit_admin(
-        owner,
-        lambda: future,
-        lambda _result: on_success(messages),
-        context,
+    return _admin_dispatcher(owner).submit_workflow(
+        operation,
+        context=context,
+        on_success=on_success,
     )
+
+
+def schedule_once(owner: QObject, delay_ms: int, callback):
+    """Run one callback from an owner-bound timer that shutdown can cancel."""
+
+    timer = QTimer(owner)
+    timer.setSingleShot(True)
+    timer.timeout.connect(callback)
+    timer.timeout.connect(timer.deleteLater)
+    timer.start(delay_ms)
+    return timer
 
 
 class ServerTab(QWidget):
     """Server connection tab."""
 
-    def __init__(self, server: ServerManager, signals: LogSignals):
+    def __init__(
+        self,
+        server: ServerManager,
+        signals: LogSignals,
+        runtime: DesktopRuntime | None = None,
+    ):
         super().__init__()
         self.server = server
         self.signals = signals
-        self.missions_tab = None  # set by MainWindow after creation
+        self.runtime = runtime or DesktopRuntime.production()
         self._server_creds = {}  # {(host, port, user): password}
-        self.reconnect_timer = QTimer()
+        self.reconnect_timer = QTimer(self)
         self.reconnect_timer.timeout.connect(self._auto_reconnect_tick)
         self._manual_disconnect = False
         self._reconnect_attempts = 0
         self._pending_connect = None
         self._connect_thread = None
+        self._closing = False
         self.signals.connect_signal.connect(
             self._finish_connect, Qt.ConnectionType.QueuedConnection
         )
@@ -719,6 +636,8 @@ class ServerTab(QWidget):
         self._load_saved_servers()
 
     def _do_connect(self):
+        if self._closing:
+            return
         self._manual_disconnect = False
         self.reconnect_timer.stop()
 
@@ -748,9 +667,17 @@ class ServerTab(QWidget):
             success, msg = self.server.connect(host, port, username, password)
         except Exception as e:
             success, msg = False, f"Connect error: {e}"
+        if self._closing:
+            if success:
+                self.server.disconnect()
+            return
         self.signals.connect_signal.emit(success, msg)
 
     def _finish_connect(self, success, msg):
+        if self._closing:
+            self._pending_connect = None
+            self._connect_thread = None
+            return
         self.log(msg)
         pending = self._pending_connect
         self._pending_connect = None
@@ -817,6 +744,24 @@ class ServerTab(QWidget):
         self.log("Disconnected from server.")
         self.signals.disconnected_signal.emit()
 
+    def shutdown(self):
+        """Invalidate and join the connection worker owned by this tab."""
+
+        self._closing = True
+        self._manual_disconnect = True
+        self._pending_connect = None
+        self.reconnect_timer.stop()
+        self.server.close()
+        worker = self._connect_thread
+        if worker is threading.current_thread():
+            raise RuntimeError("server tab cannot join its own connection worker")
+        if worker is not None:
+            worker.join(timeout=6)
+            if worker.is_alive():
+                raise RuntimeError("retail connection worker did not stop")
+        if self._connect_thread is worker:
+            self._connect_thread = None
+
     def update_gamestate(self, state: dict):
         mode = state.get('mode', '-')
         self.game_mode_label.setText(mode)
@@ -875,8 +820,7 @@ class ServerTab(QWidget):
             pass
 
     def _get_servers_path(self):
-        return os.path.join(os.path.dirname(sys.argv[0]) if not getattr(sys, 'frozen', False)
-                            else os.path.dirname(sys.executable), 'wolfrat_servers.json')
+        return str(self.runtime.path("wolfrat_servers.json"))
 
     def _persist_servers(self):
         servers = []
@@ -1068,7 +1012,7 @@ class ConsoleTab(QWidget):
             lambda: self.server.execute_raw(cmd),
             lambda _result: self._raw_command_accepted(cmd),
             "Raw console command",
-            result_mode="raw",
+            policy=CompletionPolicy.ACCEPTED,
         )
 
     def _raw_command_accepted(self, command):
@@ -1100,16 +1044,10 @@ class PlayerTableModel(QAbstractTableModel):
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
         if not index.isValid() or role != Qt.ItemDataRole.DisplayRole:
             return None
-        p = self._players[index.row()]
-        col = index.column()
-        if col == 0: return str(p.get('id', ''))
-        if col == 1: return str(p.get('name', ''))
-        if col == 2: return str(p.get('team_name', p.get('team', '')))
-        if col == 3: return self.CLASS_MAP.get(str(p.get('class', '')).strip(), str(p.get('class', '-')))
-        if col == 4: return str(p.get('kills', '0'))
-        if col == 5: return str(p.get('deaths', '-'))
-        if col == 6: return str(p.get('ping', '-'))
-        return None
+        return self._cell_value(
+            self._players[index.row()],
+            index.column(),
+        )
 
     def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
         if role == Qt.ItemDataRole.DisplayRole and orientation == Qt.Orientation.Horizontal:
@@ -1123,10 +1061,10 @@ class PlayerTableModel(QAbstractTableModel):
 
         # If row count changed, do a full reset (unavoidable)
         if len(old) != len(new):
-            try:
-                from wolfrat.protocol import wire_log
-                wire_log(f"PlayerTable: FULL RESET (row count {len(old)} -> {len(new)})")
-            except: pass
+            wire_log(
+                f"PlayerTable: FULL RESET "
+                f"(row count {len(old)} -> {len(new)})"
+            )
             self.beginResetModel()
             self._players = new
             self.endResetModel()
@@ -1144,20 +1082,28 @@ class PlayerTableModel(QAbstractTableModel):
                     idx = self.index(row, col)
                     self.dataChanged.emit(idx, idx, [Qt.ItemDataRole.DisplayRole])
         if changed:
-            try:
-                from wolfrat.protocol import wire_log
-                wire_log(f"PlayerTable: {changed} cells changed (no reset)")
-            except: pass
+            wire_log(f"PlayerTable: {changed} cells changed (no reset)")
 
     def _cell_value(self, p, col):
         """Get display value for a player dict at a given column."""
-        if col == 0: return str(p.get('id', ''))
-        if col == 1: return str(p.get('name', ''))
-        if col == 2: return str(p.get('team_name', p.get('team', '')))
-        if col == 3: return self.CLASS_MAP.get(str(p.get('class', '')).strip(), str(p.get('class', '-')))
-        if col == 4: return str(p.get('kills', '0'))
-        if col == 5: return str(p.get('deaths', '-'))
-        if col == 6: return str(p.get('ping', '-'))
+        if col == 0:
+            return str(p.get('id', ''))
+        if col == 1:
+            return str(p.get('name', ''))
+        if col == 2:
+            return str(p.get('team_name', p.get('team', '')))
+        if col == 3:
+            player_class = str(p.get('class', '')).strip()
+            return self.CLASS_MAP.get(
+                player_class,
+                str(p.get('class', '-')),
+            )
+        if col == 4:
+            return str(p.get('kills', '0'))
+        if col == 5:
+            return str(p.get('deaths', '-'))
+        if col == 6:
+            return str(p.get('ping', '-'))
         return None
 
     def get_player_at(self, row):
@@ -1173,7 +1119,9 @@ class PlayersTab(QWidget):
     def __init__(self, server: ServerManager):
         super().__init__()
         self.server = server
-        self._admin_futures = AdminFutureBridge(self, self.server._log)
+        self._admin_futures = QtAdminDispatcher(
+            parent=self, error_sink=self.server._log
+        )
         self._build_ui()
 
     def _build_ui(self):
@@ -1295,11 +1243,11 @@ class PlayersTab(QWidget):
                 lambda: self.server.warn_player(
                     player_target, msg or "You have been warned!"
                 ),
-                lambda _result: self.server._log(
+                on_success=lambda _result: self.server._log(
                     f"Warning delivered to {display}: "
                     f"{msg or 'You have been warned!'}"
                 ),
-                f"Warn {display}",
+                context=f"Warn {display}",
             )
 
         elif action == "punt":
@@ -1307,11 +1255,11 @@ class PlayersTab(QWidget):
                 lambda: self.server.punt_player(
                     player_target, msg or "Kicked by admin"
                 ),
-                lambda _result: self._announce_admin_action(
+                on_success=lambda _result: self._announce_admin_action(
                     f"{display} has been kicked",
                     f"kick announcement for {display}",
                 ),
-                f"Kick {display}",
+                context=f"Kick {display}",
             )
 
         elif action == "ban":
@@ -1319,11 +1267,11 @@ class PlayersTab(QWidget):
                 lambda: self.server.ban_player(
                     player_target, msg or "Banned by admin"
                 ),
-                lambda _result: self._announce_admin_action(
+                on_success=lambda _result: self._announce_admin_action(
                     f"{display} has been banned",
                     f"ban announcement for {display}",
                 ),
-                f"Ban {display}",
+                context=f"Ban {display}",
             )
 
         elif action == "kill":
@@ -1336,11 +1284,11 @@ class PlayersTab(QWidget):
             # PLAYER SWAPTEAM handles the team change directly
             self._admin_futures.submit(
                 lambda: self.server.swap_player(player_target),
-                lambda _result: self._announce_admin_action(
+                on_success=lambda _result: self._announce_admin_action(
                     f"{display} swapped to the other team",
                     f"swap announcement for {display}",
                 ),
-                f"Swap {display}",
+                context=f"Swap {display}",
             )
 
         elif action == "zero":
@@ -1422,7 +1370,7 @@ class PlayersTab(QWidget):
 
             balance_text = f"Joint Ops: {len(team_a)} players ({score_a} kills)  |  Rebels: {len(team_b)} players ({score_b} kills)"
             if count_diff > 1 or diff > 10:
-                balance_text += f"  ⚠ UNBALANCED"
+                balance_text += "  ⚠ UNBALANCED"
                 self.balance_label.setStyleSheet("font-size: 11pt; color: #ff6040; font-weight: bold;")
             else:
                 self.balance_label.setStyleSheet("font-size: 11pt; color: #a89830;")
@@ -1444,9 +1392,15 @@ class MissionsTab(QWidget):
       BOTTOM: Status bar (Connected | Game Mode | command | status | players | time)
     """
 
-    def __init__(self, server: ServerManager, missions_store=None):
+    def __init__(
+        self,
+        server: ServerManager,
+        missions_store=None,
+        runtime: DesktopRuntime | None = None,
+    ):
         super().__init__()
         self.server = server
+        self.runtime = runtime or DesktopRuntime.production()
         self._missions_store = missions_store
         self._all_maps = []  # full available list [{file, display}]
         self._rotation_maps = []  # compatibility view [filename, ...]
@@ -1470,8 +1424,7 @@ class MissionsTab(QWidget):
         )
 
     def _preset_path(self):
-        base = os.path.dirname(sys.argv[0]) if not getattr(sys, 'frozen', False) else os.path.dirname(sys.executable)
-        return os.path.join(base, 'wolfrat_rotations.json')
+        return str(self.runtime.path("wolfrat_rotations.json"))
 
     def _load_presets(self):
         try:
@@ -1697,7 +1650,7 @@ class MissionsTab(QWidget):
         layout.addLayout(main_h, 1)  # stretch=1 for main area
 
         # Auto-refresh timer
-        self._auto_refresh_timer = QTimer()
+        self._auto_refresh_timer = QTimer(self)
         self._auto_refresh_timer.timeout.connect(self._auto_refresh_tick)
         self._auto_refresh_timer.start(15000)  # every 15s
 
@@ -2394,17 +2347,20 @@ class SettingsTab(QWidget):
     }
 
     # Standard JO weapons (editable list)
-    def __init__(self, server):
+    def __init__(self, server, runtime: DesktopRuntime | None = None):
         super().__init__()
         self.server = server
-        self._admin_futures = AdminFutureBridge(self, self.server._log)
+        self.runtime = runtime or DesktopRuntime.production()
+        self._admin_futures = QtAdminDispatcher(
+            parent=self, error_sink=self.server._log
+        )
         self.mods_tab = None  # set by MainWindow after creation
         self._checkboxes = {}
         self._sliders = {}
 
         self._loading = False
         self._auto_refresh = False
-        self._refresh_timer = QTimer()
+        self._refresh_timer = QTimer(self)
         self._refresh_timer.timeout.connect(self._do_refresh)
         self._build_ui()
 
@@ -2498,7 +2454,7 @@ class SettingsTab(QWidget):
             spin.valueChanged.connect(slider.setValue)
 
             # Debounce: only send to server 800ms after last change
-            timer = QTimer()
+            timer = QTimer(self)
             timer.setSingleShot(True)
             timer.timeout.connect(lambda k=key: self._send_debounced(k))
             self._debounce_timers[key] = timer
@@ -2871,8 +2827,12 @@ class SettingsTab(QWidget):
         submit_admin(
             self,
             lambda: self.server.set_time_of_day(value),
-            lambda _result: self._show_feedback(f"Time of day = {value}"),
+            lambda _result: self._show_feedback(
+                f"Time-of-day request accepted for {value}; "
+                "retail exposes no CMD readback"
+            ),
             "Set time of day",
+            policy=CompletionPolicy.ACCEPTED,
         )
 
     def _on_time_rate(self, value):
@@ -2882,9 +2842,11 @@ class SettingsTab(QWidget):
             self,
             lambda: self.server.set_time_rate(int(value)),
             lambda _result: self._show_feedback(
-                f"24-hour cycle = {value} minutes"
+                f"Time-rate request accepted for {value} minutes; "
+                "retail exposes no CMD readback"
             ),
             "Set time rate",
+            policy=CompletionPolicy.ACCEPTED,
         )
 
     def _lock_server(self):
@@ -2947,7 +2909,7 @@ class SettingsTab(QWidget):
             else:
                 settings[key] = str(spin.value())
         try:
-            path = os.path.join(os.path.dirname(__file__), "settings_preset.json")
+            path = self.runtime.path("settings_preset.json")
             with open(path, "w") as f:
                 json.dump(settings, f, indent=2)
             self._show_feedback(f"Settings saved to {os.path.basename(path)}")
@@ -2972,13 +2934,16 @@ class SettingsTab(QWidget):
 
     def _on_spinbox_changed(self, key, value):
         """Spinbox value changed — only debounce if slider is NOT being dragged."""
-        if self._loading: return
-        if self._slider_dragging.get(key, False): return
+        if self._loading:
+            return
+        if self._slider_dragging.get(key, False):
+            return
         self._pending_values[key] = value
         self._debounce_timers[key].start()
 
     def _send_debounced(self, key):
-        if key not in self._pending_values: return
+        if key not in self._pending_values:
+            return
         val = self._pending_values[key]
         # Go through set_setting like every other write path: it maps the key
         # back to the exact spelling the server reported in GET GAMESETTINGS.
@@ -3075,9 +3040,7 @@ class SettingsTab(QWidget):
     def load_vote_settings(self):
         """Load vote settings from mods config. Called on init."""
         try:
-            import os, sys, json
-            base = os.path.dirname(sys.argv[0]) if not getattr(sys, 'frozen', False) else os.path.dirname(sys.executable)
-            path = os.path.join(base, 'wolfrat_mods.json')
+            path = self.runtime.path("wolfrat_mods.json")
             if os.path.exists(path):
                 with open(path) as f:
                     cfg = json.load(f)
@@ -3091,9 +3054,7 @@ class SettingsTab(QWidget):
     def _save_vote_settings(self):
         """Save vote settings to mods config."""
         try:
-            import os, sys, json
-            base = os.path.dirname(sys.argv[0]) if not getattr(sys, 'frozen', False) else os.path.dirname(sys.executable)
-            path = os.path.join(base, 'wolfrat_mods.json')
+            path = self.runtime.path("wolfrat_mods.json")
             cfg = {}
             if os.path.exists(path):
                 with open(path) as f:
@@ -3151,9 +3112,7 @@ class SettingsTab(QWidget):
     def load_skip_settings(self):
         """Load skip vote settings from mods config. Called on init."""
         try:
-            import os, sys, json
-            base = os.path.dirname(sys.argv[0]) if not getattr(sys, 'frozen', False) else os.path.dirname(sys.executable)
-            path = os.path.join(base, 'wolfrat_mods.json')
+            path = self.runtime.path("wolfrat_mods.json")
             if os.path.exists(path):
                 with open(path) as f:
                     cfg = json.load(f)
@@ -3167,9 +3126,7 @@ class SettingsTab(QWidget):
     def _save_skip_settings(self):
         """Save skip vote settings to mods config."""
         try:
-            import os, sys, json
-            base = os.path.dirname(sys.argv[0]) if not getattr(sys, 'frozen', False) else os.path.dirname(sys.executable)
-            path = os.path.join(base, 'wolfrat_mods.json')
+            path = self.runtime.path("wolfrat_mods.json")
             cfg = {}
             if os.path.exists(path):
                 with open(path) as f:
@@ -3227,10 +3184,17 @@ class SettingsTab(QWidget):
 class ChatBotTab(QWidget):
     """Chat monitor and auto-moderation tab."""
 
-    def __init__(self, server: ServerManager):
+    def __init__(
+        self,
+        server: ServerManager,
+        runtime: DesktopRuntime | None = None,
+    ):
         super().__init__()
         self.server = server
-        self._admin_futures = AdminFutureBridge(self, self.server._log)
+        self.runtime = runtime or DesktopRuntime.production()
+        self._admin_futures = QtAdminDispatcher(
+            parent=self, error_sink=self.server._log
+        )
         self.bad_words = {}  # {word: action} e.g. {"nigger": "Kick", "cunt": "Warn"}
         self.auto_swap_enabled = True
         self.swap_trigger = "!switch"
@@ -3254,12 +3218,11 @@ class ChatBotTab(QWidget):
         self._spam_kick_pending = set()
 
     def _chat_config_path(self):
-        import os, sys
-        base = os.path.dirname(sys.argv[0]) if not getattr(sys, 'frozen', False) else os.path.dirname(sys.executable)
-        return os.path.join(base, 'wolfrat_chat.json')
+        return str(self.runtime.path("wolfrat_chat.json"))
 
     def _load_chat_config(self):
-        import json, os
+        import json
+        import os
         try:
             path = self._chat_config_path()
             if os.path.exists(path):
@@ -3432,11 +3395,6 @@ class ChatBotTab(QWidget):
             self._save_config()
 
     def update_chat(self, messages: list):
-        try:
-            from wolfrat.protocol import wire_log
-        except ImportError:
-            wire_log = lambda m: None
-
         # Skip the first batch - those are old messages from before we connected
         if not self._chat_initialized:
             self._chat_initialized = True
@@ -3645,13 +3603,13 @@ class ChatBotTab(QWidget):
 class StatsStore:
     """SQLite-backed persistent player stats (kills, deaths, KD, streaks)."""
 
-    def __init__(self):
+    def __init__(self, runtime: DesktopRuntime | None = None):
+        self.runtime = runtime or DesktopRuntime.production()
         self._db = None
         self._init_db()
 
     def _db_path(self):
-        base = os.path.dirname(sys.argv[0]) if not getattr(sys, 'frozen', False) else os.path.dirname(sys.executable)
-        return os.path.join(base, 'wolfrat_stats.db')
+        return str(self.runtime.path("wolfrat_stats.db"))
 
     def _init_db(self):
         try:
@@ -3781,30 +3739,42 @@ class StatsStore:
         except Exception:
             return 0
 
+    @property
+    def is_open(self):
+        return self._db is not None
+
+    def close(self):
+        """Close the owned SQLite connection. Safe to call repeatedly."""
+
+        if self._db is None:
+            return
+        self._db.close()
+        self._db = None
+
 
 class MessagesTab(QWidget):
     """Server messaging - direct, recurring, and welcome messages."""
 
-    def __init__(self, server: ServerManager, stats_store: StatsStore = None):
+    def __init__(
+        self,
+        server: ServerManager,
+        stats_store: StatsStore = None,
+        runtime: DesktopRuntime | None = None,
+    ):
         super().__init__()
         self.server = server
-        self._admin_futures = AdminFutureBridge(self, self.server._log)
+        self.runtime = runtime or DesktopRuntime.production()
+        self._admin_futures = QtAdminDispatcher(
+            parent=self, error_sink=self.server._log
+        )
         self.stats_store = stats_store
         self._recurring_messages = []
         self._recurring_index = 0
-        self._recurring_timer = QTimer()
+        self._recurring_timer = QTimer(self)
         self._recurring_timer.timeout.connect(self._send_next_recurring)
         self._seen_players = set()
         self._welcome_enabled = True
         self._welcome_message = "Welcome to the server, {player}! Enjoy your stay."
-        self._spree_enabled = True
-        self._spree_thresholds = {
-            3: ">>> {player} is on a KILLING SPREE! (3 Kills) <<<",
-            5: ">>> {player} is on a RAMPAGE! (5 Kills) <<<",
-            7: ">>> {player} is UNSTOPPABLE! (7 Kills) <<<",
-            10: ">>> {player} is GODLIKE! (10 Kills) <<<"
-        }
-        self._spree_table_loading = False
         self._kd_enabled = True
         self._player_stats = {}
         self._recurring_interval_idx = 2
@@ -3816,8 +3786,7 @@ class MessagesTab(QWidget):
             self._toggle_recurring()
 
     def _config_path(self):
-        base = os.path.dirname(sys.argv[0]) if not getattr(sys, 'frozen', False) else os.path.dirname(sys.executable)
-        return os.path.join(base, 'wolfrat_messages.json')
+        return str(self.runtime.path("wolfrat_messages.json"))
 
     def _load_config(self):
         try:
@@ -3829,12 +3798,6 @@ class MessagesTab(QWidget):
                     self._welcome_enabled = cfg.get('welcome_enabled', False)
                     self._welcome_message = cfg.get('welcome_msg', self._welcome_message)
                     self._seen_players = set(cfg.get('seen_players', []))
-                    self._spree_enabled = cfg.get('spree_enabled', True)
-                    # Spree thresholds: {"3": "message", "5": "message", ...}
-                    raw_thresholds = cfg.get('spree_thresholds', None)
-                    if raw_thresholds is not None:
-                        self._spree_thresholds = {int(k): v for k, v in raw_thresholds.items()}
-                    # else keep the defaults from __init__
                     self._kd_enabled = cfg.get('kd_enabled', True)
                     self._recurring_interval_idx = cfg.get('recurring_interval_idx', 2)
                     self._recurring_running = cfg.get('recurring_running', False)
@@ -3852,8 +3815,6 @@ class MessagesTab(QWidget):
                 'welcome_enabled': self._welcome_enabled,
                 'welcome_msg': self._welcome_message,
                 'seen_players': list(self._seen_players),
-                'spree_enabled': self._spree_enabled,
-                'spree_thresholds': {str(k): v for k, v in sorted(self._spree_thresholds.items())},
                 'kd_enabled': self._kd_enabled,
                 'recurring_interval_idx': interval_idx,
                 'recurring_running': is_running,
@@ -3972,23 +3933,6 @@ class MessagesTab(QWidget):
         scroll_area.setWidget(scroll_content)
         main_layout.addWidget(scroll_area)
 
-    def _send_message(self):
-        msg = self.msg_input.text().strip()
-        if msg:
-            submit_admin(
-                self,
-                lambda: self.server.announce(msg),
-                lambda _result: self._message_sent(msg),
-                "Send server message",
-            )
-
-    def _message_sent(self, message):
-        self.log_text.append(
-            f"[{time.strftime('%H:%M:%S')}] SENT: {message}"
-        )
-        if self.msg_input.text().strip() == message:
-            self.msg_input.clear()
-
     def _add_recurring(self):
         msg = self.recur_input.text().strip()
         if msg and msg not in self._recurring_messages:
@@ -4059,81 +4003,9 @@ class MessagesTab(QWidget):
         self._welcome_message = text
         self._save_config()
 
-    def _toggle_spree(self, state):
-        self._spree_enabled = (state == 2)
-        self._save_config()
-
     def _toggle_kd(self, state):
         self._kd_enabled = (state == 2)
         self._save_config()
-
-    def _populate_spree_table(self):
-        """Fill the spree thresholds table from self._spree_thresholds."""
-        self._spree_table_loading = True
-        self.spree_table.setRowCount(0)
-        for kills in sorted(self._spree_thresholds.keys()):
-            row = self.spree_table.rowCount()
-            self.spree_table.insertRow(row)
-            kills_item = QTableWidgetItem(str(kills))
-            kills_item.setTextAlignment(0x0004)  # AlignCenter
-            self.spree_table.setItem(row, 0, kills_item)
-            self.spree_table.setItem(row, 1, QTableWidgetItem(self._spree_thresholds[kills]))
-        self._spree_table_loading = False
-
-    def _add_spree_threshold(self):
-        """Add a new blank threshold row."""
-        # Find the next logical kill count (max + 5, or 3 if empty)
-        if self._spree_thresholds:
-            next_kill = max(self._spree_thresholds.keys()) + 5
-        else:
-            next_kill = 3
-        self._spree_thresholds[next_kill] = f">>> {{{{player}}}} hit {next_kill} kills! <<<"
-        self._populate_spree_table()
-        self._save_config()
-
-    def _remove_spree_threshold(self):
-        """Remove the selected threshold row."""
-        row = self.spree_table.currentRow()
-        if row < 0:
-            return
-        kills_item = self.spree_table.item(row, 0)
-        if kills_item:
-            kills = int(kills_item.text())
-            self._spree_thresholds.pop(kills, None)
-            self._populate_spree_table()
-            self._save_config()
-
-    def _reset_spree_defaults(self):
-        """Reset thresholds to 3/5/7/10 defaults."""
-        self._spree_thresholds = {
-            3: ">>> {player} is on a KILLING SPREE! (3 Kills) <<<",
-            5: ">>> {player} is on a RAMPAGE! (5 Kills) <<<",
-            7: ">>> {player} is UNSTOPPABLE! (7 Kills) <<<",
-            10: ">>> {player} is GODLIKE! (10 Kills) <<<"
-        }
-        self._populate_spree_table()
-        self._save_config()
-
-    def _on_spree_cell_changed(self, row, col):
-        """Save edits made inline in the spree table."""
-        if self._spree_table_loading:
-            return
-        # Rebuild thresholds from the entire table
-        new_thresholds = {}
-        for r in range(self.spree_table.rowCount()):
-            kills_item = self.spree_table.item(r, 0)
-            msg_item = self.spree_table.item(r, 1)
-            if kills_item and msg_item:
-                try:
-                    kills = int(kills_item.text().strip())
-                    msg = msg_item.text().strip()
-                    if kills > 0 and msg:
-                        new_thresholds[kills] = msg
-                except ValueError:
-                    pass  # skip rows with invalid kill numbers
-        if new_thresholds:
-            self._spree_thresholds = new_thresholds
-            self._save_config()
 
     def check_new_players(self, players):
         """Called when player list updates. Detects first-time joiners."""
@@ -4147,8 +4019,13 @@ class MessagesTab(QWidget):
                 self.welcome_log.addItem(f"[{time.strftime('%H:%M:%S')}] {name} (sending in 40s)")
                 self.log_text.append(f"[{time.strftime('%H:%M:%S')}] WELCOME QUEUED: {name}")
                 self._save_config()
-                # Delay 15 seconds so player finishes loading before they see the message
-                QTimer.singleShot(40000, lambda m=msg, n=name: self._send_welcome(m, n))
+                timer = QTimer(self)
+                timer.setSingleShot(True)
+                timer.timeout.connect(
+                    lambda m=msg, n=name: self._send_welcome(m, n)
+                )
+                timer.timeout.connect(timer.deleteLater)
+                timer.start(40000)
 
     def _send_welcome(self, msg, name):
         """Actually send the welcome message after the delay."""
@@ -4170,10 +4047,18 @@ class MessagesTab(QWidget):
 class SpreeTab(QWidget):
     """Killing Spree Announcer Tab"""
 
-    def __init__(self, server, messages_tab):
+    def __init__(
+        self,
+        server,
+        messages_tab,
+        runtime: DesktopRuntime | None = None,
+    ):
         super().__init__()
         self.server = server
-        self._admin_futures = AdminFutureBridge(self, self.server._log)
+        self.runtime = runtime or DesktopRuntime.production()
+        self._admin_futures = QtAdminDispatcher(
+            parent=self, error_sink=self.server._log
+        )
         self.messages_tab = messages_tab
         self._spree_enabled = True
         self._spree_thresholds = {
@@ -4197,12 +4082,11 @@ class SpreeTab(QWidget):
         self._build_ui()
 
     def _config_path(self):
-        import os, sys
-        base = os.path.dirname(sys.argv[0]) if not getattr(sys, 'frozen', False) else os.path.dirname(sys.executable)
-        return os.path.join(base, 'wolfrat_sprees.json')
+        return str(self.runtime.path("wolfrat_sprees.json"))
 
     def _load_config(self):
-        import os, json
+        import os
+        import json
         try:
             path = self._config_path()
             if os.path.exists(path):
@@ -4337,7 +4221,8 @@ class SpreeTab(QWidget):
         self._save_config()
 
     def _on_spree_cell_changed(self, row, col):
-        if self._spree_table_loading: return
+        if self._spree_table_loading:
+            return
         self._save_config_from_table()
 
     def _save_config_from_table(self):
@@ -4376,18 +4261,9 @@ class SpreeTab(QWidget):
             self._first_blood_pending = False
             for stat in self._player_stats.values():
                 stat['streak'] = 0
-            try:
-                from wolfrat.web_server import wire_log
-            except ImportError:
-                wire_log = lambda m: None
             wire_log(f"[SPREE] Map changed to {current} - first blood + streaks reset")
 
     def check_sprees(self, players):
-        try:
-            from wolfrat.protocol import wire_log
-        except ImportError:
-            wire_log = lambda m: None
-
         kd_enabled = self.messages_tab._kd_enabled
         if not self._spree_enabled and not kd_enabled:
             return
@@ -4395,7 +4271,8 @@ class SpreeTab(QWidget):
         for p in players:
             name = p.get('name', '').strip()
             pid = p.get('id', '')
-            if not name or not pid: continue
+            if not name or not pid:
+                continue
 
             try:
                 k_val = p.get('kills', '0')
@@ -4483,14 +4360,14 @@ class MissionsStore:
     Fetches on connect, saves to JSON, used by Mods tab for !map lookup.
     """
 
-    def __init__(self):
+    def __init__(self, runtime: DesktopRuntime | None = None):
+        self.runtime = runtime or DesktopRuntime.production()
         self._data = {'rotation': [], 'available': [], 'updated': None}
         self._missions_tab = None  # set by MainWindow, called after on-connect fetch
         self._load()
 
     def _path(self):
-        base = os.path.dirname(sys.argv[0]) if not getattr(sys, 'frozen', False) else os.path.dirname(sys.executable)
-        return os.path.join(base, 'wolfrat_missions.json')
+        return str(self.runtime.path("wolfrat_missions.json"))
 
     def _load(self):
         try:
@@ -4543,10 +4420,8 @@ class MissionsStore:
 
     def update_rotation(self, missions_list):
         """Update rotation from 'mission list' response (list of raw lines)."""
-        if not missions_list:
-            return
         self._data['rotation'] = []
-        for raw in missions_list:
+        for raw in missions_list or ():
             full = self._clean(raw)
             if full:
                 self._data['rotation'].append({'name': self._strip_ext(full), 'file': full})
@@ -4554,11 +4429,9 @@ class MissionsStore:
 
     def update_available(self, data_str):
         """Update available maps from 'mission available' response (raw text)."""
-        if not data_str:
-            return
         self._data['available'] = []
         import re
-        for line in data_str.split('\n'):
+        for line in (data_str or "").splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -4574,9 +4447,12 @@ class MissionsStore:
             filename = line[:ext_match.end()].strip()
 
             desc = line[ext_match.end():].strip()
-            if desc.startswith('-'): desc = desc[1:].strip()
-            if desc.startswith('('): desc = desc[1:].strip()
-            if desc.endswith(')'): desc = desc[:-1].strip()
+            if desc.startswith('-'):
+                desc = desc[1:].strip()
+            if desc.startswith('('):
+                desc = desc[1:].strip()
+            if desc.endswith(')'):
+                desc = desc[:-1].strip()
 
             if filename:
                 # Use description as the display name if available
@@ -4680,11 +4556,17 @@ class MissionsStore:
 class ModsTab(QWidget):
     """Moderator management - assign mods, track their commands."""
 
-    def __init__(self, server: ServerManager, missions_store: MissionsStore):
+    def __init__(
+        self,
+        server: ServerManager,
+        missions_store: MissionsStore,
+        runtime: DesktopRuntime | None = None,
+    ):
         super().__init__()
         self.server = server
-        self._admin_futures = AdminFutureBridge(
-            self, self._admin_operation_error
+        self.runtime = runtime or DesktopRuntime.production()
+        self._admin_futures = QtAdminDispatcher(
+            parent=self, error_sink=self._admin_operation_error
         )
         self.missions_store = missions_store
         self.messages_tab = None  # set by MainWindow cross-tab wiring
@@ -4702,7 +4584,7 @@ class ModsTab(QWidget):
         self._vote_voters = set()  # lowercase player names
         self._vote_total = 0
         self._vote_transition_pending = False
-        self._vote_timer = QTimer()
+        self._vote_timer = QTimer(self)
         self._vote_timer.setSingleShot(True)
         self._vote_timer.timeout.connect(self._vote_expired)
         # Skip vote state
@@ -4713,7 +4595,7 @@ class ModsTab(QWidget):
         self._skip_voters = set()
         self._skip_total = 0
         self._skip_transition_pending = False
-        self._skip_timer = QTimer()
+        self._skip_timer = QTimer(self)
         self._skip_timer.setSingleShot(True)
         self._skip_timer.timeout.connect(self._skip_expired)
         self._load_config()
@@ -4755,6 +4637,7 @@ class ModsTab(QWidget):
         log_message=None,
         on_success=None,
         on_failure=None,
+        policy=CompletionPolicy.VERIFIED,
     ):
         def accepted(result):
             if log_message:
@@ -4772,6 +4655,7 @@ class ModsTab(QWidget):
             accepted,
             context,
             on_failure,
+            policy=policy,
         )
 
     def _start_skip_transition(self, announcement, log_message):
@@ -4840,8 +4724,7 @@ class ModsTab(QWidget):
         self.mod_log.addItem(log_message)
 
     def _config_path(self):
-        base = os.path.dirname(sys.argv[0]) if not getattr(sys, 'frozen', False) else os.path.dirname(sys.executable)
-        return os.path.join(base, 'wolfrat_mods.json')
+        return str(self.runtime.path("wolfrat_mods.json"))
 
     def _load_config(self):
         try:
@@ -5041,7 +4924,7 @@ class ModsTab(QWidget):
         self.server.refresh_available_maps()
         self.mod_log.addItem(f"[{time.strftime('%H:%M:%S')}] Refreshing maps from server...")
         # Update info label after a short delay (responses arrive async)
-        QTimer.singleShot(2000, self._update_maps_info)
+        schedule_once(self, 2000, self._update_maps_info)
 
     def _update_maps_info(self):
         """Update the maps info label from store."""
@@ -5134,14 +5017,14 @@ class ModsTab(QWidget):
         if cmd == '!kd':
             wire_log(f"[MODS] !kd triggered: sender={sender} args={args}")
             if not hasattr(self, 'messages_tab') or not self.messages_tab:
-                wire_log(f"[MODS] !kd: no messages_tab")
+                wire_log("[MODS] !kd: no messages_tab")
                 return
             if not self.messages_tab._kd_enabled:
-                wire_log(f"[MODS] !kd: kd_enabled=False")
+                wire_log("[MODS] !kd: kd_enabled=False")
                 return
             stats_store = self.messages_tab.stats_store
             if not stats_store:
-                wire_log(f"[MODS] !kd: no stats_store")
+                wire_log("[MODS] !kd: no stats_store")
                 return
             # If args provided, look up that player; otherwise look up sender
             if args:
@@ -5433,7 +5316,7 @@ class ModsTab(QWidget):
                     map_tab.on_vote(sender, int(cmd[1:]))
                     wire_log(f"[VOTE] Forwarded {cmd} from {sender}")
                 else:
-                    wire_log(f"[VOTE] No map_voting_tab found")
+                    wire_log("[VOTE] No map_voting_tab found")
             except Exception as e:
                 wire_log(f"[VOTE] Error forwarding vote: {e}")
             return
@@ -5616,10 +5499,15 @@ class ModsTab(QWidget):
             self._submit_mod_action(
                 lambda: self.server.set_time_of_day(time_str),
                 context="Set time of day",
-                announcement=f"Time of day set to {hour:02d}:00",
-                log_message=(
-                    f"[{now}] {sender} set time of day to {hour:02d}:00"
+                announcement=(
+                    f"Time-of-day request accepted for {hour:02d}:00; "
+                    "retail provides no readback"
                 ),
+                log_message=(
+                    f"[{now}] {sender} requested time of day "
+                    f"{hour:02d}:00 (unverified)"
+                ),
+                policy=CompletionPolicy.ACCEPTED,
             )
 
         elif cmd == '!gametime':
@@ -5754,8 +5642,12 @@ class ModsTab(QWidget):
                 self.mod_log.addItem(f"[{now}] {sender} tried !remove but '{map_name}' not found")
 
     def _schedule_vote_milestones(self, vote_id):
-        QTimer.singleShot(20000, lambda: self._vote_milestone(vote_id, 20))
-        QTimer.singleShot(40000, lambda: self._vote_milestone(vote_id, 40))
+        schedule_once(
+            self, 20000, lambda: self._vote_milestone(vote_id, 20)
+        )
+        schedule_once(
+            self, 40000, lambda: self._vote_milestone(vote_id, 40)
+        )
 
     def _vote_milestone(self, vote_id, seconds):
         if not self._vote_active or getattr(self, '_vote_id', 0) != vote_id:
@@ -5775,8 +5667,12 @@ class ModsTab(QWidget):
             )
 
     def _schedule_skip_milestones(self, skip_id):
-        QTimer.singleShot(20000, lambda: self._skip_milestone(skip_id, 20))
-        QTimer.singleShot(40000, lambda: self._skip_milestone(skip_id, 40))
+        schedule_once(
+            self, 20000, lambda: self._skip_milestone(skip_id, 20)
+        )
+        schedule_once(
+            self, 40000, lambda: self._skip_milestone(skip_id, 40)
+        )
 
     def _skip_milestone(self, skip_id, seconds):
         if not self._skip_active or getattr(self, '_skip_id', 0) != skip_id:
@@ -5845,10 +5741,18 @@ class MapVotingTab(QWidget):
 
     raw_chat_signal = pyqtSignal(str)
 
-    def __init__(self, server: ServerManager, missions_tab: MissionsTab):
+    def __init__(
+        self,
+        server: ServerManager,
+        missions_tab: MissionsTab,
+        runtime: DesktopRuntime | None = None,
+    ):
         super().__init__()
         self.server = server
-        self._admin_futures = AdminFutureBridge(self, self.log)
+        self.runtime = runtime or DesktopRuntime.production()
+        self._admin_futures = QtAdminDispatcher(
+            parent=self, error_sink=self.log
+        )
         self.missions_tab = missions_tab
         self.server._map_voting_tab = self  # allow mods system to forward votes
 
@@ -5868,9 +5772,9 @@ class MapVotingTab(QWidget):
         self._server_game_time_remaining = 0  # remaining minutes from server
         self._server_time_updated = 0  # timestamp of last server update
 
-        import json, os, sys
-        base = os.path.dirname(sys.argv[0]) if not getattr(sys, 'frozen', False) else os.path.dirname(sys.executable)
-        self._recently_played_file = os.path.join(base, 'wolfrat_recently_played.json')
+        self._recently_played_file = str(
+            self.runtime.path("wolfrat_recently_played.json")
+        )
         try:
             if os.path.exists(self._recently_played_file):
                 with open(self._recently_played_file, 'r', encoding='utf-8') as f:
@@ -5918,7 +5822,7 @@ class MapVotingTab(QWidget):
 
         self._build_ui()
 
-        self._tick_timer = QTimer()
+        self._tick_timer = QTimer(self)
         self._tick_timer.timeout.connect(self._tick)
         self._tick_timer.start(5000)
 
@@ -6113,7 +6017,7 @@ class MapVotingTab(QWidget):
             # -------------------------------------------------------
 
             self._save_recently_played()
-            QTimer.singleShot(500, self._update_blacklist_label)
+            schedule_once(self, 500, self._update_blacklist_label)
 
     def update_game_time(self, total_mins, remaining_mins):
         """Called by SettingsTab when GameTime is received from server."""
@@ -6195,7 +6099,7 @@ class MapVotingTab(QWidget):
             self._recently_played.append(self._current_map)
             self._save_recently_played()
         elif not has_players:
-            self.log(f"Server empty. Current map not blacklisted.")
+            self.log("Server empty. Current map not blacklisted.")
         # -------------------------------------------------------------------
 
         # Pick random maps, excluding recent if possible
@@ -6215,7 +6119,7 @@ class MapVotingTab(QWidget):
                 self.log(f"Fewer than {num_choices} non-blacklisted maps available. Clearing blacklist.")
                 self._recently_played.clear()
                 self._save_recently_played()
-                QTimer.singleShot(500, self._update_blacklist_label)
+                schedule_once(self, 500, self._update_blacklist_label)
                 pool = [
                     (self.missions_tab._mission_entry_at(idx), fname)
                     for idx, fname in enumerate(rotation)
@@ -6257,7 +6161,8 @@ class MapVotingTab(QWidget):
 
         # Send options with delays to avoid truncation
         def send_opt(i):
-            if i >= len(self._map_choices): return
+            if i >= len(self._map_choices):
+                return
             _mission, fname = self._map_choices[i]
             display = self.missions_tab._find_display_name(fname)
             # Leave room for the "N: " prefix so the name is trimmed here rather
@@ -6271,10 +6176,15 @@ class MapVotingTab(QWidget):
 
         # Dynamically queue chat messages for however many choices we have
         for i in range(num_choices):
-            QTimer.singleShot((i + 1) * 1000, lambda idx=i: send_opt(idx))
+            schedule_once(
+                self,
+                (i + 1) * 1000,
+                lambda idx=i: send_opt(idx),
+            )
 
         dur_mins = self.duration_spin.value()
-        QTimer.singleShot(
+        schedule_once(
+            self,
             (num_choices + 1) * 1000,
             lambda: self._send_vote_chat(
                 f"Type {options_text}. You have {dur_mins} mins!",
@@ -6296,8 +6206,6 @@ class MapVotingTab(QWidget):
             else:
                 parts = []
                 for i in range(num_choices):
-                    fname = self._map_choices[i][1]
-                    display = self.missions_tab._find_display_name(fname)
                     parts.append(f"{i+1}:{counts.get(i+1,0)}")
                 self._send_vote_chat(
                     f"Votes: {', '.join(parts)} ({total} total)",
@@ -6422,7 +6330,7 @@ class MapVotingTab(QWidget):
             self.log(f"0 votes cast. {fname} not added to blacklist.")
 
         self._save_recently_played()
-        QTimer.singleShot(500, self._update_blacklist_label)
+        schedule_once(self, 500, self._update_blacklist_label)
 
     def _vote_winner_failed(self, display):
         self._vote_stage = 'done'
@@ -6490,44 +6398,15 @@ class MapVotingTab(QWidget):
                 continue
 
 
-class DownloadWorker(QThread):
-    progress = pyqtSignal(int)
-    finished = pyqtSignal(str)
-    error = pyqtSignal(str)
-
-    def __init__(self, url, dest):
-        super().__init__()
-        self.url = url
-        self.dest = dest
-
-    def run(self):
-        try:
-            import urllib.request
-            req = urllib.request.Request(self.url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=10) as response, open(self.dest, 'wb') as out_file:
-                total_size = int(response.getheader('Content-Length', 0))
-                downloaded = 0
-                chunk_size = 8192
-                while True:
-                    chunk = response.read(chunk_size)
-                    if not chunk:
-                        break
-                    out_file.write(chunk)
-                    downloaded += len(chunk)
-                    if total_size > 0:
-                        percent = int((downloaded / total_size) * 100)
-                        self.progress.emit(percent)
-            self.finished.emit(self.dest)
-        except Exception as e:
-            self.error.emit(str(e))
-
 class WeaponsTab(QWidget):
     """Weapons Availability Matrix Tab"""
 
     def __init__(self, server):
         super().__init__()
         self.server = server
-        self._admin_futures = AdminFutureBridge(self, self.server._log)
+        self._admin_futures = QtAdminDispatcher(
+            parent=self, error_sink=self.server._log
+        )
         self._weapons_by_row = []
         self._loading = False
         self._build_ui()
@@ -6623,10 +6502,10 @@ class WeaponsTab(QWidget):
                 bg_group.addButton(cb, col)
 
                 widget = QWidget()
-                l = QHBoxLayout(widget)
-                l.addWidget(cb)
-                l.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                l.setContentsMargins(0, 0, 0, 0)
+                cell_layout = QHBoxLayout(widget)
+                cell_layout.addWidget(cb)
+                cell_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                cell_layout.setContentsMargins(0, 0, 0, 0)
 
                 self.weapon_table.setCellWidget(i, col, widget)
 
@@ -6667,17 +6546,28 @@ class WeaponsTab(QWidget):
 class WebAdminTab(QWidget):
     """Web Admin settings tab - configure the embedded web server for mobile access."""
 
-    def __init__(self, web_server):
+    _web_start_finished_signal = pyqtSignal(object)
+
+    def __init__(
+        self,
+        web_server,
+        runtime: DesktopRuntime | None = None,
+    ):
         super().__init__()
         self.ws = web_server
+        self.runtime = runtime or DesktopRuntime.production()
         self._config_path = self._get_config_path()
         self._config = self._load_config()
+        self._pending_web_start = None
+        self._web_start_finished_signal.connect(
+            self._web_start_completed,
+            Qt.ConnectionType.QueuedConnection,
+        )
         self._build_ui()
         self._apply_config()
 
     def _get_config_path(self):
-        base = os.path.dirname(sys.argv[0]) if not getattr(sys, 'frozen', False) else os.path.dirname(sys.executable)
-        return os.path.join(base, 'wolfrat_web.json')
+        return str(self.runtime.path("wolfrat_web.json"))
 
     def _load_config(self):
         try:
@@ -6723,15 +6613,18 @@ class WebAdminTab(QWidget):
         self.ws.load_login_ips(saved_ips)
         # Set callback to persist new logins
         self.ws.on_login = self._on_web_login
-        # Start if enabled
-        if self._config.get('web_enabled', False):
-            self.ws.port = self._config.get('web_port', 8070)
-            self.ws.start()
-            self._update_status()
         # Update status bar LED
         parent = self.window()
         if hasattr(parent, 'update_web_led'):
             parent.update_web_led(self.ws.is_running)
+
+    def start_configured_server(self):
+        """Start the persisted listener after the desktop lifecycle begins."""
+
+        if not self._config.get("web_enabled", False):
+            return
+        self.ws.port = self._config.get("web_port", 8070)
+        self._observe_web_start(self.ws.start())
 
     def _on_web_login(self, ip, timestamp):
         """Called by web server when a new login happens. Persists to config."""
@@ -6865,20 +6758,20 @@ class WebAdminTab(QWidget):
         enabled = state == 2  # Qt.CheckState.Checked
         if enabled:
             self.ws.port = self.port_spin.value()
-            self.ws.start()
+            self._observe_web_start(self.ws.start())
         else:
+            self._pending_web_start = None
             self.ws.stop()
-        self._update_status()
+            self._update_status()
         self._save_config()
 
     def _on_port_change(self, port):
         if self._loading:
             return
         self._save_config()
-        if self.ws.is_running:
+        if self.enable_cb.isChecked():
             self.ws.port = port
-            self.ws.restart()
-            self._update_status()
+            self._observe_web_start(self.ws.restart())
 
     def _on_user_change(self, text):
         if self._loading:
@@ -6906,11 +6799,56 @@ class WebAdminTab(QWidget):
             self._save_config()
             self._show_msg("New token generated!")
 
-    def _update_status(self):
+    def _observe_web_start(self, future):
+        self._pending_web_start = future
+        self.status_label.setText("Starting…")
+        self.status_label.setStyleSheet(
+            "font-size: 12pt; font-weight: bold; color: #e8c840;"
+        )
+        self.url_label.setText("-")
+        parent = self.window()
+        if hasattr(parent, 'update_web_led'):
+            parent.update_web_led(False)
+        future.add_done_callback(self._web_start_finished_signal.emit)
+
+    def _web_start_completed(self, future):
+        if future is not self._pending_web_start:
+            return
+        self._pending_web_start = None
+        try:
+            outcome = future.result()
+        except Exception as error:
+            self._disable_web_after_start_failure()
+            self._update_status(error=str(error))
+            return
+        if outcome.ok and self.ws.is_running:
+            self._update_status()
+            return
+        self._disable_web_after_start_failure()
+        self._update_status(
+            error=outcome.error or "Web server stopped before becoming ready"
+        )
+
+    def _disable_web_after_start_failure(self):
+        self._loading = True
+        try:
+            self.enable_cb.setChecked(False)
+        finally:
+            self._loading = False
+        self._save_config()
+
+    def _update_status(self, error=None):
         if self.ws.is_running:
             self.status_label.setText("Running")
             self.status_label.setStyleSheet("font-size: 12pt; font-weight: bold; color: #50ff50;")
             self.url_label.setText(f"http://localhost:{self.port_spin.value()}")
+        elif error:
+            self.status_label.setText("Failed")
+            self.status_label.setStyleSheet(
+                "font-size: 12pt; font-weight: bold; color: #ff8040;"
+            )
+            self.url_label.setText("-")
+            self._show_msg(error)
         else:
             self.status_label.setText("Stopped")
             self.status_label.setStyleSheet("font-size: 12pt; font-weight: bold; color: #ff4040;")
@@ -6955,8 +6893,23 @@ class WebAdminTab(QWidget):
 class MainWindow(QMainWindow):
     """WolfRAT 2.4.11 Main Window."""
 
-    def __init__(self):
+    def __init__(self, runtime: DesktopRuntime | None = None):
         super().__init__()
+        self.runtime = runtime or DesktopRuntime.production()
+        self._started = False
+        self._shutdown = False
+        self._web_led_timer = QTimer(self)
+        self._web_led_timer.setSingleShot(True)
+        self._web_led_timer.timeout.connect(self._refresh_web_led)
+        self._autoconnect_timer = QTimer(self)
+        self._autoconnect_timer.setSingleShot(True)
+        self._autoconnect_timer.timeout.connect(self._auto_connect_last)
+        self._feedback_timer = QTimer(self)
+        self._feedback_timer.setSingleShot(True)
+        self._feedback_timer.timeout.connect(self._clear_feedback)
+        self._sync_led_timer = QTimer(self)
+        self._sync_led_timer.setSingleShot(True)
+        self._sync_led_timer.timeout.connect(self._clear_sync_led)
         self.setWindowTitle("WolfRAT 2.4.11 - Joint Operations Server Admin")
 
         # Set Window Icon
@@ -6969,10 +6922,9 @@ class MainWindow(QMainWindow):
 
         # Server manager
         self.server = ServerManager()
-        self.server._app = self  # Back-reference for store access
         self.signals = LogSignals()
-        self.missions_store = MissionsStore()
-        self.stats_store = StatsStore()
+        self.missions_store = MissionsStore(self.runtime)
+        self.stats_store = StatsStore(self.runtime)
 
         # Web server for mobile access - disabled by default
         self.web_server = WolfWebServer(self.server)
@@ -7066,21 +7018,30 @@ class MainWindow(QMainWindow):
         # Tabs
         self.tabs = QTabWidget()
 
-        self.server_tab = ServerTab(self.server, self.signals)
+        self.server_tab = ServerTab(self.server, self.signals, self.runtime)
         self.console_tab = ConsoleTab(self.server)
         self.players_tab = PlayersTab(self.server)
-        self.missions_tab = MissionsTab(self.server, self.missions_store)
-        self.settings_tab = SettingsTab(self.server)
+        self.missions_tab = MissionsTab(
+            self.server, self.missions_store, self.runtime
+        )
+        self.settings_tab = SettingsTab(self.server, self.runtime)
         self.weapons_tab = WeaponsTab(self.server)
-        self.chatbot_tab = ChatBotTab(self.server)
-        self.messages_tab = MessagesTab(self.server, self.stats_store)
-        self.spree_tab = SpreeTab(self.server, self.messages_tab)
-        self.mods_tab = ModsTab(self.server, self.missions_store)
-        self.map_voting_tab = MapVotingTab(self.server, self.missions_tab)
-        self.web_admin_tab = WebAdminTab(self.web_server)
+        self.chatbot_tab = ChatBotTab(self.server, self.runtime)
+        self.messages_tab = MessagesTab(
+            self.server, self.stats_store, self.runtime
+        )
+        self.spree_tab = SpreeTab(
+            self.server, self.messages_tab, self.runtime
+        )
+        self.mods_tab = ModsTab(
+            self.server, self.missions_store, self.runtime
+        )
+        self.map_voting_tab = MapVotingTab(
+            self.server, self.missions_tab, self.runtime
+        )
+        self.web_admin_tab = WebAdminTab(self.web_server, self.runtime)
 
         # Wire up cross-tab references
-        self.server_tab.missions_tab = self.missions_tab
         self.missions_tab._main_window = self
         self.missions_store._missions_tab = self.missions_tab
         self.settings_tab.mods_tab = self.mods_tab
@@ -7177,23 +7138,25 @@ class MainWindow(QMainWindow):
         ver_label.setStyleSheet("font-size: 9pt; color: #444;")
         status_bar.addWidget(ver_label)
 
-        status_bar.addSpacing(10)
-
-        update_btn = QPushButton("Check for Updates")
-        update_btn.setStyleSheet("font-size: 8pt; padding: 2px 8px; background: #222; border: 1px solid #444; border-radius: 3px;")
-        update_btn.clicked.connect(self._check_for_updates)
-        status_bar.addWidget(update_btn)
-
         status_widget = QWidget()
         status_widget.setLayout(status_bar)
         status_widget.setStyleSheet("background-color: #0a0a00; border-top: 1px solid #1a1a00;")
         layout.addWidget(status_widget)
 
-        # Sync web LED with actual server state (WebAdminTab may have started server before status bar existed)
-        QTimer.singleShot(100, lambda: self.update_web_led(self.web_server.is_running))
+    def start(self):
+        """Begin explicitly permitted external startup behavior."""
 
-        # Auto-connect to last server on launch
-        QTimer.singleShot(500, self._auto_connect_last)
+        if self._started:
+            return
+        self._started = True
+        self._web_led_timer.start(100)
+        if self.runtime.web_autostart_enabled:
+            self.web_admin_tab.start_configured_server()
+        if self.runtime.auto_connect_enabled:
+            self._autoconnect_timer.start(500)
+
+    def _refresh_web_led(self):
+        self.update_web_led(self.web_server.is_running)
 
     def set_connected(self, connected, text="Connected"):
         if connected:
@@ -7212,13 +7175,21 @@ class MainWindow(QMainWindow):
     def show_feedback(self, msg):
         """Show temporary feedback message in status bar."""
         self.feedback_label.setText(msg)
-        QTimer.singleShot(3000, lambda: self.feedback_label.setText(""))
+        self._feedback_timer.start(3000)
+
+    def _clear_feedback(self):
+        self.feedback_label.setText("")
 
     def flash_sync_led(self):
         """Flash the sync LED green to indicate server data reception."""
         if hasattr(self, 'sync_led_label'):
             self.sync_led_label.setStyleSheet("font-size: 10pt; color: #50ff50; padding: 2px 4px;")
-            QTimer.singleShot(300, lambda: self.sync_led_label.setStyleSheet("font-size: 10pt; color: #444444; padding: 2px 4px;"))
+            self._sync_led_timer.start(300)
+
+    def _clear_sync_led(self):
+        self.sync_led_label.setStyleSheet(
+            "font-size: 10pt; color: #444444; padding: 2px 4px;"
+        )
 
     def update_web_led(self, running):
         """Update the web server status LED in the status bar."""
@@ -7240,132 +7211,35 @@ class MainWindow(QMainWindow):
         # When map changes, update the status bar directly from the mission cycle parser
         # The true name is pushed by MissionsTab, but we can safely fallback to state if needed.
 
-    def _check_for_updates(self):
-        """Check fmj-squad.com/version.json for updates."""
-        try:
-            import urllib.request
-            import json
-            req = urllib.request.Request(
-                "http://fmj-squad.com/version.json",
-                headers={'User-Agent': 'Mozilla/5.0'}
-            )
-            resp = urllib.request.urlopen(req, timeout=5)
-            data = json.loads(resp.read())
+    def shutdown(self):
+        """Release every application-owned resource. Safe to call repeatedly."""
 
-            wolfrat_data = data.get("wolfrat", {})
-            latest_version = wolfrat_data.get("version", "2.4.11")
-            current = "2.4.11"
-
-            if latest_version != current:
-                # Custom dialog with scrollable changelog
-                dlg = QDialog(self)
-                dlg.setWindowTitle("Update Available")
-                dlg.setMinimumSize(450, 350)
-                dlg.setMaximumSize(600, 500)
-                dlg.resize(500, 400)
-                layout = QVBoxLayout(dlg)
-
-                header = QLabel(f"A new version of WolfRAT is available!")
-                header.setStyleSheet("font-weight: bold; font-size: 11pt; color: #e8c840;")
-                layout.addWidget(header)
-
-                versions = QLabel(f"Current: v{current}    →    Latest: v{latest_version}")
-                versions.setStyleSheet("color: #a89830; font-size: 10pt;")
-                layout.addWidget(versions)
-
-                changelog = QTextEdit()
-                changelog.setReadOnly(True)
-                changelog.setPlainText(wolfrat_data.get('notes', 'No changelog available.'))
-                changelog.setStyleSheet("font-family: 'Segoe UI', Arial; font-size: 9pt; color: #e8c840; background-color: #050500; border: 1px solid #1a1a00; padding: 6px;")
-                layout.addWidget(changelog, 1)
-
-                question = QLabel("Would you like to download and install it now?")
-                question.setStyleSheet("color: #e8c840; font-size: 10pt; padding-top: 6px;")
-                layout.addWidget(question)
-
-                btn_row = QHBoxLayout()
-                btn_row.addStretch()
-                yes_btn = QPushButton("Yes")
-                yes_btn.setMinimumWidth(80)
-                yes_btn.clicked.connect(dlg.accept)
-                btn_row.addWidget(yes_btn)
-                no_btn = QPushButton("No")
-                no_btn.setMinimumWidth(80)
-                no_btn.clicked.connect(dlg.reject)
-                btn_row.addWidget(no_btn)
-                layout.addLayout(btn_row)
-
-                if dlg.exec() == QDialog.DialogCode.Accepted:
-                    self._start_update_download(wolfrat_data.get("exe_url", "http://fmj-squad.com/downloads/WolfRAT2.exe"))
-            else:
-                QMessageBox.information(self, "Up to Date", "You are running the latest version of WolfRAT.")
-
-        except Exception as e:
-            QMessageBox.warning(self, "Update Check Failed", f"Could not check for updates.\n\nError: {e}")
-
-    def _start_update_download(self, url):
-        if not url:
-            QMessageBox.warning(self, "Error", "No download URL provided in the update config.")
+        if self._shutdown:
             return
+        self._shutdown = True
+        for timer in self.findChildren(QTimer):
+            timer.stop()
 
-        self.progress_dialog = QProgressDialog("Downloading update...", "Cancel", 0, 100, self)
-        self.progress_dialog.setWindowTitle("Updating WolfRAT")
-        self.progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
-        self.progress_dialog.setAutoClose(True)
-        self.progress_dialog.show()
+        cleanups = [
+            ("retail connection", self.server_tab.shutdown),
+            ("web server", self.web_server.stop),
+            ("stats database", self.stats_store.close),
+        ]
+        if self.runtime.telemetry_enabled:
+            from wolfrat import bstats
 
-        import os, sys, tempfile
-        base_dir = os.path.dirname(sys.argv[0]) if not getattr(sys, 'frozen', False) else os.path.dirname(sys.executable)
-        dest_path = os.path.join(tempfile.gettempdir(), "WolfRAT2_update.exe")
+            cleanups.append(("telemetry", bstats.bstats_stop))
 
-        self.dl_worker = DownloadWorker(url, dest_path)
-        self.dl_worker.progress.connect(self.progress_dialog.setValue)
-        self.dl_worker.finished.connect(self._on_download_finished)
-        self.dl_worker.error.connect(self._on_download_error)
-        self.progress_dialog.canceled.connect(self.dl_worker.terminate)
-        self.dl_worker.start()
-
-    def _on_download_error(self, err):
-        self.progress_dialog.close()
-        QMessageBox.warning(self, "Download Failed", f"Failed to download update:\n\n{err}")
-
-    def _on_download_finished(self, dest_path):
-        self.progress_dialog.close()
-        import os, sys, subprocess, tempfile, shutil
-
-        if not getattr(sys, 'frozen', False):
-            QMessageBox.information(self, "Update", "Update downloaded! (Running from source, skipping update).")
-            return
-
-        current_exe = os.path.abspath(sys.executable)
-        pid = os.getpid()
-
-        # Extract bundled updater.exe to temp dir
-        updater_dest = os.path.join(tempfile.gettempdir(), "fmj_updater.exe")
-
-        bundled_updater = os.path.join(sys._MEIPASS, 'updater.exe')
-        if not os.path.exists(bundled_updater):
-            bundled_updater = os.path.join(os.path.dirname(current_exe), 'updater.exe')
-        if os.path.exists(bundled_updater):
-            shutil.copy2(bundled_updater, updater_dest)
-        else:
-            QMessageBox.critical(self, "Update Error", "Could not find updater component. Please download the update manually from fmj-squad.com")
-            return
-
-        # Launch updater: updater.exe <old_exe> <new_exe> <pid>
-        subprocess.Popen(
-            [updater_dest, current_exe, dest_path, str(pid)],
-            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
-        )
-
-        # Exit the application
-        QApplication.quit()
+        for label, cleanup in cleanups:
+            try:
+                cleanup()
+            except Exception as error:
+                wire_log(f"Shutdown could not stop {label}: {error}")
 
     def closeEvent(self, event):
         """Clean shutdown."""
-        self.web_server.stop()
-        self.server.stop_polling()
-        self.server.disconnect()
+
+        self.shutdown()
         event.accept()
 
 
@@ -7373,7 +7247,6 @@ def _set_dark_title_bar(window):
     """Enable dark title bar on Windows 10/11."""
     try:
         import ctypes
-        from ctypes import wintypes
         hwnd = int(window.winId())
         DWMWA_USE_IMMERSIVE_DARK_MODE = 20
         ctypes.windll.dwmapi.DwmSetWindowAttribute(
@@ -7384,48 +7257,188 @@ def _set_dark_title_bar(window):
         pass  # Not on Windows or API not available
 
 
-def main():
-    # Log startup
-    try:
-        from protocol import wire_log
-        wire_log("=== WolfRAT 2.4.11 STARTED ===")
-    except Exception:
-        pass
+def start_desktop(
+    app: QApplication,
+    runtime: DesktopRuntime | None = None,
+) -> MainWindow:
+    """Construct, show, and start the desktop through one lifecycle seam."""
 
-    # B-Stats: anonymous usage analytics
+    runtime = runtime or DesktopRuntime.production()
+    app.setStyleSheet(DARK_STYLE)
+    app.setApplicationName("WolfRAT 2.4.11")
+    sounds.set_enabled(runtime.audio_enabled)
+    if runtime.audio_enabled:
+        sounds.initialize()
+
+    window = MainWindow(runtime)
+    app.aboutToQuit.connect(window.shutdown)
+    _set_dark_title_bar(window)
+    window.show()
+    window.start()
+    return window
+
+
+def schedule_desktop_smoke(
+    app: QApplication,
+    window: MainWindow,
+    *,
+    delay_ms: int = 750,
+    exit_app: bool = False,
+):
+    """Verify a real desktop instance and write a machine-readable result."""
+
+    result_path = window.runtime.path("wolfrat_smoke.json")
+
+    def finish():
+        try:
+            package_dir = os.path.dirname(__file__)
+            expected_routes = {
+                "/",
+                "/api/auth",
+                "/api/status",
+                "/static/style.css",
+                "/static/app.js",
+            }
+            try:
+                application = window.web_server.application
+                actual_routes = {
+                    route.resource.canonical
+                    for route in application.router.routes()
+                }
+                web_application_available = expected_routes <= actual_routes
+            except Exception:
+                web_application_available = False
+            resources = {
+                "icon": os.path.isfile(
+                    os.path.join(package_dir, "icon.ico")
+                ),
+                "web_templates": all(
+                    os.path.isfile(
+                        os.path.join(
+                            package_dir,
+                            "web_templates",
+                            filename,
+                        )
+                    )
+                    for filename in ("index.html", "style.css", "app.js")
+                ),
+                "sounds": all(
+                    os.path.isfile(
+                        os.path.join(package_dir, "sounds", filename)
+                    )
+                    for filename in (
+                        "click.wav",
+                        "connect.wav",
+                        "disconnect.wav",
+                        "warning.wav",
+                    )
+                ),
+                "web_application": web_application_available,
+            }
+            checks = {
+                "tab_count": window.tabs.count() == 12,
+                "web_stopped": not window.web_server.is_running,
+                "retail_disconnected": not window.server.is_connected,
+                **resources,
+            }
+            payload = {
+                "ok": all(checks.values()),
+                "tab_count": window.tabs.count(),
+                "resources": resources,
+                "checks": checks,
+            }
+        except BaseException as error:
+            payload = {
+                "ok": False,
+                "error": f"{type(error).__name__}: {error}",
+            }
+        try:
+            result_path.write_text(
+                json.dumps(payload, indent=2),
+                encoding="utf-8",
+            )
+        finally:
+            window.close()
+            if exit_app:
+                app.exit(0 if payload["ok"] else 1)
+
+    schedule_once(window, delay_ms, finish)
+    return result_path
+
+
+def main(argv=None, runtime: DesktopRuntime | None = None):
+    raw_arguments = list(sys.argv if argv is None else argv)
     try:
-        from wolfrat import bstats
-        bstats.bstats_start("wolfrat", "2.4.11")
-    except Exception:
-        pass
+        launch = parse_launch_args(raw_arguments)
+    except ValueError as error:
+        print(f"WolfRAT startup error: {error}")
+        return 2
+    runtime = runtime or launch.runtime
+    wire_log("=== WolfRAT 2.4.11 STARTED ===")
 
     # Catch-all exception handler for debugging
     import traceback
+
+    def write_smoke_failure(error):
+        payload = {
+            "ok": False,
+            "error": f"{type(error).__name__}: {error}",
+        }
+        try:
+            runtime.path("wolfrat_smoke.json").write_text(
+                json.dumps(payload, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
     def excepthook(exc_type, exc_value, exc_tb):
         tb = ''.join(traceback.format_exception(exc_type, exc_value, exc_tb))
         print(f"\n=== CRASH ===\n{tb}\n============")
         try:
-            with open('wolfrat_crash.log', 'w') as f:
+            with open(runtime.path("wolfrat_crash.log"), 'w') as f:
                 f.write(tb)
         except Exception:
             pass
-        # Show error dialog if possible
+        if launch.smoke_test:
+            write_smoke_failure(exc_value)
+            application = QApplication.instance()
+            if application is not None:
+                application.exit(1)
+            return
         try:
             QMessageBox.critical(None, "WolfRAT Crash", f"An error occurred:\n\n{tb[-1000:]}")
         except Exception:
             pass
     sys.excepthook = excepthook
 
-    app = QApplication(sys.argv)
-    app.setStyleSheet(DARK_STYLE)
-    app.setApplicationName("WolfRAT 2.4.11")
+    try:
+        app = QApplication(list(launch.qt_argv))
+        window = start_desktop(app, runtime)
+    except BaseException as error:
+        if launch.smoke_test:
+            write_smoke_failure(error)
+            return 1
+        raise
 
-    window = MainWindow()
-    _set_dark_title_bar(window)
-    window.show()
+    if runtime.telemetry_enabled:
+        try:
+            from wolfrat import bstats
 
-    sys.exit(app.exec())
+            bstats.bstats_start(
+                "wolfrat",
+                "2.4.11",
+                data_dir=runtime.data_dir,
+            )
+        except Exception:
+            pass
+    if launch.smoke_test:
+        schedule_desktop_smoke(app, window, exit_app=True)
+    try:
+        return app.exec()
+    finally:
+        window.shutdown()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

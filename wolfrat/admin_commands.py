@@ -219,6 +219,7 @@ class AdminSnapshot:
 
 
 ReplyParser = Callable[[str, int], Any]
+ReplyValidator = Callable[[Sequence[str]], bool]
 
 
 @dataclass(frozen=True)
@@ -229,12 +230,20 @@ class CommandSpec:
     parser: Optional[ReplyParser] = None
     mutating: bool = False
     identity: Optional[IdentityRef] = None
+    reply_validator: Optional[ReplyValidator] = None
 
     def __post_init__(self) -> None:
         _validate_wire_text(self.text)
 
     def parse(self, payload: str, revision: int) -> Any:
         return self.parser(payload, revision) if self.parser else payload
+
+    def accepts_replies(self, replies: Sequence[str]) -> bool:
+        """Return whether replies satisfy this command's ACK contract."""
+
+        if self.reply_validator is None:
+            return True
+        return bool(self.reply_validator(replies))
 
 
 def _validate_wire_text(text: str) -> str:
@@ -422,9 +431,16 @@ def _spec(
     mutating: bool = False,
     reply_policy: ReplyPolicy = ReplyPolicy.ONE,
     identity: Optional[IdentityRef] = None,
+    reply_validator: Optional[ReplyValidator] = None,
 ) -> CommandSpec:
     return CommandSpec(
-        text, operation, reply_policy, parser, mutating, identity,
+        text,
+        operation,
+        reply_policy,
+        parser,
+        mutating,
+        identity,
+        reply_validator,
     )
 
 
@@ -735,7 +751,18 @@ def _cmd_spec(arguments: str, operation: AdminOperation) -> CommandSpec:
     _validate_argument(arguments)
     if len(arguments) > MAX_CMD_ARGUMENT_LEN:
         raise ValueError(f"CMD arguments cannot exceed {MAX_CMD_ARGUMENT_LEN} characters")
-    return _spec(f"CMD {arguments}", operation, mutating=True)
+    return _spec(
+        f"CMD {arguments}",
+        operation,
+        mutating=True,
+        reply_validator=_accepts_cmd_reply,
+    )
+
+
+def _accepts_cmd_reply(replies: Sequence[str]) -> bool:
+    return tuple(replies) == (
+        "OK - Command executed.",
+    )
 
 
 def raw_command(text: str) -> CommandSpec:

@@ -1,10 +1,4 @@
-"""Static safety contract for Qt-facing asynchronous admin operations.
-
-The deterministic suite does not install PyQt, so these tests inspect the
-desktop source instead of importing it.  They lock the important thread and
-future boundaries while the protocol behavior is exercised by the runtime
-tests in the rest of this suite.
-"""
+"""Supplementary static contracts for Qt-facing admin call sites."""
 
 from __future__ import annotations
 
@@ -179,32 +173,9 @@ class DesktopAsyncContractTests(unittest.TestCase):
             "raw chat delivery must be explicitly queued onto the GUI thread",
         )
 
-    def test_future_bridge_gates_callbacks_on_accepted_results(self):
-        bridge = _class("AdminFutureBridge")
-        initializer = _method("AdminFutureBridge", "__init__")
-        submit = _method("AdminFutureBridge", "submit")
-        deliver = _method("AdminFutureBridge", "_deliver")
-
-        self.assertTrue(_calls(submit, "add_done_callback"))
-        self.assertTrue(
-            any(
-                isinstance(argument, ast.Attribute)
-                and argument.attr == "QueuedConnection"
-                for call in _calls(initializer, "connect")
-                for argument in call.args
-            )
-        )
-        delivery_source = ast.unparse(deliver)
-        self.assertIn("'accepted'", delivery_source)
-        self.assertIn("'verified'", delivery_source)
-        self.assertIn("'verification_error'", delivery_source)
-        self.assertIn("is False", delivery_source)
-        self.assertIn("is not True", delivery_source)
-
     def test_raw_console_uses_explicit_ack_only_completion_mode(self):
         send_command = _method("ConsoleTab", "_send_command")
         accepted = _method("ConsoleTab", "_raw_command_accepted")
-        bridge_deliver = _method("AdminFutureBridge", "_deliver")
 
         raw_calls = _calls(send_command, "execute_raw")
         self.assertEqual(1, len(raw_calls))
@@ -216,22 +187,76 @@ class DesktopAsyncContractTests(unittest.TestCase):
             and call.func.id == "submit_admin"
         ]
         self.assertEqual(1, len(submit_calls))
-        mode = next(
+        policy = next(
             (
                 keyword.value
                 for keyword in submit_calls[0].keywords
-                if keyword.arg == "result_mode"
+                if keyword.arg == "policy"
             ),
             None,
         )
-        self.assertIsInstance(mode, ast.Constant)
-        self.assertEqual("raw", mode.value)
+        self.assertIsInstance(policy, ast.Attribute)
+        self.assertEqual("ACCEPTED", policy.attr)
         self.assertEqual([], _calls(send_command, "clear"))
         self.assertTrue(_calls(accepted, "clear"))
 
-        bridge_source = ast.unparse(bridge_deliver)
-        self.assertIn("result_mode == 'typed'", bridge_source)
-        self.assertIn("result_mode == 'raw'", bridge_source)
+        submit_helper = next(
+            node
+            for node in TREE.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "submit_admin"
+        )
+        helper_source = ast.unparse(submit_helper)
+        self.assertIn(
+            "policy=CompletionPolicy.VERIFIED",
+            helper_source,
+        )
+
+    def test_unreadable_console_time_effects_are_only_reported_as_accepted(self):
+        settings_methods = (
+            _method("SettingsTab", "_on_time_of_day"),
+            _method("SettingsTab", "_on_time_rate"),
+        )
+        for method in settings_methods:
+            submit_call = next(
+                call
+                for call in ast.walk(method)
+                if isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id == "submit_admin"
+            )
+            policy = next(
+                (
+                    keyword.value
+                    for keyword in submit_call.keywords
+                    if keyword.arg == "policy"
+                ),
+                None,
+            )
+            self.assertIsInstance(policy, ast.Attribute)
+            self.assertEqual("ACCEPTED", policy.attr)
+            self.assertIn("readback", ast.unparse(method).casefold())
+
+        moderator = _method("ModsTab", "_check_mod_command")
+        time_call = next(
+            call
+            for call in _calls(moderator, "_submit_mod_action")
+            if any(
+                _attribute_name(candidate.func) == "set_time_of_day"
+                for candidate in ast.walk(call)
+                if isinstance(candidate, ast.Call)
+            )
+        )
+        policy = next(
+            (
+                keyword.value
+                for keyword in time_call.keywords
+                if keyword.arg == "policy"
+            ),
+            None,
+        )
+        self.assertIsInstance(policy, ast.Attribute)
+        self.assertEqual("ACCEPTED", policy.attr)
 
     def test_every_active_retail_mutation_is_future_observed(self):
         mutation_names = {

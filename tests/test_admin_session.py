@@ -84,6 +84,96 @@ class ScriptedTransport:
 
 
 class RetailAdminSessionTests(unittest.TestCase):
+    def test_socket_transport_close_interrupts_connect_in_progress(self):
+        class BlockingSocket:
+            def __init__(self):
+                self.entered = threading.Event()
+                self.released = threading.Event()
+                self.closed = False
+
+            def setsockopt(self, *_args):
+                pass
+
+            def settimeout(self, _timeout):
+                pass
+
+            def connect(self, _address):
+                self.entered.set()
+                self.released.wait(timeout=2)
+                raise ConnectionAbortedError("socket closed")
+
+            def close(self):
+                self.closed = True
+                self.released.set()
+
+        sock = BlockingSocket()
+        transport = SocketTransport()
+        errors = []
+
+        def connect():
+            try:
+                transport.connect("127.0.0.1", 4000, 0.1)
+            except BaseException as error:
+                errors.append(error)
+
+        worker = threading.Thread(target=connect)
+        with patch("wolfrat.admin_session.socket.socket", return_value=sock):
+            worker.start()
+            self.assertTrue(sock.entered.wait(timeout=1))
+            try:
+                transport.close()
+                worker.join(timeout=0.5)
+
+                self.assertTrue(sock.closed)
+                self.assertFalse(worker.is_alive())
+                self.assertIsInstance(errors[0], ConnectionAbortedError)
+            finally:
+                sock.close()
+                worker.join(timeout=1)
+
+    def test_close_interrupts_and_joins_authentication_in_progress(self):
+        class BlockingConnectTransport:
+            def __init__(self):
+                self.entered = threading.Event()
+                self.released = threading.Event()
+                self.closed = False
+
+            def connect(self, _host, _port, _timeout):
+                self.entered.set()
+                self.released.wait(timeout=2)
+                raise ConnectionError("transport closed")
+
+            def sendall(self, _data):
+                raise AssertionError("authentication never reached send")
+
+            def recv(self, _size, _timeout):
+                raise AssertionError("authentication never reached receive")
+
+            def close(self):
+                self.closed = True
+                self.released.set()
+
+        transport = BlockingConnectTransport()
+        session = RetailAdminSession(
+            "127.0.0.1",
+            username="admin",
+            password="secret",
+            transport_factory=lambda: transport,
+            timeout=0.1,
+        )
+        future = session.execute_raw("GET GAMESTATE")
+        self.assertTrue(transport.entered.wait(timeout=1))
+
+        try:
+            session.close()
+
+            self.assertTrue(transport.closed)
+            self.assertTrue(future.done())
+            self.assertIsNotNone(session._worker)
+            self.assertFalse(session._worker.is_alive())
+        finally:
+            transport.close()
+
     def test_socket_transport_uses_abortive_close_for_retail_disconnect(self):
         class RecordingSocket:
             def __init__(self):
@@ -166,6 +256,41 @@ class RetailAdminSessionTests(unittest.TestCase):
             ],
             transport.sent,
         )
+
+    def test_typed_cmd_acceptance_requires_its_exact_catalog_ack(self):
+        transport = ScriptedTransport(
+            [
+                server_frame(b"T" * 32 + b"\x00"),
+                server_frame(b"User logged in\x00"),
+                server_frame(b"OK\x00"),
+                server_frame(b"OK - Command executed.\x00"),
+            ]
+        )
+        session = RetailAdminSession(
+            "127.0.0.1",
+            username="admin",
+            password="secret",
+            transport_factory=lambda: transport,
+            timeout=0.25,
+        )
+        self.addCleanup(session.close)
+
+        wrong_ack = session.execute(
+            AdminCommands.tod("1730")
+        ).result(timeout=1)
+        exact_ack = session.execute(
+            AdminCommands.tod_rate(5)
+        ).result(timeout=1)
+
+        self.assertEqual(("OK",), wrong_ack.replies)
+        self.assertFalse(wrong_ack.accepted)
+        self.assertIsNone(wrong_ack.verified)
+        self.assertEqual(
+            ("OK - Command executed.",),
+            exact_ack.replies,
+        )
+        self.assertTrue(exact_ack.accepted)
+        self.assertIsNone(exact_ack.verified)
 
     def test_second_command_is_not_sent_until_the_first_reply_is_complete(self):
         transport = ScriptedTransport(
