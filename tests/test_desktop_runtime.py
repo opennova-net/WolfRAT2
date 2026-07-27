@@ -36,7 +36,18 @@ def test_production_runtime_uses_writable_per_user_state_not_launcher_directory(
 ):
     launcher_dir = tmp_path / "venv" / "Scripts"
     launcher_dir.mkdir(parents=True)
-    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "LocalAppData"))
+    if os.name == "nt":
+        state_root = tmp_path / "LocalAppData"
+        monkeypatch.setenv("LOCALAPPDATA", str(state_root))
+        expected = state_root / "WolfRAT2"
+    elif sys.platform == "darwin":
+        home = tmp_path / "Home"
+        monkeypatch.setenv("HOME", str(home))
+        expected = home / "Library" / "Application Support" / "WolfRAT2"
+    else:
+        state_root = tmp_path / "XdgState"
+        monkeypatch.setenv("XDG_STATE_HOME", str(state_root))
+        expected = state_root / "wolfrat2"
     monkeypatch.setattr(
         sys,
         "argv",
@@ -45,9 +56,7 @@ def test_production_runtime_uses_writable_per_user_state_not_launcher_directory(
 
     runtime = DesktopRuntime.production()
 
-    assert runtime.data_dir == (
-        tmp_path / "LocalAppData" / "WolfRAT2"
-    ).resolve()
+    assert runtime.data_dir == expected.resolve()
     assert runtime.data_dir != launcher_dir.resolve()
 
 
