@@ -1,0 +1,99 @@
+name: Package Windows
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: package-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUTF8: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+  QT_QPA_PLATFORM: offscreen
+
+jobs:
+  package:
+    name: Build and smoke-test executable
+    runs-on: windows-2025
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install canonical dependencies
+        run: python -m pip install --editable ".[dev]"
+
+      - name: Build executable
+        run: python -m PyInstaller --clean --noconfirm WolfRAT2.spec
+
+      - name: Smoke-test packaged executable
+        shell: pwsh
+        run: |
+          $smokeDirectory = Join-Path $env:RUNNER_TEMP "wolfrat-packaged-smoke"
+          New-Item -ItemType Directory -Force -Path $smokeDirectory | Out-Null
+          $smokeResult = Join-Path $smokeDirectory "wolfrat_smoke.json"
+          Remove-Item -LiteralPath $smokeResult -Force -ErrorAction SilentlyContinue
+
+          $process = Start-Process `
+            -FilePath ".\dist\WolfRAT2.exe" `
+            -ArgumentList @("--smoke-test", "--data-dir", "`"$smokeDirectory`"") `
+            -PassThru
+          if (-not $process.WaitForExit(60000)) {
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            throw "Packaged smoke test did not exit within 60 seconds."
+          }
+          if ($process.ExitCode -ne 0) {
+            throw "Packaged smoke test exited with code $($process.ExitCode)."
+          }
+
+          if (-not (Test-Path -LiteralPath $smokeResult)) {
+            throw "Packaged smoke test did not write wolfrat_smoke.json."
+          }
+
+          $result = Get-Content -LiteralPath $smokeResult -Raw | ConvertFrom-Json
+          if ($result.ok -ne $true) {
+            throw "Packaged smoke result reported a failed runtime check."
+          }
+
+          Copy-Item -LiteralPath $smokeResult -Destination ".\dist\wolfrat_smoke.json"
+
+      - name: Prepare distributable metadata
+        shell: pwsh
+        run: |
+          $executable = ".\dist\WolfRAT2.exe"
+          $digest = (Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content `
+            -LiteralPath ".\dist\WolfRAT2.exe.sha256" `
+            -Value "$digest  WolfRAT2.exe" `
+            -Encoding ascii
+          Copy-Item -LiteralPath ".\LICENSE" -Destination ".\dist\LICENSE"
+
+      - name: Upload executable, checksum, license, and smoke result
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: WolfRAT2-windows
+          path: |
+            dist/WolfRAT2.exe
+            dist/WolfRAT2.exe.sha256
+            dist/LICENSE
+            dist/wolfrat_smoke.json
+          if-no-files-found: error
+          retention-days: 14

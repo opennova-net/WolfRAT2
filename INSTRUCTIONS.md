@@ -61,7 +61,7 @@ and fixed everywhere the two disagreed.
 ### 2.1 (June 2026)
 - Killing spree announcer (3/5/7/10 kill streaks)
 - Recurring message timers (30/45/60 min intervals)
-- Auto-reconnect on server drop (15s polling loop)
+- Auto-reconnect on server drop (30s retry delay)
 - Ghost connection timeout (60s)
 - Custom WolfRAT icon
 
@@ -71,8 +71,9 @@ and fixed everywhere the two disagreed.
 
 ### Requirements
 - Windows 10/11
-- Python 3.11+ installed
+- Python 3.11–3.14 installed
 - Internet connection (for pip)
+- Node.js 24 with npm 11 only when running browser-client validation
 
 ### Build Steps
 1. Open PowerShell
@@ -87,17 +88,20 @@ and fixed everywhere the two disagreed.
 4. The executable will be at `dist\WolfRAT2.exe`
 
 ### First-Time Setup
-If `pyinstaller` is not found, the build script uses `python -m PyInstaller` to avoid PATH issues. This should work out of the box.
+`build.bat` installs the canonical development dependency group from
+`pyproject.toml` before invoking PyInstaller. To prepare the same environment
+without building, run:
 
-If you get dependency errors, run:
 ```
-pip install PyQt6 aiohttp pyinstaller
+python -m pip install --editable ".[dev]"
 ```
+
+Do not install PyQt6, aiohttp, PyInstaller, or test tools individually.
 
 ---
 
 ## Earlier 2.1 Changes (June 7, 2026)
-- **Auto-Reconnect**: Added 60s timeout for ghost connections and a 15s auto-reconnect loop to keep the tool hooked to the server automatically.
+- **Auto-Reconnect**: Added a 30s reconnect delay to keep the tool hooked to the server automatically.
 - **Killing Spree Announcer**: Automatically tracks player streaks (3, 5, 7, 10 kills without dying) and broadcasts custom rampage messages to the server chat.
 - **Recurring Timers**: Added 30, 45, and 60-minute interval options for recurring chat messages.
 - **Custom Icon**: Added a sleek black-and-gold rat/wolf silhouette icon to the executable.
@@ -112,8 +116,46 @@ Double-click `dist\WolfRAT2.exe`
 ### From Source
 ```
 cd WolfRAT2
+python -m pip install --editable .
 python main.py
 ```
+
+### Developer Validation
+
+Python runtime, test, lint, package-build, and executable-build dependencies are
+declared in `pyproject.toml`. The Node toolchain and browser-client commands are
+declared in `package.json`; there are currently no third-party npm packages.
+
+```
+python -m pip install --editable ".[dev]"
+python -m ruff check .
+python -m pytest -q
+npm run validate
+python -m build
+```
+
+CI builds the wheel and source distribution on Linux and Windows, installs the
+wheel into a clean environment, and builds and smoke-tests `WolfRAT2.exe`. The
+Windows artifact includes the executable, SHA-256 checksum, MIT license, and
+machine-readable smoke result.
+
+### Protected Retail Conformance
+
+The live retail workflow must use a GitHub environment named
+`retail-conformance`. Configure required reviewers, prevent self-review, and
+restrict deployments to the default branch. Store only these environment
+secrets there:
+
+- `WOLFRAT_HOST`
+- `WOLFRAT_PORT`
+- `WOLFRAT_USERNAME`
+- `WOLFRAT_PASSWORD`
+
+The dedicated runner must carry the `self-hosted`, `windows`, `x64`, and
+`jotac-retail` labels and use a current GitHub Actions runner. The workflow runs
+the standard-library-only conformance module directly, so checkout and tool
+setup never receive retail credentials and no packages are installed on the
+live host.
 
 ---
 
@@ -121,7 +163,8 @@ python main.py
 
 ### Prerequisites
 - JO dedicated server running (`Jointops.exe`)
-- Admin configured in `admin.cfg` (format: `username, password, access_level`)
+- Admin configured in `admin.cfg` (three whitespace-separated fields:
+  `username password access_level`)
 - Server listening on the `remote_admin_port` configured in `game.cfg`
 - Server needs ~115 seconds to fully initialize after starting
 
@@ -234,7 +277,8 @@ mission scanner picks up.
 ### Presets
 - Rotation is auto-saved when you add/remove maps
 - Load saved presets from the dropdown
-- Presets are stored in `wolfrat_rotations.json` next to the executable
+- Presets are stored in `%LOCALAPPDATA%\WolfRAT2\wolfrat_rotations.json`
+  on Windows.
 
 ---
 
@@ -323,9 +367,14 @@ neither credential field is optional.
 - Check the connection log for errors
 
 ### Build fails
-- Make sure Python 3.11+ is installed
-- Run `pip install PyQt6 aiohttp pyinstaller` manually
+- Make sure Python 3.11–3.14 is installed
+- Run `python -m pip install --editable ".[dev]"` from the repository root
 - Use `python -m PyInstaller` instead of `pyinstaller` if PATH issues
+
+### Browser-client validation is skipped or unavailable
+- Use Node.js 24 and npm 11
+- Run `npm run validate` from the repository root
+- Do not install ad-hoc npm packages; the validation scripts use Node built-ins
 
 ---
 
@@ -337,12 +386,18 @@ neither credential field is optional.
 - `wolfrat/admin_commands.py` — Typed retail command catalog
 - `wolfrat/admin_session.py` — Framing, login, scheduling, and snapshots
 - `wolfrat/protocol.py` — Semantic application facade
+- `pyproject.toml` — Canonical Python dependencies and tool configuration
+- `package.json` — Canonical Node toolchain and browser-client commands
+- `WolfRAT2.spec` — Reproducible PyInstaller build definition
 - `build.bat` — Build script
 - `dist/WolfRAT2.exe` — Built executable
 
-### Runtime Files (next to executable)
-- `wolfrat_rotations.json` — Saved map rotation presets
-- `wolfrat_servers.json` — Saved server profiles
+### Runtime Files
+
+Mutable state is stored in `%LOCALAPPDATA%\WolfRAT2` on Windows, not beside the
+executable. This includes saved server profiles, map rotations, chat, stats,
+moderation data, web settings, telemetry identity, and crash diagnostics.
+`--data-dir <directory>` provides an explicit override.
 
 ### JO Server Files
 - `C:\GAMES\JOTAC\Game\JO\admin.cfg` — Admin credentials

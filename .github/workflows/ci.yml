@@ -1,0 +1,148 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUTF8: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+  QT_QPA_PLATFORM: offscreen
+
+jobs:
+  quality:
+    name: Quality and coverage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install canonical dependencies
+        run: python -m pip install --editable ".[dev]"
+
+      - name: Verify canonical runtime imports
+        run: >-
+          python -c "import aiohttp;
+          from PyQt6.QtCore import PYQT_VERSION_STR, QT_VERSION_STR;
+          print(f'aiohttp={aiohttp.__version__}
+          PyQt6={PYQT_VERSION_STR} Qt={QT_VERSION_STR}')"
+
+      - name: Lint Python
+        run: python -m ruff check .
+
+      - name: Compile Python sources
+        run: python -m compileall -q app.py main.py protocol.py wolfrat tests
+
+      - name: Enforce core branch coverage
+        run: >-
+          python -m pytest -q
+          tests/test_admin_commands.py
+          tests/test_admin_session.py
+          tests/test_server_manager.py
+          --cov=wolfrat.admin_commands
+          --cov=wolfrat.admin_session
+          --cov=wolfrat.protocol
+          --cov-branch
+          --cov-report=term-missing
+          --cov-fail-under=80
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7.0.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Validate browser client
+        run: npm run validate
+
+  tests:
+    name: Tests (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - windows-2025
+        python:
+          - "3.11"
+          - "3.12"
+          - "3.13"
+          - "3.14"
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install canonical dependencies
+        run: python -m pip install --editable ".[dev]"
+
+      - name: Verify canonical runtime imports
+        run: >-
+          python -c "import aiohttp;
+          from PyQt6.QtCore import PYQT_VERSION_STR, QT_VERSION_STR;
+          print(f'aiohttp={aiohttp.__version__}
+          PyQt6={PYQT_VERSION_STR} Qt={QT_VERSION_STR}')"
+
+      - name: Exercise the real Qt runtime
+        run: >-
+          python -m pytest -q
+          tests/test_desktop_runtime.py
+          tests/test_qt_dispatcher.py
+
+      - name: Run the complete test suite
+        run: python -m pytest -q
+
+      - name: Build wheel and source distribution
+        if: matrix.python == '3.14'
+        run: python -m build
+
+      - name: Validate a clean wheel installation
+        if: matrix.python == '3.14'
+        run: >-
+          python -c "import os, pathlib, subprocess, sys, venv;
+          artifacts = pathlib.Path('dist');
+          wheels = list(artifacts.glob('wolfrat2-*.whl'));
+          sdists = list(artifacts.glob('wolfrat2-*.tar.gz'));
+          assert len(wheels) == 1, wheels;
+          assert len(sdists) == 1, sdists;
+          temporary = pathlib.Path(os.environ['RUNNER_TEMP']);
+          environment = temporary / 'wolfrat-distribution-venv';
+          probe_directory = temporary / 'wolfrat-distribution-probe';
+          probe_directory.mkdir(parents=True, exist_ok=True);
+          venv.EnvBuilder(with_pip=True, clear=True).create(environment);
+          interpreter = environment / ('Scripts/python.exe' if sys.platform == 'win32' else 'bin/python');
+          subprocess.check_call([str(interpreter), '-m', 'pip', 'install', str(wheels[0].resolve())], cwd=probe_directory);
+          probe = 'import sys; import wolfrat.app; from importlib import metadata, resources; package = resources.files(sys.argv[1]); required = tuple(package.joinpath(item) for item in sys.argv[2:10]); assert all(item.is_file() for item in required), required; scripts = [item.value for item in metadata.distribution(sys.argv[10]).entry_points if item.group == sys.argv[11] and item.name == sys.argv[12]]; assert scripts == [sys.argv[13]], scripts';
+          subprocess.check_call([str(interpreter), '-c', probe, 'wolfrat', 'icon.ico', 'sounds/click.wav', 'sounds/connect.wav', 'sounds/disconnect.wav', 'sounds/warning.wav', 'web_templates/index.html', 'web_templates/style.css', 'web_templates/app.js', 'WolfRAT2', 'gui_scripts', 'wolfrat', 'wolfrat.app:main'], cwd=probe_directory)"

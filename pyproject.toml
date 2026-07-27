@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "WolfRAT2"
+version = "2.4.11"
+description = "Joint Operations retail server administration tool"
+readme = "README.md"
+requires-python = ">=3.11,<3.15"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = [
+    "aiohttp>=3.13,<4",
+    "PyQt6>=6.7,<7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "build>=1.2,<2",
+    "pyinstaller>=6.15,<7",
+    "pytest>=8.4,<10",
+    "pytest-asyncio>=1,<2",
+    "pytest-cov>=6,<8",
+    "pytest-qt>=4.5,<5",
+    "pytest-timeout>=2.3,<3",
+    "ruff>=0.9,<1",
+]
+
+[project.gui-scripts]
+wolfrat = "wolfrat.app:main"
+
+[project.urls]
+Repository = "https://github.com/opennova-net/WolfRAT2"
+
+[tool.setuptools.packages.find]
+include = ["wolfrat*"]
+
+[tool.setuptools.package-data]
+wolfrat = [
+    "icon.ico",
+    "sounds/*.wav",
+    "web_templates/*.css",
+    "web_templates/*.html",
+    "web_templates/*.js",
+]
+
+[tool.pytest.ini_options]
+addopts = ["--strict-config", "--strict-markers", "-ra"]
+asyncio_mode = "auto"
+qt_api = "pyqt6"
+testpaths = ["tests"]
+timeout = 30
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

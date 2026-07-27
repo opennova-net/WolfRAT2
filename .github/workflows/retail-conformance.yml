@@ -1,0 +1,106 @@
+name: Retail Conformance
+
+on:
+  workflow_dispatch:
+    inputs:
+      full:
+        description: Run reversible mutation checks
+        type: boolean
+        default: false
+      dummy_name:
+        description: Exact dedicated non-host player name, if available
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: retail-jotac
+  cancel-in-progress: false
+
+jobs:
+  conformance:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on:
+      - self-hosted
+      - windows
+      - x64
+      - jotac-retail
+    environment: retail-conformance
+    timeout-minutes: 30
+    env:
+      PYTHONUTF8: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+
+    steps:
+      - name: Check out trusted default branch
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7.0.0
+        with:
+          python-version: "3.14"
+
+      - name: Preflight retail server
+        shell: pwsh
+        env:
+          WOLFRAT_HOST: ${{ secrets.WOLFRAT_HOST }}
+          WOLFRAT_PORT: ${{ secrets.WOLFRAT_PORT }}
+        run: |
+          if (-not $env:WOLFRAT_HOST -or -not $env:WOLFRAT_PORT) {
+            throw "The retail-conformance environment is missing host or port secrets."
+          }
+          if (-not (Get-Process Jointops -ErrorAction SilentlyContinue)) {
+            throw "Jointops.exe is not running."
+          }
+          if (-not (Test-NetConnection `
+            -ComputerName $env:WOLFRAT_HOST `
+            -Port ([int]$env:WOLFRAT_PORT) `
+            -InformationLevel Quiet)) {
+            throw "The configured retail admin listener is not reachable."
+          }
+
+      - name: Run retail conformance
+        shell: pwsh
+        env:
+          WOLFRAT_HOST: ${{ secrets.WOLFRAT_HOST }}
+          WOLFRAT_PORT: ${{ secrets.WOLFRAT_PORT }}
+          WOLFRAT_USERNAME: ${{ secrets.WOLFRAT_USERNAME }}
+          WOLFRAT_PASSWORD: ${{ secrets.WOLFRAT_PASSWORD }}
+          WOLFRAT_FULL: ${{ inputs.full }}
+          WOLFRAT_DUMMY_NAME: ${{ inputs.dummy_name }}
+        run: |
+          if (-not $env:WOLFRAT_USERNAME -or -not $env:WOLFRAT_PASSWORD) {
+            throw "The retail-conformance environment is missing admin credentials."
+          }
+          $arguments = @("-m", "tests.live_retail")
+          if ($env:WOLFRAT_FULL -eq "true") {
+            $arguments += "--full"
+          }
+          if ($env:WOLFRAT_DUMMY_NAME) {
+            $arguments += @("--dummy-name", $env:WOLFRAT_DUMMY_NAME)
+          }
+          python @arguments
+
+      - name: Verify retail server remained healthy
+        if: always()
+        shell: pwsh
+        env:
+          WOLFRAT_HOST: ${{ secrets.WOLFRAT_HOST }}
+          WOLFRAT_PORT: ${{ secrets.WOLFRAT_PORT }}
+        run: |
+          if (-not $env:WOLFRAT_HOST -or -not $env:WOLFRAT_PORT) {
+            throw "The retail-conformance environment is missing host or port secrets."
+          }
+          if (-not (Get-Process Jointops -ErrorAction SilentlyContinue)) {
+            throw "Jointops.exe exited during conformance."
+          }
+          if (-not (Test-NetConnection `
+            -ComputerName $env:WOLFRAT_HOST `
+            -Port ([int]$env:WOLFRAT_PORT) `
+            -InformationLevel Quiet)) {
+            throw "The retail admin listener stopped during conformance."
+          }

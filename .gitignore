@@ -2,11 +2,18 @@
 build/
 dist/
 *.spec
+!WolfRAT2.spec
 
 # Python
 __pycache__/
 *.pyc
 *.pyo
+/venv/
+/.coverage
+/htmlcov/
+/.pytest_cache/
+/.ruff_cache/
+/*.egg-info/
 
 # Logs
 *.log
@@ -16,6 +23,7 @@ __pycache__/
 /wolfrat_*.db
 /wolfrat/settings_preset.json
 /.uv-cache/
+/.test-tmp*/
 *.bak
 
 # Releases (binary outputs)
