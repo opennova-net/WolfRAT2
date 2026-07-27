@@ -1,5 +1,5 @@
 """
-WolfRAT 2.4.10 - Modern Joint Operations Server Admin Tool
+WolfRAT 2.4.11 - Modern Joint Operations Server Admin Tool
 Replaces the original WolfRAT v0.95 (2005, MFC70)
 """
 
@@ -8,6 +8,7 @@ import os
 import json
 import time
 import random
+import threading
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QLineEdit, QPushButton, QTextEdit, QTableWidget,
@@ -19,7 +20,13 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread, QObject, QAbstractTabl
 from PyQt6.QtGui import QFont, QColor, QIcon, QTextCursor
 
 import math
-from wolfrat.protocol import ServerManager, wire_log
+from wolfrat.protocol import (
+    CHAT_MAX_LEN,
+    ServerManager,
+    player_entry_from_legacy,
+    wire_log,
+)
+from wolfrat.admin_commands import MissionEntry, WeaponMode
 from wolfrat.sounds import generate_all_sounds
 from wolfrat.web_server import WolfWebServer, generate_token
 from PyQt6.QtMultimedia import QSoundEffect
@@ -440,7 +447,156 @@ class LogSignals(QObject):
     missions_signal = pyqtSignal(list)
     settings_signal = pyqtSignal(dict)
     available_maps_signal = pyqtSignal(str)
+    weapons_signal = pyqtSignal(list)
     connect_signal = pyqtSignal(bool, str)
+
+
+class AdminFutureBridge(QObject):
+    """Deliver admin Future completion onto the owning widget's Qt thread."""
+
+    completed_signal = pyqtSignal(object, object, object, object, str, str)
+
+    def __init__(self, parent=None, on_error=None):
+        super().__init__(parent)
+        self._on_error = on_error
+        self.completed_signal.connect(
+            self._deliver, Qt.ConnectionType.QueuedConnection
+        )
+
+    def submit(
+        self,
+        operation,
+        on_success=None,
+        context="Admin operation",
+        on_failure=None,
+        *,
+        result_mode="typed",
+    ):
+        """Invoke an operation without blocking and observe its retail result."""
+
+        if result_mode not in {"typed", "raw"}:
+            raise ValueError(f"unknown admin result mode: {result_mode}")
+        try:
+            future = operation()
+        except BaseException as error:
+            self.completed_signal.emit(
+                None, error, on_success, on_failure, context, result_mode
+            )
+            return None
+
+        def finished(done):
+            try:
+                result = done.result()
+                error = None
+            except BaseException as caught:
+                result = None
+                error = caught
+            self.completed_signal.emit(
+                result, error, on_success, on_failure, context, result_mode
+            )
+
+        future.add_done_callback(finished)
+        return future
+
+    def _deliver(
+        self,
+        result,
+        error,
+        on_success,
+        on_failure,
+        context,
+        result_mode,
+    ):
+        message = None
+        if error is not None:
+            message = f"{context} failed: {error}"
+        elif getattr(result, "accepted", True) is False:
+            replies = getattr(result, "replies", ())
+            detail = replies[-1] if replies else "retail server rejected the command"
+            message = f"{context} rejected: {detail}"
+        elif (
+            result_mode == "typed"
+            and getattr(result, "verified", None) is not True
+        ):
+            detail = getattr(result, "verification_error", None)
+            if detail:
+                message = f"{context} was not verified: {detail}"
+            else:
+                message = (
+                    f"{context} was accepted but not verified by retail"
+                )
+        elif result_mode == "raw":
+            # Explicit raw-console commands have no typed readback contract.
+            # Their only success claim is the accepted retail RawResult.
+            message = None
+
+        if message is not None:
+            if on_failure is not None:
+                try:
+                    on_failure(message)
+                except Exception as callback_error:
+                    message = f"{message}; failure callback failed: {callback_error}"
+            if self._on_error is not None:
+                self._on_error(message)
+            return
+
+        if on_success is not None:
+            try:
+                on_success(result)
+            except Exception as callback_error:
+                if self._on_error is not None:
+                    self._on_error(
+                        f"{context} completion callback failed: {callback_error}"
+                    )
+
+
+def submit_admin(
+    owner,
+    operation,
+    on_success=None,
+    context="Admin operation",
+    on_failure=None,
+    *,
+    result_mode="typed",
+):
+    """Use one queued completion bridge for every mutating desktop caller."""
+
+    bridge = getattr(owner, "_admin_futures", None)
+    if bridge is None:
+        server = getattr(owner, "server", None)
+        error_sink = getattr(server, "_log", None)
+        bridge = AdminFutureBridge(owner, error_sink)
+        owner._admin_futures = bridge
+    return bridge.submit(
+        operation,
+        on_success,
+        context,
+        on_failure,
+        result_mode=result_mode,
+    )
+
+
+def submit_team_workflow(owner, operation, on_success, context):
+    """Observe the Future exposed by the facade's legacy team helpers."""
+
+    server = owner.server
+    previous = getattr(server, "_last_team_workflow", None)
+    try:
+        messages = operation()
+    except BaseException as error:
+        server._log(f"{context} failed: {error}")
+        return None
+
+    future = getattr(server, "_last_team_workflow", None)
+    if future is None or future is previous:
+        on_success(messages)
+        return None
+    return submit_admin(
+        owner,
+        lambda: future,
+        lambda _result: on_success(messages),
+        context,
+    )
 
 
 class ServerTab(QWidget):
@@ -456,6 +612,11 @@ class ServerTab(QWidget):
         self.reconnect_timer.timeout.connect(self._auto_reconnect_tick)
         self._manual_disconnect = False
         self._reconnect_attempts = 0
+        self._pending_connect = None
+        self._connect_thread = None
+        self.signals.connect_signal.connect(
+            self._finish_connect, Qt.ConnectionType.QueuedConnection
+        )
         self._build_ui()
 
     def _build_ui(self):
@@ -573,16 +734,33 @@ class ServerTab(QWidget):
         self.connect_btn.setEnabled(False)
         self.log(f"Connecting to {host}:{port} as {username}...")
 
+        self._pending_connect = (host, port, username, password)
+        self._connect_thread = threading.Thread(
+            target=self._connect_in_background,
+            args=(host, port, username, password),
+            name="wolfrat-connect",
+            daemon=True,
+        )
+        self._connect_thread.start()
+
+    def _connect_in_background(self, host, port, username, password):
         try:
             success, msg = self.server.connect(host, port, username, password)
         except Exception as e:
-            self.log(f"Connect error: {e}")
-            self.connect_btn.setEnabled(True)
-            self._handle_connect_failure()
-            return
+            success, msg = False, f"Connect error: {e}"
+        self.signals.connect_signal.emit(success, msg)
+
+    def _finish_connect(self, success, msg):
         self.log(msg)
+        pending = self._pending_connect
+        self._pending_connect = None
+        self._connect_thread = None
 
         if success:
+            if pending is None:
+                self.server.disconnect()
+                return
+            host, port, username, password = pending
             self._reconnect_attempts = 0
             self.status_label.setText("Connected")
             self.status_label.setStyleSheet("font-size: 14pt; font-weight: bold; color: #e8c840;")
@@ -624,12 +802,13 @@ class ServerTab(QWidget):
 
     def _auto_reconnect_tick(self):
         self.reconnect_timer.stop()
-        if not self.server.proto.connected:
+        if not self.server.is_connected:
             self.log(f"Auto-reconnecting... (Attempt {self._reconnect_attempts})")
             self._do_connect()
 
     def _do_disconnect(self):
         self._manual_disconnect = True
+        self._pending_connect = None
         self._reconnect_attempts = 0
         self.reconnect_timer.stop()
         self.server.disconnect()
@@ -881,11 +1060,20 @@ class ConsoleTab(QWidget):
         cmd = self.cmd_input.text().strip()
         if not cmd:
             return
-        if not self.server.proto.connected:
+        if not self.server.is_connected:
             self.log("⚠ Not connected to server")
             return
-        self.server.send(cmd)
-        self.cmd_input.clear()
+        submit_admin(
+            self,
+            lambda: self.server.execute_raw(cmd),
+            lambda _result: self._raw_command_accepted(cmd),
+            "Raw console command",
+            result_mode="raw",
+        )
+
+    def _raw_command_accepted(self, command):
+        if self.cmd_input.text().strip() == command:
+            self.cmd_input.clear()
 
 
 class PlayerTableModel(QAbstractTableModel):
@@ -985,6 +1173,7 @@ class PlayersTab(QWidget):
     def __init__(self, server: ServerManager):
         super().__init__()
         self.server = server
+        self._admin_futures = AdminFutureBridge(self, self.server._log)
         self._build_ui()
 
     def _build_ui(self):
@@ -1067,14 +1256,14 @@ class PlayersTab(QWidget):
         balance_btn_layout.addWidget(self.shuffle_btn)
 
         refresh_btn = QPushButton("Refresh")
-        refresh_btn.clicked.connect(lambda: self.server.send("player list"))
+        refresh_btn.clicked.connect(self.server.refresh_players)
         balance_btn_layout.addWidget(refresh_btn)
 
         balance_layout.addLayout(balance_btn_layout)
         balance_group.setLayout(balance_layout)
         layout.addWidget(balance_group)
 
-    def _get_selected_player_id(self):
+    def _get_selected_player_target(self):
         rows = self.table.selectionModel().selectedRows()
         if not rows:
             QMessageBox.information(self, "Select Player", "Please select a player from the list first.")
@@ -1082,53 +1271,89 @@ class PlayersTab(QWidget):
         row = rows[0].row()
         p = self.model.get_player_at(row)
         if p:
-            return p.get('id', '')
+            try:
+                return player_entry_from_legacy(p)
+            except (TypeError, ValueError) as error:
+                QMessageBox.warning(
+                    self,
+                    "Stale Player",
+                    f"The displayed player cannot be targeted: {error}",
+                )
         return None
 
     def _admin_action(self, action: str):
-        player_id = self._get_selected_player_id()
-        if not player_id:
+        player_target = self._get_selected_player_target()
+        if player_target is None:
             return
 
-        # Get player name for announcements
-        player_name = ""
-        rows = self.table.selectionModel().selectedRows()
-        if rows:
-            p = self.model.get_player_at(rows[0].row())
-            if p:
-                player_name = p.get('name', '')
-
         msg = self.msg_input.text().strip()
-        display = player_name or player_id
+        display = player_target.name or str(player_target.server_id)
 
         if action == "warn":
             # Send warning with custom message to player
-            self.server.warn_player(int(player_id), msg or "You have been warned!")
-            time.sleep(0.3)
-            # Announce to server with the message
-            self.server.send_chat(f"WARNING to {display}: {msg or 'Behave!'}")
+            self._admin_futures.submit(
+                lambda: self.server.warn_player(
+                    player_target, msg or "You have been warned!"
+                ),
+                lambda _result: self.server._log(
+                    f"Warning delivered to {display}: "
+                    f"{msg or 'You have been warned!'}"
+                ),
+                f"Warn {display}",
+            )
 
         elif action == "punt":
-            self.server.punt_player(int(player_id), msg or "Kicked by admin")
-            time.sleep(0.3)
-            self.server.send_chat(f"{display} has been kicked")
+            self._admin_futures.submit(
+                lambda: self.server.punt_player(
+                    player_target, msg or "Kicked by admin"
+                ),
+                lambda _result: self._announce_admin_action(
+                    f"{display} has been kicked",
+                    f"kick announcement for {display}",
+                ),
+                f"Kick {display}",
+            )
 
         elif action == "ban":
-            self.server.ban_player(int(player_id), msg or "Banned by admin")
-            time.sleep(0.3)
-            self.server.send_chat(f"{display} has been banned")
+            self._admin_futures.submit(
+                lambda: self.server.ban_player(
+                    player_target, msg or "Banned by admin"
+                ),
+                lambda _result: self._announce_admin_action(
+                    f"{display} has been banned",
+                    f"ban announcement for {display}",
+                ),
+                f"Ban {display}",
+            )
 
         elif action == "kill":
-            self.server.kill_player(int(player_id))
+            self._admin_futures.submit(
+                lambda: self.server.kill_player(player_target),
+                context=f"Kill {display}",
+            )
 
         elif action == "swap":
             # PLAYER SWAPTEAM handles the team change directly
-            self.server.swap_player(int(player_id))
-            time.sleep(0.3)
-            self.server.send_chat(f"{display} swapped to the other team")
+            self._admin_futures.submit(
+                lambda: self.server.swap_player(player_target),
+                lambda _result: self._announce_admin_action(
+                    f"{display} swapped to the other team",
+                    f"swap announcement for {display}",
+                ),
+                f"Swap {display}",
+            )
 
         elif action == "zero":
-            self.server.zero_player(int(player_id))
+            self._admin_futures.submit(
+                lambda: self.server.zero_player(player_target),
+                context=f"Zero score for {display}",
+            )
+
+    def _announce_admin_action(self, message, context):
+        self._admin_futures.submit(
+            lambda: self.server.send_chat(message),
+            context=context,
+        )
 
     def _mix_teams(self):
         """Mix teams - should only be used at round start."""
@@ -1139,21 +1364,30 @@ class PlayersTab(QWidget):
             "• Randomly select players from the bigger team\n"
             "• Swap them to the other team\n"
             "• Kill them so they respawn at the correct base\n"
-            "• Announce each swap to the server\n\nContinue?",
+            "\nContinue?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        results = self.server.mix_teams()
-        for line in results:
-            self.server._log(line)
+        submit_team_workflow(
+            self,
+            self.server.mix_teams,
+            self._log_team_results,
+            "Balance teams",
+        )
 
     def _shuffle_teams(self):
         """Randomly shuffle all players across both teams."""
         players = self.server.players
         if len(players) < 2:
-            self.server.send_chat("Need at least 2 players to mix!")
+            submit_admin(
+                self,
+                lambda: self.server.send_chat(
+                    "Need at least 2 players to mix!"
+                ),
+                context="Send team mix requirement",
+            )
             return
 
         reply = QMessageBox.question(
@@ -1165,7 +1399,14 @@ class PlayersTab(QWidget):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        results = self.server.shuffle_teams()
+        submit_team_workflow(
+            self,
+            self.server.shuffle_teams,
+            self._log_team_results,
+            "Mix teams",
+        )
+
+    def _log_team_results(self, results):
         for line in results:
             self.server._log(line)
 
@@ -1208,35 +1449,25 @@ class MissionsTab(QWidget):
         self.server = server
         self._missions_store = missions_store
         self._all_maps = []  # full available list [{file, display}]
-        self._rotation_maps = []  # current rotation [filename, ...]
+        self._rotation_maps = []  # compatibility view [filename, ...]
+        self._rotation_entries = []  # authoritative MissionEntry per table row
         self._main_window = None  # set by MainWindow after creation
         self._presets = {}  # saved rotation presets
         self._load_presets()
         self._build_ui()
 
-    @staticmethod
-    def _is_dm_map(filename):
-        """Check if a map is a deathmatch map (DM prefix)."""
-        return filename.upper().startswith('DM-') or filename.upper().startswith('DM_')
-
-    @staticmethod
-    def _build_mission_add_cmd(filename, count=1):
-        """Build mission add command. DM maps don't support the '0' parameter."""
-        if filename.upper().startswith('DM-') or filename.upper().startswith('DM_'):
-            return f"mission add {filename}"
-        elif count == 1:
-            return f"mission add {filename} 0"
-        else:
-            return f"mission add {filename}"
-
     def _send_mission_add(self, filename, count=1):
-        """Send mission add command. DM maps don't support the '0' parameter."""
-        self.server.send(self._build_mission_add_cmd(filename, count))
+        """Add a catalog mission using the retail-aware facade."""
+        return self.server.add_mission(
+            filename, auto_switch_sides=(count == 2)
+        )
 
     @staticmethod
     def _send_mission_add_to_server(server, filename, count=1):
-        """Send mission add command via a specific server object. For use outside MissionsTab."""
-        server.send(MissionsTab._build_mission_add_cmd(filename, count))
+        """Add a catalog mission through a specific server facade."""
+        return server.add_mission(
+            filename, auto_switch_sides=(count == 2)
+        )
 
     def _preset_path(self):
         base = os.path.dirname(sys.argv[0]) if not getattr(sys, 'frozen', False) else os.path.dirname(sys.executable)
@@ -1324,7 +1555,7 @@ class MissionsTab(QWidget):
         # Bottom buttons
         avail_btns = QHBoxLayout()
         refresh_avail_btn = SatisfyingButton("Refresh")
-        refresh_avail_btn.clicked.connect(lambda: self.server.send("mission available"))
+        refresh_avail_btn.clicked.connect(self.server.refresh_available_maps)
         avail_btns.addWidget(refresh_avail_btn)
 
         add_btn = SatisfyingButton("Add to Rotation (1x)")
@@ -1370,7 +1601,7 @@ class MissionsTab(QWidget):
         # Rotation buttons
         rot_btns = QHBoxLayout()
         refresh_rot_btn = SatisfyingButton("Refresh")
-        refresh_rot_btn.clicked.connect(lambda: self.server.send("mission list"))
+        refresh_rot_btn.clicked.connect(self.server.refresh_missions)
         rot_btns.addWidget(refresh_rot_btn)
 
         setnext_btn = SatisfyingButton("Queue Next")
@@ -1472,21 +1703,18 @@ class MissionsTab(QWidget):
 
     def _refresh_all(self):
         """Refresh everything: rotation, available maps, gamestate."""
-        self.server.send("mission list")
-        time.sleep(0.3)
-        self.server.send("mission available")
-        time.sleep(0.3)
-        self.server.send("get gamestate")
+        self.server.refresh_missions()
+        self.server.refresh_available_maps()
+        self.server.refresh_game_state()
 
     def _auto_refresh_tick(self):
         """Auto-refresh rotation and gamestate periodically."""
         if not self.auto_refresh_check.isChecked():
             return
-        if not self.server.proto.connected:
+        if not self.server.is_connected:
             return
-        self.server.send("mission list", quiet=True)
-        time.sleep(0.2)
-        self.server.send("get gamestate", quiet=True)
+        self.server.refresh_missions(quiet=True)
+        self.server.refresh_game_state(quiet=True)
 
     def _toggle_auto_refresh(self, checked):
         """Toggle auto refresh on/off."""
@@ -1500,7 +1728,7 @@ class MissionsTab(QWidget):
         e.g. 'AS-Teotihuacan.bms' -> 'AS-Teotihuacan'
         """
         name = filename
-        for ext in ('.bms', '.npaj', '.npj'):
+        for ext in ('.bms', '.npj', '.npz'):
             if name.lower().endswith(ext):
                 name = name[:-len(ext)]
         return name
@@ -1516,7 +1744,14 @@ class MissionsTab(QWidget):
                 return m.get('desc', '') or self._parse_mission_name(filename)
         return self._parse_mission_name(filename)
 
-    def _add_rotation_row(self, filename, play_count=1, is_current=False, display_name=None):
+    def _add_rotation_row(
+        self,
+        filename,
+        play_count=1,
+        is_current=False,
+        display_name=None,
+        mission=None,
+    ):
         """Add a row to the Mission Cycle table."""
         row = self.rotation_table.rowCount()
         self.rotation_table.insertRow(row)
@@ -1529,6 +1764,10 @@ class MissionsTab(QWidget):
         self.rotation_table.setItem(row, 1, r_item)
 
         file_item = QTableWidgetItem(filename)
+        if mission is not None:
+            file_item.setData(
+                Qt.ItemDataRole.UserRole, mission.queue_index
+            )
         self.rotation_table.setItem(row, 2, file_item)
 
         if is_current:
@@ -1541,72 +1780,67 @@ class MissionsTab(QWidget):
     def update_missions(self, missions: list):
         """Update the current rotation from mission list response."""
         try:
-            # Don't wipe rotation if server returns empty (happens during map transitions)
-            if not missions:
-                return
+            entries = tuple(self.server.mission_entries)
 
             # Skip rebuild if data hasn't changed (prevents flicker from polling)
-            if missions == getattr(self, '_last_missions_raw', None):
+            fingerprint = tuple(
+                (
+                    mission.queue_index,
+                    mission.filename.casefold(),
+                    mission.is_current,
+                    mission.is_next,
+                    mission.one_shot,
+                    mission.is_flipped,
+                    mission.double_time,
+                )
+                for mission in entries
+            )
+            if fingerprint == getattr(
+                self, '_last_mission_fingerprint', None
+            ):
+                # Retain the latest revision-bearing records even when no
+                # visual rebuild is necessary.
+                self._rotation_entries = list(entries)
                 return
+            self._last_mission_fingerprint = fingerprint
             self._last_missions_raw = list(missions)
 
             # Suppress repaints to prevent flicker
             self.setUpdatesEnabled(False)
 
-            # Remember which map was selected
+            # Remember the exact queue occurrence that was selected.
             prev_row = self.rotation_table.currentRow()
-            prev_name = None
-            if prev_row >= 0 and prev_row < len(self._rotation_maps):
-                prev_name = self._rotation_maps[prev_row]
+            prev_entry = self._mission_entry_at(prev_row)
 
             self._rotation_maps.clear()
+            self._rotation_entries.clear()
             self.rotation_table.setRowCount(0)
 
             restored = -1
-            import re
-            for m in missions:
-                name_part = m.strip()
-                if ':' in name_part[:5]:
-                    name_part = name_part.split(':', 1)[1].strip()
-
-                if not name_part:
-                    continue
-
-                # Extract filename cleanly using regex
-                filename = name_part
-                match = re.search(r'(\S+\.(?:bms|npj|npaj))', name_part, re.IGNORECASE)
-                if match:
-                    filename = match.group(1)
-                else:
-                    # Fallback if no extension is found (should be rare)
-                    parts = name_part.split(' - ')
-                    if len(parts) > 1:
-                        filename = parts[1].split('<')[0].replace('(2x)', '').strip()
-
-                # Extract display name cleanly
-                display_name = name_part
-                if match and filename in name_part:
-                    idx = name_part.find(filename)
-                    if idx > 0:
-                        display_name = name_part[:idx].strip()
-                        if display_name.endswith('-'):
-                            display_name = display_name[:-1].strip()
-                    else:
-                        display_name = self._find_display_name(filename)
-                else:
-                    display_name = display_name.split('<')[0].replace('(2x)', '').strip()
-                    if not display_name or display_name == filename:
-                        display_name = self._find_display_name(filename)
-
+            for mission in entries:
+                filename = mission.filename
+                display_name = self._find_display_name(filename)
                 row_idx = len(self._rotation_maps)
                 self._rotation_maps.append(filename)
+                self._rotation_entries.append(mission)
 
-                is_current = '<CURRENT MISSION>' in m or '<NEXT MISSION>' in m
-                play_count = 2 if '(2x)' in m else 1
-                self._add_rotation_row(filename, play_count, is_current, display_name=display_name)
+                is_current = mission.is_current or mission.is_next
+                play_count = 2 if mission.double_time else 1
+                self._add_rotation_row(
+                    filename,
+                    play_count,
+                    is_current,
+                    display_name=display_name,
+                    mission=mission,
+                )
 
                 # Track which row to restore
-                if prev_name and filename == prev_name:
+                if (
+                    prev_entry is not None
+                    and mission.queue_index == prev_entry.queue_index
+                    and mission.filename.casefold()
+                    == prev_entry.filename.casefold()
+                ):
                     restored = row_idx
 
                 # Push current map name to main status bar
@@ -1617,7 +1851,7 @@ class MissionsTab(QWidget):
             # Restore selection
             if restored >= 0:
                 self.rotation_table.selectRow(restored)
-            elif prev_name is None and self.rotation_table.rowCount() > 0:
+            elif prev_entry is None and self.rotation_table.rowCount() > 0:
                 pass  # Don't auto-select if nothing was selected before
         except Exception as e:
             print(f"[WolfRAT] update_missions error: {e}")
@@ -1733,14 +1967,14 @@ class MissionsTab(QWidget):
         if filename in self._rotation_maps:
             return
         play_count = 1 if count == "1x" else 2
-        self._send_mission_add(filename, play_count)
-        time.sleep(0.2)
-        self._rotation_maps.append(filename)
-        display_name = self._find_display_name(filename)
-        self._add_rotation_row(filename, play_count, False, display_name=display_name)
-        self._presets['_auto'] = self._build_auto_preset()
-        self._save_presets()
-        self.server._log(f"Added {filename} to rotation ({count})")
+        submit_admin(
+            self,
+            lambda: self._send_mission_add(filename, play_count),
+            lambda _result: self.server._log(
+                f"Added {filename} to rotation ({count})"
+            ),
+            f"Add mission {filename}",
+        )
 
     def _add_all_visible(self, count="1x"):
         """Add all visible (filtered) available maps to rotation."""
@@ -1757,64 +1991,117 @@ class MissionsTab(QWidget):
         if row < 0 or row >= len(self._rotation_maps):
             return
 
-        # Capture the filename - not the row index - so it survives table rebuilds
-        filename = self._rotation_maps[row]
+        # Capture the authoritative queue identity. A filename is not unique:
+        # retail can queue the same mission more than once.
+        mission = self._mission_entry_at(row)
+        if mission is None:
+            self.server._log(
+                "Cannot open mission actions: row has no queue identity"
+            )
+            self.server.refresh_missions()
+            return
+        filename = mission.filename
         name = self._parse_mission_name(filename)
         menu = QMenu(self)
 
         run_action = menu.addAction(f"Run {name} Now")
-        run_action.triggered.connect(lambda checked=False, f=filename: self._switch_to_map_by_name(f))
+        run_action.triggered.connect(
+            lambda checked=False, m=mission: self._switch_to_mission(m)
+        )
 
         setnext_action = menu.addAction("Set as Next Mission")
-        setnext_action.triggered.connect(lambda checked=False, f=filename: self._set_next_mission_by_name(f))
+        setnext_action.triggered.connect(
+            lambda checked=False, m=mission: self._queue_mission(m)
+        )
 
         menu.addSeparator()
 
         remove_action = menu.addAction("Remove from Rotation")
-        remove_action.triggered.connect(lambda checked=False, f=filename: self._remove_from_rotation_by_name(f))
+        remove_action.triggered.connect(
+            lambda checked=False, m=mission: self._remove_mission(m)
+        )
 
         menu.exec(self.rotation_table.mapToGlobal(pos))
 
+    def _mission_entry_at(self, row):
+        """Return the identity attached to a rendered queue row."""
+        if 0 <= row < len(self._rotation_entries):
+            return self._rotation_entries[row]
+        return None
+
+    @staticmethod
+    def _resolve_unique_mission_entry(entries, filename):
+        """Resolve filename compatibility input without choosing a duplicate."""
+        matches = [
+            mission
+            for mission in entries
+            if mission.filename.casefold() == filename.casefold()
+        ]
+        if len(matches) > 1:
+            raise ValueError(
+                f"mission filename {filename!r} is ambiguous; "
+                "select a specific queue row"
+            )
+        return matches[0] if matches else None
+
+    def _find_unique_mission_entry(self, filename):
+        """Resolve legacy filename input only when it names one occurrence."""
+        if not getattr(self, "server", None):
+            return None
+        try:
+            return self._resolve_unique_mission_entry(
+                self.server.mission_entries, filename
+            )
+        except ValueError as error:
+            self.server._log(
+                f"Cannot target {filename}: {error}"
+            )
+            return None
+
     def _get_server_index(self, filename):
-        """Safely lookup the true server index for a filename, ignoring UI row drifts."""
-        if not getattr(self, 'server', None) or not hasattr(self.server, 'missions'):
-            return -1
+        """Legacy unique-filename lookup; never guess a duplicate occurrence."""
+        mission = self._find_unique_mission_entry(filename)
+        return mission.queue_index if mission is not None else -1
 
-        import re
-        for raw in self.server.missions:
-            # Extract server index (e.g., "1: " or "1 - ")
-            idx_str = ""
-            name_part = raw.strip()
-            if ':' in name_part[:5]:
-                parts = name_part.split(':', 1)
-                idx_str = parts[0].strip()
-                name_part = parts[1].strip()
-
-            # Extract filename using the same regex as update_missions
-            server_filename = name_part
-            match = re.search(r'(\S+\.(?:bms|npj|npaj))', name_part, re.IGNORECASE)
-            if match:
-                server_filename = match.group(1)
-            else:
-                # Fallback if no extension is found
-                parts = name_part.split(' - ')
-                if len(parts) > 1:
-                    server_filename = parts[1].split('<')[0].replace('(2x)', '').strip()
-
-            if server_filename.lower() == filename.lower() and idx_str.isdigit():
-                return int(idx_str)
-        return -1
+    def _switch_to_mission(self, mission):
+        """Run one identity-bearing queue occurrence now."""
+        name = mission.filename
+        submit_admin(
+            self,
+            lambda: self.server.switch_mission(mission),
+            lambda _result: self.server._log(
+                f"Running map: {name} "
+                f"(server index {mission.queue_index})"
+            ),
+            f"Switch to mission {name}",
+        )
 
     def _switch_to_map(self, row):
         """Run this map now - queue it and trigger cycle."""
         if 0 <= row < len(self._rotation_maps):
-            name = self._rotation_maps[row]
-            idx = self._get_server_index(name)
-            idx = idx if idx >= 0 else row
-            self.server._log(f"Running map: {name} (server index {idx})")
-            self.server.send(f"MISSION SETNEXT {idx}")
-            time.sleep(0.3)
-            self.server.send("GOTO GAMESTATE")
+            mission = self._mission_entry_at(row)
+            if mission is None:
+                self.server._log(
+                    "Cannot run selected map: mission row has no identity"
+                )
+                self.server.refresh_missions()
+                return
+            self._switch_to_mission(mission)
+
+    def _queue_mission(self, mission):
+        """Queue one identity-bearing occurrence as the next mission."""
+        name = mission.filename
+        submit_admin(
+            self,
+            lambda: self.server.set_next_mission(
+                mission, add_if_missing=False
+            ),
+            lambda _result: self.server._log(
+                f"Next mission set to: {name} "
+                f"(server index {mission.queue_index})"
+            ),
+            f"Queue mission {name} as next",
+        )
 
     def _run_selected_map(self):
         """Run This Map button - switch to the selected map now."""
@@ -1825,11 +2112,14 @@ class MissionsTab(QWidget):
     def _set_next_mission(self, row):
         """Set Next Mission - queue map without cycling."""
         if 0 <= row < len(self._rotation_maps):
-            name = self._rotation_maps[row]
-            idx = self._get_server_index(name)
-            idx = idx if idx >= 0 else row
-            self.server.send(f"MISSION SETNEXT {idx}")
-            self.server._log(f"Next mission set to: {name} (server index {idx})")
+            mission = self._mission_entry_at(row)
+            if mission is None:
+                self.server._log(
+                    "Cannot queue selected map: mission row has no identity"
+                )
+                self.server.refresh_missions()
+                return
+            self._queue_mission(mission)
 
     def _set_play_count(self, row, count):
         """Set how many times a map plays (1x or 2x). Updates 'r' column."""
@@ -1843,15 +2133,24 @@ class MissionsTab(QWidget):
         """Remove a specific map by row index."""
         if row >= len(self._rotation_maps):
             return
-        name = self._rotation_maps[row]
-        idx = self._get_server_index(name)
-        idx = idx if idx >= 0 else row
-        self.server.send(f"mission remove {idx}")
-        time.sleep(0.3)
-        self._rotation_maps.pop(row)
-        self.rotation_table.removeRow(row)
-        self._presets['_auto'] = self._build_auto_preset()
-        self._save_presets()
+        mission = self._mission_entry_at(row)
+        if mission is None:
+            self.server._log(
+                "Cannot remove selected map: mission row has no identity"
+            )
+            self.server.refresh_missions()
+            return
+        self._remove_mission(mission)
+
+    def _remove_mission(self, mission):
+        """Remove one identity-bearing queue occurrence."""
+        name = mission.filename
+        submit_admin(
+            self,
+            lambda: self.server.remove_mission(mission),
+            lambda _result: self.server._log(f"Removed {name} from rotation"),
+            f"Remove mission {name}",
+        )
 
     def _remove_from_rotation(self):
         """Remove selected map from rotation (button click)."""
@@ -1860,30 +2159,32 @@ class MissionsTab(QWidget):
             self._remove_from_rotation_at(row)
 
     def _find_rotation_row(self, filename):
-        """Find the current row index for a filename in the rotation table."""
-        for i in range(self.rotation_table.rowCount()):
-            item = self.rotation_table.item(i, 2)
-            if item and item.text() == filename:
-                return i
-        return -1
+        """Legacy unique-filename row lookup; duplicates are ambiguous."""
+        matches = [
+            index
+            for index, mission in enumerate(self._rotation_entries)
+            if mission is not None
+            and mission.filename.casefold() == filename.casefold()
+        ]
+        return matches[0] if len(matches) == 1 else -1
 
     def _switch_to_map_by_name(self, filename):
-        """Run a map by filename - looks up current row at execution time."""
-        row = self._find_rotation_row(filename)
-        if row >= 0:
-            self._switch_to_map(row)
+        """Run a legacy filename only when it names one queue occurrence."""
+        mission = self._find_unique_mission_entry(filename)
+        if mission is not None:
+            self._switch_to_mission(mission)
 
     def _set_next_mission_by_name(self, filename):
-        """Set next mission by filename."""
-        row = self._find_rotation_row(filename)
-        if row >= 0:
-            self._set_next_mission(row)
+        """Queue a legacy filename only when it names one occurrence."""
+        mission = self._find_unique_mission_entry(filename)
+        if mission is not None:
+            self._queue_mission(mission)
 
     def _remove_from_rotation_by_name(self, filename):
-        """Remove a map by filename - looks up current row at execution time."""
-        row = self._find_rotation_row(filename)
-        if row >= 0:
-            self._remove_from_rotation_at(row)
+        """Remove a legacy filename only when it names one occurrence."""
+        mission = self._find_unique_mission_entry(filename)
+        if mission is not None:
+            self._remove_mission(mission)
 
     def _clear_rotation(self):
         reply = QMessageBox.question(
@@ -1892,9 +2193,12 @@ class MissionsTab(QWidget):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
         if reply == QMessageBox.StandardButton.Yes:
-            self.server.send("mission clear")
-            self._rotation_maps.clear()
-            self.rotation_table.setRowCount(0)
+            submit_admin(
+                self,
+                lambda: self.server.clear_missions(),
+                lambda _result: self.server._log("Cleared mission rotation"),
+                "Clear mission rotation",
+            )
 
     def _move_up(self):
         row = self.rotation_table.currentRow()
@@ -1912,6 +2216,10 @@ class MissionsTab(QWidget):
         """Swap two rows in the rotation table and backing list."""
         # Swap backing list
         self._rotation_maps[r1], self._rotation_maps[r2] = self._rotation_maps[r2], self._rotation_maps[r1]
+        self._rotation_entries[r1], self._rotation_entries[r2] = (
+            self._rotation_entries[r2],
+            self._rotation_entries[r1],
+        )
 
         # Swap table cell contents
         for col in range(self.rotation_table.columnCount()):
@@ -1921,12 +2229,19 @@ class MissionsTab(QWidget):
             self.rotation_table.setItem(r2, col, item1)
 
     def _on_rotation_reorder(self):
-        """Drag-drop reorder - rebuild _rotation_maps from table."""
+        """Drag-drop reorder - rebuild filenames and attached identities."""
         self._rotation_maps = []
+        self._rotation_entries = []
+        by_index = {
+            mission.queue_index: mission
+            for mission in self.server.mission_entries
+        }
         for i in range(self.rotation_table.rowCount()):
             file_item = self.rotation_table.item(i, 2)
             if file_item:
                 self._rotation_maps.append(file_item.text())
+                queue_index = file_item.data(Qt.ItemDataRole.UserRole)
+                self._rotation_entries.append(by_index.get(queue_index))
 
     def auto_apply_rotation(self):
         """Called on connect. Applies saved rotation automatically."""
@@ -1935,36 +2250,23 @@ class MissionsTab(QWidget):
             return
 
         self.server._log(f"Auto-applying saved rotation ({len(saved)} maps)...")
-        time.sleep(1.0)
-
-        self.server.send("mission clear")
-        time.sleep(0.5)
-
-        self._rotation_maps = []
-        self.rotation_table.setRowCount(0)
-        for entry in saved:
-            if isinstance(entry, dict):
-                filename = entry['file']
-                count = entry.get('count', 1)
-            else:
-                filename = entry
-                count = 1
-            play_count = entry.get('count', 1) if isinstance(entry, dict) else 1
-            self._send_mission_add(filename, play_count)
-            time.sleep(0.2)
-            self._rotation_maps.append(filename)
-            display_name = self._find_display_name(filename)
-            self._add_rotation_row(filename, count, False, display_name=display_name)
-
-        self.server._log(f"Rotation applied: {len(saved)} maps")
+        submit_admin(
+            self,
+            lambda: self.server.clear_missions(),
+            lambda _result: self._add_missions_in_sequence(
+                saved,
+                on_complete=lambda: self.server._log(
+                    f"Auto rotation applied: {len(saved)} maps"
+                ),
+            ),
+            "Clear rotation before auto-apply",
+        )
 
     def _set_next_map(self):
         """Set Next Mission button - queue selected map without cycling."""
         row = self.rotation_table.currentRow()
         if 0 <= row < len(self._rotation_maps):
-            name = self._rotation_maps[row]
-            self.server.send(f"MISSION SETNEXT {row}")
-            self.server._log(f"Next mission set to: {name} (index {row})")
+            self._set_next_mission(row)
 
     def _save_preset(self):
         try:
@@ -2004,28 +2306,45 @@ class MissionsTab(QWidget):
 
         preset = self._presets[name]
 
-        # Run in background thread to avoid freezing the GUI
-        import threading
-        def _do_load():
-            self.server._log(f"Loading preset '{name}' - adding {len(preset)} maps...")
-            for i, entry in enumerate(preset):
-                if isinstance(entry, dict):
-                    mapname = entry['file']
-                    count = entry.get('count', 1)
-                else:
-                    mapname = entry
-                    count = 1
-                play_count = entry.get('count', 1) if isinstance(entry, dict) else 1
-                self._send_mission_add(mapname, play_count)
-                self.server._log(f"  [{i+1}/{len(preset)}] Added {mapname}")
-                if i < len(preset) - 1:
-                    time.sleep(2)
-            # Refresh the rotation from the server
-            time.sleep(1)
-            self.server.send("mission list")
-            self.server._log(f"Preset '{name}' loaded. Remove unwanted maps manually.")
+        self.server._log(
+            f"Loading preset '{name}' - adding {len(preset)} maps..."
+        )
+        self._add_missions_in_sequence(
+            preset,
+            on_complete=lambda: self.server._log(
+                f"Preset '{name}' loaded. Remove unwanted maps manually."
+            ),
+        )
 
-        threading.Thread(target=_do_load, daemon=True).start()
+    def _add_missions_in_sequence(self, entries, index=0, on_complete=None):
+        """Add a preset serially and stop at the first rejected operation."""
+
+        if index >= len(entries):
+            if on_complete is not None:
+                on_complete()
+            return
+        entry = entries[index]
+        if isinstance(entry, dict):
+            filename = entry["file"]
+            play_count = entry.get("count", 1)
+        else:
+            filename = entry
+            play_count = 1
+
+        submit_admin(
+            self,
+            lambda: self._send_mission_add(filename, play_count),
+            lambda _result: self._mission_added_in_sequence(
+                entries, index, filename, on_complete
+            ),
+            f"Add preset mission {filename}",
+        )
+
+    def _mission_added_in_sequence(
+        self, entries, index, filename, on_complete
+    ):
+        self.server._log(f"  [{index + 1}/{len(entries)}] Added {filename}")
+        self._add_missions_in_sequence(entries, index + 1, on_complete)
 
     def _ok_clicked(self):
         """OK button - apply rotation and show feedback."""
@@ -2039,12 +2358,13 @@ class MissionsTab(QWidget):
 
     def _review_event_log(self):
         """Review Event Log button."""
-        self.server.send("eventlog")
-        self.server._log("Requested event log.")
+        self.server._log(
+            "Retail admin has no EVENTLOG command; review the local console/wire log."
+        )
 
     def _review_chat_log(self):
         """Review Chat Log button."""
-        self.server.send("chat get")
+        self.server.refresh_chat()
         self.server._log("Requested chat log.")
 
 
@@ -2077,6 +2397,7 @@ class SettingsTab(QWidget):
     def __init__(self, server):
         super().__init__()
         self.server = server
+        self._admin_futures = AdminFutureBridge(self, self.server._log)
         self.mods_tab = None  # set by MainWindow after creation
         self._checkboxes = {}
         self._sliders = {}
@@ -2212,30 +2533,30 @@ class SettingsTab(QWidget):
         ping_layout = QGridLayout()
 
         self.ping_min_cb = QCheckBox("Do Minimum Ping Check")
-        self.ping_min_cb.stateChanged.connect(lambda s: self._on_toggle("pingMinCheck", s))
+        self.ping_min_cb.stateChanged.connect(lambda s: self._on_toggle("DoMinPingCheck", s))
         ping_layout.addWidget(self.ping_min_cb, 0, 0, 1, 2)
-        self._checkboxes["pingMinCheck"] = self.ping_min_cb
+        self._checkboxes["DoMinPingCheck"] = self.ping_min_cb
 
         ping_layout.addWidget(QLabel("  Min ping [ms]:"), 1, 0)
         self.ping_min_val = QSpinBox()
         self.ping_min_val.setRange(0, 999)
         self.ping_min_val.setFixedWidth(80)
-        self.ping_min_val.valueChanged.connect(lambda v: self._on_slider("pingMin", v))
+        self.ping_min_val.valueChanged.connect(lambda v: self._on_slider("MinPing", v))
         ping_layout.addWidget(self.ping_min_val, 1, 1)
-        self._sliders["pingMin"] = self.ping_min_val
+        self._sliders["MinPing"] = self.ping_min_val
 
         self.ping_max_cb = QCheckBox("Do Maximum Ping Check")
-        self.ping_max_cb.stateChanged.connect(lambda s: self._on_toggle("pingMaxCheck", s))
+        self.ping_max_cb.stateChanged.connect(lambda s: self._on_toggle("DoMaxPingCheck", s))
         ping_layout.addWidget(self.ping_max_cb, 2, 0, 1, 2)
-        self._checkboxes["pingMaxCheck"] = self.ping_max_cb
+        self._checkboxes["DoMaxPingCheck"] = self.ping_max_cb
 
         ping_layout.addWidget(QLabel("  Max ping [ms]:"), 3, 0)
         self.ping_max_val = QSpinBox()
         self.ping_max_val.setRange(0, 999)
         self.ping_max_val.setFixedWidth(80)
-        self.ping_max_val.valueChanged.connect(lambda v: self._on_slider("pingMax", v))
+        self.ping_max_val.valueChanged.connect(lambda v: self._on_slider("MaxPing", v))
         ping_layout.addWidget(self.ping_max_val, 3, 1)
-        self._sliders["pingMax"] = self.ping_max_val
+        self._sliders["MaxPing"] = self.ping_max_val
 
         ping_group.setLayout(ping_layout)
         center_col.addWidget(ping_group)
@@ -2390,13 +2711,13 @@ class SettingsTab(QWidget):
                                   "0600", "0700", "0800", "0900", "1000", "1100",
                                   "1200", "1300", "1400", "1500", "1600", "1700",
                                   "1800", "1900", "2000", "2100", "2200", "2300"])
-        self.tod_combo.currentTextChanged.connect(lambda v: self.server.send(f"CMD TOD {v}") if v != "Def" and hasattr(self, 'server') and self.server else None)
+        self.tod_combo.currentTextChanged.connect(self._on_time_of_day)
         time_layout.addWidget(self.tod_combo, 0, 1)
 
         time_layout.addWidget(QLabel("24hr passes in (min):"), 1, 0)
         self.game_pass_combo = QComboBox()
         self.game_pass_combo.addItems(["Def", "5", "10", "15", "20", "30", "45", "60", "90", "120"])
-        self.game_pass_combo.currentTextChanged.connect(lambda v: self._on_combo("gamePass", v) if v != "Def" else None)
+        self.game_pass_combo.currentTextChanged.connect(self._on_time_rate)
         time_layout.addWidget(self.game_pass_combo, 1, 1)
 
         time_group.setLayout(time_layout)
@@ -2407,8 +2728,11 @@ class SettingsTab(QWidget):
         pw_layout = QGridLayout()
 
         pw_layout.addWidget(QLabel("Server Password:"), 0, 0)
+        # Length caps mirror ServerManager._VALUE_LIMITS: the server stores these
+        # in fixed buffers that it never bounds-checks on the way back out.
         self.pw_server = QLineEdit()
-        self.pw_server.setPlaceholderText("Server password...")
+        self.pw_server.setMaxLength(16)
+        self.pw_server.setPlaceholderText("Server password (max 16)...")
         pw_layout.addWidget(self.pw_server, 0, 1)
         pw_set1 = SatisfyingButton("Set")
         pw_set1.clicked.connect(lambda: self._set_password("serverPassword", self.pw_server.text()))
@@ -2419,7 +2743,8 @@ class SettingsTab(QWidget):
 
         pw_layout.addWidget(QLabel("Side A Password:"), 1, 0)
         self.pw_sideA = QLineEdit()
-        self.pw_sideA.setPlaceholderText("Side A password...")
+        self.pw_sideA.setMaxLength(16)
+        self.pw_sideA.setPlaceholderText("Side A password (max 16)...")
         pw_layout.addWidget(self.pw_sideA, 1, 1)
         pw_set2 = SatisfyingButton("Set")
         pw_set2.clicked.connect(lambda: self._set_password("sideAPassword", self.pw_sideA.text()))
@@ -2430,7 +2755,8 @@ class SettingsTab(QWidget):
 
         pw_layout.addWidget(QLabel("Side B Password:"), 2, 0)
         self.pw_sideB = QLineEdit()
-        self.pw_sideB.setPlaceholderText("Side B password...")
+        self.pw_sideB.setMaxLength(16)
+        self.pw_sideB.setPlaceholderText("Side B password (max 16)...")
         pw_layout.addWidget(self.pw_sideB, 2, 1)
         pw_set3 = SatisfyingButton("Set")
         pw_set3.clicked.connect(lambda: self._set_password("sideBPassword", self.pw_sideB.text()))
@@ -2441,13 +2767,15 @@ class SettingsTab(QWidget):
 
         pw_layout.addWidget(QLabel("Server Title:"), 3, 0)
         self.pw_title = QLineEdit()
-        self.pw_title.setPlaceholderText("Server name...")
+        self.pw_title.setMaxLength(27)
+        self.pw_title.setPlaceholderText("Server name (max 27)...")
         pw_layout.addWidget(self.pw_title, 3, 1)
         pw_set4 = SatisfyingButton("Set")
         pw_set4.clicked.connect(lambda: self._set_password("serverName", self.pw_title.text()))
         pw_layout.addWidget(pw_set4, 3, 2)
         pw_clr4 = SatisfyingButton("Clear")
-        pw_clr4.clicked.connect(lambda: self._clear_password("serverName", self.pw_title))
+        pw_clr4.setToolTip("Retail does not support an empty server title")
+        pw_clr4.setEnabled(False)
         pw_layout.addWidget(pw_clr4, 3, 3)
 
         pw_group.setLayout(pw_layout)
@@ -2483,32 +2811,81 @@ class SettingsTab(QWidget):
         if self._loading:
             return
         val = "1" if state == 2 else "0"
-        self.server.set_setting(key, val)
         label = self.CHECKBOX_SETTINGS.get(key, key)
-        self._show_feedback(f"{label} = {'ON' if val == '1' else 'OFF'}")
+        submit_admin(
+            self,
+            lambda: self.server.set_setting(key, val),
+            lambda _result: self._show_feedback(
+                f"{label} = {'ON' if val == '1' else 'OFF'}"
+            ),
+            f"Set {label}",
+        )
 
     def _on_slider(self, key, val):
         """Direct send (for non-slider spinboxes like ping limits)."""
         if self._loading:
             return
-        self.server.set_setting(key, str(val))
         label = self.SLIDER_SETTINGS.get(key, (key,))[0]
-        self._show_feedback(f"{label} = {val}")
+        submit_admin(
+            self,
+            lambda: self.server.set_setting(key, str(val)),
+            lambda _result: self._show_feedback(f"{label} = {val}"),
+            f"Set {label}",
+        )
 
     def _on_combo(self, key, val):
         if self._loading or val == "Def":
             return
-        self.server.set_setting(key, val)
-        self._show_feedback(f"{key} = {val}")
+        submit_admin(
+            self,
+            lambda: self.server.set_setting(key, val),
+            lambda _result: self._show_feedback(f"{key} = {val}"),
+            f"Set {key}",
+        )
 
     def _set_password(self, key, value):
-        self.server.set_setting(key, value)
-        self._show_feedback(f"{key} = '{value}'" if value else f"{key} cleared")
+        submit_admin(
+            self,
+            lambda: self.server.set_setting(key, value),
+            lambda _result: self._show_feedback(
+                f"{key} = '{value}'" if value else f"{key} cleared"
+            ),
+            f"Set {key}",
+        )
 
     def _clear_password(self, key, field):
-        self.server.set_setting(key, "")
+        submit_admin(
+            self,
+            lambda: self.server.set_setting(key, ""),
+            lambda _result: self._password_cleared(key, field),
+            f"Clear {key}",
+        )
+
+    def _password_cleared(self, key, field):
         field.clear()
         self._show_feedback(f"{key} cleared")
+
+    def _on_time_of_day(self, value):
+        if value == "Def" or self._loading:
+            return
+        submit_admin(
+            self,
+            lambda: self.server.set_time_of_day(value),
+            lambda _result: self._show_feedback(f"Time of day = {value}"),
+            "Set time of day",
+        )
+
+    def _on_time_rate(self, value):
+        if value == "Def" or self._loading:
+            return
+        submit_admin(
+            self,
+            lambda: self.server.set_time_rate(int(value)),
+            lambda _result: self._show_feedback(
+                f"24-hour cycle = {value} minutes"
+            ),
+            "Set time rate",
+        )
 
     def _lock_server(self):
         """Lock/unlock all settings controls to prevent accidental changes."""
@@ -2555,7 +2932,7 @@ class SettingsTab(QWidget):
 
     def _do_refresh(self):
         """Re-fetch settings from server."""
-        self.server.send("get gamesettings")
+        self.server.refresh_settings()
         self._show_feedback("Settings refreshed")
 
     def _save_settings(self):
@@ -2603,12 +2980,22 @@ class SettingsTab(QWidget):
     def _send_debounced(self, key):
         if key not in self._pending_values: return
         val = self._pending_values[key]
-        # GameTime needs CamelCase to match server key
-        server_key = "GameTime" if key == "gameTime" else key
-        self.server.send(f"set {server_key} {val}")
-        self._show_feedback(f"Set {server_key} to {val}")
-        del self._pending_values[key]
+        # Go through set_setting like every other write path: it maps the key
+        # back to the exact spelling the server reported in GET GAMESETTINGS.
+        # Hand-patching one key here left the rest as camelCase guesses, and
+        # some of them (KOTHLimit) no camelCase transform reproduces.
         self._debounce_timers[key].stop()
+        submit_admin(
+            self,
+            lambda: self.server.set_setting(key, val),
+            lambda _result: self._debounced_setting_applied(key, val),
+            f"Set {key}",
+        )
+
+    def _debounced_setting_applied(self, key, val):
+        self._show_feedback(f"Set {key} to {val}")
+        if self._pending_values.get(key) == val:
+            del self._pending_values[key]
 
     def _show_feedback(self, msg):
         try:
@@ -2723,12 +3110,36 @@ class SettingsTab(QWidget):
             return
         enabled = bool(state)
         if self.mods_tab:
-            self.mods_tab._vote_enabled = enabled
             if not enabled and self.mods_tab._vote_active:
-                self.mods_tab._vote_timer.stop()
-                self.mods_tab.server.send_chat("Vote cancelled: voting disabled")
-                self.mods_tab._vote_active = False
+                submit_admin(
+                    self,
+                    lambda: self.server.send_chat(
+                        "Vote cancelled: voting disabled"
+                    ),
+                    lambda _result: self._vote_disable_succeeded(),
+                    "Cancel active map vote",
+                    lambda _message: self._vote_disable_failed(),
+                )
+                return
+            self.mods_tab._vote_enabled = enabled
         self._save_vote_settings()
+
+    def _vote_disable_succeeded(self):
+        if self.vote_enabled_cb.isChecked():
+            return
+        self.mods_tab._vote_timer.stop()
+        self.mods_tab._vote_active = False
+        self.mods_tab._vote_enabled = False
+        self._save_vote_settings()
+
+    def _vote_disable_failed(self):
+        if self.vote_enabled_cb.isChecked():
+            return
+        self._loading = True
+        try:
+            self.vote_enabled_cb.setChecked(self.mods_tab._vote_enabled)
+        finally:
+            self._loading = False
 
     def _on_vote_threshold_changed(self, val):
         if self._loading:
@@ -2775,12 +3186,36 @@ class SettingsTab(QWidget):
             return
         enabled = bool(state)
         if self.mods_tab:
-            self.mods_tab._skip_enabled = enabled
             if not enabled and self.mods_tab._skip_active:
-                self.mods_tab._skip_timer.stop()
-                self.mods_tab.server.send_chat("Skip vote cancelled: voting disabled")
-                self.mods_tab._skip_active = False
+                submit_admin(
+                    self,
+                    lambda: self.server.send_chat(
+                        "Skip vote cancelled: voting disabled"
+                    ),
+                    lambda _result: self._skip_disable_succeeded(),
+                    "Cancel active skip vote",
+                    lambda _message: self._skip_disable_failed(),
+                )
+                return
+            self.mods_tab._skip_enabled = enabled
         self._save_skip_settings()
+
+    def _skip_disable_succeeded(self):
+        if self.skip_enabled_cb.isChecked():
+            return
+        self.mods_tab._skip_timer.stop()
+        self.mods_tab._skip_active = False
+        self.mods_tab._skip_enabled = False
+        self._save_skip_settings()
+
+    def _skip_disable_failed(self):
+        if self.skip_enabled_cb.isChecked():
+            return
+        self._loading = True
+        try:
+            self.skip_enabled_cb.setChecked(self.mods_tab._skip_enabled)
+        finally:
+            self._loading = False
 
     def _on_skip_threshold_changed(self, val):
         if self._loading:
@@ -2795,14 +3230,17 @@ class ChatBotTab(QWidget):
     def __init__(self, server: ServerManager):
         super().__init__()
         self.server = server
+        self._admin_futures = AdminFutureBridge(self, self.server._log)
         self.bad_words = {}  # {word: action} e.g. {"nigger": "Kick", "cunt": "Warn"}
         self.auto_swap_enabled = True
         self.swap_trigger = "!switch"
         self._seen_chat_ids = set()  # msg ids we've already processed
         self._swap_cooldowns = {}  # player_name -> timestamp of last swap
+        self._swap_pending = set()
         self._chat_initialized = False  # skip first chat batch (old messages from before we connected)
         self._player_chat_times = {} # player_name -> list of timestamps
         self._spam_kick_cooldowns = {}  # player_name -> timestamp of last kick
+        self._spam_kick_pending = set()
         self._chat_config = self._load_chat_config()
         self._build_ui()
 
@@ -2812,6 +3250,8 @@ class ChatBotTab(QWidget):
         self._seen_chat_raw = set()
         self._player_chat_times = {}
         self._spam_kick_cooldowns = {}
+        self._swap_pending = set()
+        self._spam_kick_pending = set()
 
     def _chat_config_path(self):
         import os, sys
@@ -2860,12 +3300,13 @@ class ChatBotTab(QWidget):
         # Send chat
         send_layout = QHBoxLayout()
         self.chat_input = QLineEdit()
-        self.chat_input.setPlaceholderText("Type a message (max 69 chars)...")
-        self.chat_input.setMaxLength(69)
-        self.chat_input.textChanged.connect(lambda t: self.char_count.setText(f"{len(t)}/69"))
+        self.chat_input.setPlaceholderText(f"Type a message (max {CHAT_MAX_LEN} chars)...")
+        self.chat_input.setMaxLength(CHAT_MAX_LEN)
+        self.chat_input.textChanged.connect(
+            lambda t: self.char_count.setText(f"{len(t)}/{CHAT_MAX_LEN}"))
         self.chat_input.returnPressed.connect(self._send_chat)
         send_layout.addWidget(self.chat_input)
-        self.char_count = QLabel("0/69")
+        self.char_count = QLabel(f"0/{CHAT_MAX_LEN}")
         self.char_count.setStyleSheet("color: #666;")
         send_layout.addWidget(self.char_count)
 
@@ -2958,8 +3399,18 @@ class ChatBotTab(QWidget):
     def _send_chat(self):
         msg = self.chat_input.text().strip()
         if msg:
-            self.server.send_chat(msg)
-            self.chat_display.append(f"<span style='color: #e8c840'>[ADMIN] {msg}</span>")
+            submit_admin(
+                self,
+                lambda: self.server.send_chat(msg),
+                lambda _result: self._admin_chat_sent(msg),
+                "Send admin chat",
+            )
+
+    def _admin_chat_sent(self, message):
+        self.chat_display.append(
+            f"<span style='color: #e8c840'>[ADMIN] {message}</span>"
+        )
+        if self.chat_input.text().strip() == message:
             self.chat_input.clear()
 
     def _add_bad_word(self):
@@ -3024,8 +3475,8 @@ class ChatBotTab(QWidget):
                     found = False
                     for p in self.server.players:
                         if p.get('name', '').lower() == player_name.lower():
-                            pid = p.get('id', '')
-                            name = p.get('name', player_name)
+                            player_target = player_entry_from_legacy(p)
+                            name = player_target.name
                             # Cooldown: ignore if this player triggered within last 2 minutes
                             now = time.time()
                             last_swap = self._swap_cooldowns.get(name.lower(), 0)
@@ -3033,17 +3484,25 @@ class ChatBotTab(QWidget):
                                 remaining = int(120 - (now - last_swap))
                                 self.chat_display.append(
                                     f"<span style='color: #a89830'>[SWAP] {name} on cooldown ({remaining}s remaining)</span>")
-                            else:
-                                self._swap_cooldowns[name.lower()] = now
+                            elif name.lower() in self._swap_pending:
                                 self.chat_display.append(
-                                    f"<span style='color: #e8c840'>[SWAP] {name} requested team switch - swapping and respawning</span>")
-                                # Swap + kill in background thread so UI doesn't freeze
-                                import threading
-                                threading.Thread(
-                                    target=self.server.swap_and_kill,
-                                    args=(pid, name),
-                                    daemon=True
-                                ).start()
+                                    f"<span style='color: #a89830'>[SWAP] {name} switch is already pending</span>"
+                                )
+                            else:
+                                self._swap_pending.add(name.lower())
+                                submit_admin(
+                                    self,
+                                    lambda player_target=player_target, player_name=name: self.server.swap_and_kill(
+                                        player_target, player_name
+                                    ),
+                                    lambda _result, player_name=name, timestamp=now: self._swap_succeeded(
+                                        player_name, timestamp
+                                    ),
+                                    f"Auto-swap {name}",
+                                    lambda _message, player_name=name: self._swap_pending.discard(
+                                        player_name.lower()
+                                    ),
+                                )
                             found = True
                             break
                     if not found:
@@ -3056,40 +3515,66 @@ class ChatBotTab(QWidget):
                     # Extract player name from chat message
                     player_name = text.split(':')[0].strip() if ':' in text else text.split()[0].strip()
                     # Find player in player list
-                    pid = None
+                    player_target = None
                     display_name = player_name
                     for p in self.server.players:
                         if p.get('name', '').lower() == player_name.lower():
-                            pid = p.get('id', '')
-                            display_name = p.get('name', player_name)
+                            player_target = player_entry_from_legacy(p)
+                            display_name = player_target.name
                             break
 
                     self.chat_display.append(
                         f"<span style='color: #ff6040'>[FILTER] Bad word '{word}' from {display_name} - Action: {action}</span>")
 
-                    if pid:
+                    if player_target is not None:
                         if action == 'Warn':
-                            self.server.warn_player(int(pid), "Watch your language!")
-                            time.sleep(0.3)
-                            self.server.send_chat(f"{display_name}: watch your language!")
+                            submit_admin(
+                                self,
+                                lambda player_target=player_target: self.server.warn_player(
+                                    player_target, "Watch your language!"
+                                ),
+                                lambda _result, player_name=display_name: self.chat_display.append(
+                                    f"<span style='color: #e8c840'>"
+                                    f"[FILTER] Warning delivered to "
+                                    f"{player_name}</span>"
+                                ),
+                                f"Warn {display_name} for bad language",
+                            )
                         elif action == 'Kick':
-                            self.server.punt_player(int(pid), "Bad language")
-                            time.sleep(0.3)
-                            self.server.send_chat(f"{display_name} was kicked for bad language")
+                            submit_admin(
+                                self,
+                                lambda player_target=player_target: self.server.punt_player(
+                                    player_target, "Bad language"
+                                ),
+                                lambda _result, player_name=display_name: self._send_automod_announcement(
+                                    f"{player_name} was kicked for bad language"
+                                ),
+                                f"Kick {display_name} for bad language",
+                            )
                         elif action == 'Ban':
-                            self.server.ban_player(int(pid), "Bad language")
-                            time.sleep(0.3)
-                            self.server.send_chat(f"{display_name} was banned for bad language")
+                            submit_admin(
+                                self,
+                                lambda player_target=player_target: self.server.ban_player(
+                                    player_target, "Bad language"
+                                ),
+                                lambda _result, player_name=display_name: self._send_automod_announcement(
+                                    f"{player_name} was banned for bad language"
+                                ),
+                                f"Ban {display_name} for bad language",
+                            )
 
             # Anti-Spam Check
             if self.spam_cb.isChecked():
                 player_name = text.split(':')[0].strip() if ':' in text else text.split()[0].strip()
                 if player_name and player_name != 'Server':
                     now = time.time()
-                    # Cooldown: skip if this player was kicked in the last 30 seconds
+                    # Cooldown: skip if this player was kicked in the last 30 seconds.
+                    # continue, not return: this is inside the per-message loop,
+                    # and returning here abandoned every later message in the
+                    # batch, taking bad-word filtering and !commands with it.
                     last_kick = self._spam_kick_cooldowns.get(player_name.lower(), 0)
                     if now - last_kick < 30:
-                        return
+                        continue
                     history = self._player_chat_times.get(player_name.lower(), [])
                     window = self.spam_time_spin.value()
                     # keep only messages within the time window
@@ -3098,26 +3583,63 @@ class ChatBotTab(QWidget):
                     self._player_chat_times[player_name.lower()] = history
 
                     if len(history) >= self.spam_msg_spin.value():
-                        pid = None
+                        player_target = None
                         display_name = player_name
                         for p in self.server.players:
                             if p.get('name', '').lower() == player_name.lower():
-                                pid = p.get('id', '')
-                                display_name = p.get('name', player_name)
+                                player_target = player_entry_from_legacy(p)
+                                display_name = player_target.name
                                 break
 
-                        if pid:
-                            self._spam_kick_cooldowns[player_name.lower()] = now
-                            self.server.punt_player(int(pid), "Chat spam")
-                            time.sleep(0.3)
-                            self.server.send_chat(f"{display_name} was kicked for spamming the chat")
-                            self.chat_display.append(f"<span style='color: #ff6040'>[ANTI-SPAM] {display_name} kicked for spam</span>")
-                            self._player_chat_times[player_name.lower()] = [] # Reset after kick
+                        if player_target is not None:
+                            player_key = player_name.lower()
+                            if player_key in self._spam_kick_pending:
+                                continue
+                            self._spam_kick_pending.add(player_key)
+                            submit_admin(
+                                self,
+                                lambda player_target=player_target: self.server.punt_player(
+                                    player_target, "Chat spam"
+                                ),
+                                lambda _result, key=player_key, player_name=display_name, timestamp=now: self._spam_kick_succeeded(
+                                    key, player_name, timestamp
+                                ),
+                                f"Kick {display_name} for chat spam",
+                                lambda _message, key=player_key: self._spam_kick_pending.discard(
+                                    key
+                                ),
+                            )
 
         # Scroll to bottom
         cursor = self.chat_display.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         self.chat_display.setTextCursor(cursor)
+
+    def _swap_succeeded(self, name, timestamp):
+        key = name.lower()
+        self._swap_pending.discard(key)
+        self._swap_cooldowns[key] = timestamp
+        self.chat_display.append(
+            f"<span style='color: #e8c840'>[SWAP] {name} requested team switch - swapped and respawned</span>"
+        )
+
+    def _send_automod_announcement(self, message):
+        submit_admin(
+            self,
+            lambda: self.server.send_chat(message),
+            context="Send auto-moderation announcement",
+        )
+
+    def _spam_kick_succeeded(self, player_key, display_name, timestamp):
+        self._spam_kick_pending.discard(player_key)
+        self._spam_kick_cooldowns[player_key] = timestamp
+        self._player_chat_times[player_key] = []
+        self.chat_display.append(
+            f"<span style='color: #ff6040'>[ANTI-SPAM] {display_name} kicked for spam</span>"
+        )
+        self._send_automod_announcement(
+            f"{display_name} was kicked for spamming the chat"
+        )
 
 
 class StatsStore:
@@ -3266,6 +3788,7 @@ class MessagesTab(QWidget):
     def __init__(self, server: ServerManager, stats_store: StatsStore = None):
         super().__init__()
         self.server = server
+        self._admin_futures = AdminFutureBridge(self, self.server._log)
         self.stats_store = stats_store
         self._recurring_messages = []
         self._recurring_index = 0
@@ -3363,8 +3886,8 @@ class MessagesTab(QWidget):
         # Add/remove
         add_layout = QHBoxLayout()
         self.recur_input = QLineEdit()
-        self.recur_input.setPlaceholderText("Add a recurring message (max 69 chars)...")
-        self.recur_input.setMaxLength(69)
+        self.recur_input.setPlaceholderText(f"Add a recurring message (max {CHAT_MAX_LEN} chars)...")
+        self.recur_input.setMaxLength(CHAT_MAX_LEN)
         add_layout.addWidget(self.recur_input)
         add_btn = QPushButton("Add")
         add_btn.clicked.connect(self._add_recurring)
@@ -3406,7 +3929,7 @@ class MessagesTab(QWidget):
 
         welcome_layout.addWidget(QLabel("Welcome message ({player} = player name):"))
         self.welcome_input = QLineEdit(self._welcome_message)
-        self.welcome_input.setMaxLength(69)
+        self.welcome_input.setMaxLength(CHAT_MAX_LEN)
         self.welcome_input.textChanged.connect(self._update_welcome_msg)
         welcome_layout.addWidget(self.welcome_input)
 
@@ -3452,8 +3975,18 @@ class MessagesTab(QWidget):
     def _send_message(self):
         msg = self.msg_input.text().strip()
         if msg:
-            self.server.announce(msg)
-            self.log_text.append(f"[{time.strftime('%H:%M:%S')}] SENT: {msg}")
+            submit_admin(
+                self,
+                lambda: self.server.announce(msg),
+                lambda _result: self._message_sent(msg),
+                "Send server message",
+            )
+
+    def _message_sent(self, message):
+        self.log_text.append(
+            f"[{time.strftime('%H:%M:%S')}] SENT: {message}"
+        )
+        if self.msg_input.text().strip() == message:
             self.msg_input.clear()
 
     def _add_recurring(self):
@@ -3505,8 +4038,17 @@ class MessagesTab(QWidget):
         if not self._recurring_messages:
             return
         msg = self._recurring_messages[self._recurring_index % len(self._recurring_messages)]
-        self.server.announce(msg)
-        self.log_text.append(f"[{time.strftime('%H:%M:%S')}] RECURRING: {msg}")
+        submit_admin(
+            self,
+            lambda: self.server.announce(msg),
+            lambda _result: self._recurring_sent(msg),
+            "Send recurring message",
+        )
+
+    def _recurring_sent(self, message):
+        self.log_text.append(
+            f"[{time.strftime('%H:%M:%S')}] RECURRING: {message}"
+        )
         self._recurring_index += 1
 
     def _toggle_welcome(self, checked):
@@ -3610,9 +4152,20 @@ class MessagesTab(QWidget):
 
     def _send_welcome(self, msg, name):
         """Actually send the welcome message after the delay."""
-        self.server.announce(msg)
-        self.welcome_log.addItem(f"[{time.strftime('%H:%M:%S')}] {name} (sent)")
-        self.log_text.append(f"[{time.strftime('%H:%M:%S')}] WELCOME SENT: {name}")
+        submit_admin(
+            self,
+            lambda: self.server.announce(msg),
+            lambda _result: self._welcome_sent(name),
+            f"Send welcome to {name}",
+        )
+
+    def _welcome_sent(self, name):
+        self.welcome_log.addItem(
+            f"[{time.strftime('%H:%M:%S')}] {name} (sent)"
+        )
+        self.log_text.append(
+            f"[{time.strftime('%H:%M:%S')}] WELCOME SENT: {name}"
+        )
 
 class SpreeTab(QWidget):
     """Killing Spree Announcer Tab"""
@@ -3620,6 +4173,7 @@ class SpreeTab(QWidget):
     def __init__(self, server, messages_tab):
         super().__init__()
         self.server = server
+        self._admin_futures = AdminFutureBridge(self, self.server._log)
         self.messages_tab = messages_tab
         self._spree_enabled = True
         self._spree_thresholds = {
@@ -3636,6 +4190,7 @@ class SpreeTab(QWidget):
             "{player} claims first blood"
         ]
         self._first_blood_ready = True
+        self._first_blood_pending = False
         self._spree_table_loading = False
         self._player_stats = {}
         self._load_config()
@@ -3818,6 +4373,7 @@ class SpreeTab(QWidget):
         if current != getattr(self, '_last_map', None):
             self._last_map = current
             self._first_blood_ready = True
+            self._first_blood_pending = False
             for stat in self._player_stats.values():
                 stat['streak'] = 0
             try:
@@ -3858,8 +4414,6 @@ class SpreeTab(QWidget):
             prev = self._player_stats[pid]
             prev['name'] = name
 
-            # Map change resets handled by on_missions_updated() (v2.4.10)
-
             if deaths > prev['deaths']:
                 prev['streak'] = 0
             elif kills > prev['kills']:
@@ -3869,11 +4423,23 @@ class SpreeTab(QWidget):
                 prev['streak'] = new_streak
 
                 # First blood check
-                if self._first_blood_enabled and self._first_blood_ready and new_streak >= 1:
+                if (
+                    self._first_blood_enabled
+                    and self._first_blood_ready
+                    and not self._first_blood_pending
+                    and new_streak >= 1
+                ):
                     fb_msg = random.choice(self._first_blood_templates).replace('{player}', name)
-                    self.server.send_chat(fb_msg)
-                    self.log_text.append(f"[{time.strftime('%H:%M:%S')}] FIRST BLOOD: {fb_msg}")
-                    self._first_blood_ready = False
+                    self._first_blood_pending = True
+                    submit_admin(
+                        self,
+                        lambda message=fb_msg: self.server.send_chat(message),
+                        lambda _result, message=fb_msg: self._first_blood_sent(
+                            message
+                        ),
+                        "Announce first blood",
+                        lambda _message: self._first_blood_failed(),
+                    )
 
                 if self._spree_enabled:
                     thresholds = sorted(self._spree_thresholds.keys(), reverse=True)
@@ -3881,8 +4447,17 @@ class SpreeTab(QWidget):
                         if old_streak < t <= new_streak:
                             template = self._spree_thresholds[t]
                             msg = template.replace('{player}', name)
-                            self.server.send_chat(msg)
-                            self.log_text.append(f"[{time.strftime('%H:%M:%S')}] SPREE: {msg}")
+                            submit_admin(
+                                self,
+                                lambda message=msg: self.server.send_chat(
+                                    message
+                                ),
+                                lambda _result, message=msg: self.log_text.append(
+                                    f"[{time.strftime('%H:%M:%S')}] "
+                                    f"SPREE: {message}"
+                                ),
+                                "Announce killing spree",
+                            )
                             break
 
             prev['kills'] = kills
@@ -3890,6 +4465,16 @@ class SpreeTab(QWidget):
 
             if kd_enabled and getattr(self.messages_tab, 'stats_store', None):
                 self.messages_tab.stats_store.update_player(name, kills, deaths, prev.get('streak', 0))
+
+    def _first_blood_sent(self, message):
+        self._first_blood_pending = False
+        self._first_blood_ready = False
+        self.log_text.append(
+            f"[{time.strftime('%H:%M:%S')}] FIRST BLOOD: {message}"
+        )
+
+    def _first_blood_failed(self):
+        self._first_blood_pending = False
 
 
 
@@ -3937,7 +4522,7 @@ class MissionsStore:
         if m:
             name = name[m.end():]
 
-        ext_match = re.search(r'(?i)\.(bms|npaj|npj)\b', name)
+        ext_match = re.search(r'(?i)\.(bms|npj|npz)\b', name)
         if ext_match:
             return name[:ext_match.end()].strip()
 
@@ -3950,8 +4535,8 @@ class MissionsStore:
 
     @staticmethod
     def _strip_ext(filename):
-        """Remove .bms/.npaj/.npj extension."""
-        for ext in ('.bms', '.npaj', '.npj'):
+        """Remove .bms/.npj/.npz extension."""
+        for ext in ('.bms', '.npj', '.npz'):
             if filename.lower().endswith(ext):
                 return filename[:-len(ext)]
         return filename
@@ -3982,7 +4567,7 @@ class MissionsStore:
             if m:
                 line = line[m.end():]
 
-            ext_match = re.search(r'(?i)\.(bms|npaj|npj)\b', line)
+            ext_match = re.search(r'(?i)\.(bms|npj|npz)\b', line)
             if not ext_match:
                 continue
 
@@ -4024,7 +4609,7 @@ class MissionsStore:
             return None, None, None
         q = query.lower().strip()
         # Strip extension if user typed it
-        for ext in ('.bms', '.npaj', '.npj'):
+        for ext in ('.bms', '.npj', '.npz'):
             if q.endswith(ext):
                 q = q[:-len(ext)]
                 break
@@ -4098,6 +4683,9 @@ class ModsTab(QWidget):
     def __init__(self, server: ServerManager, missions_store: MissionsStore):
         super().__init__()
         self.server = server
+        self._admin_futures = AdminFutureBridge(
+            self, self._admin_operation_error
+        )
         self.missions_store = missions_store
         self.messages_tab = None  # set by MainWindow cross-tab wiring
         self.mods = {}  # {lowercase_name: display_name}
@@ -4109,9 +4697,11 @@ class ModsTab(QWidget):
         self._vote_active = False
         self._vote_map_name = None
         self._vote_map_file = None
+        self._vote_map_entry = None
         self._vote_source = None
         self._vote_voters = set()  # lowercase player names
         self._vote_total = 0
+        self._vote_transition_pending = False
         self._vote_timer = QTimer()
         self._vote_timer.setSingleShot(True)
         self._vote_timer.timeout.connect(self._vote_expired)
@@ -4122,6 +4712,7 @@ class ModsTab(QWidget):
         self._skip_cooldown_until = 0  # epoch; skip cooldown timer (15 min)
         self._skip_voters = set()
         self._skip_total = 0
+        self._skip_transition_pending = False
         self._skip_timer = QTimer()
         self._skip_timer.setSingleShot(True)
         self._skip_timer.timeout.connect(self._skip_expired)
@@ -4140,6 +4731,113 @@ class ModsTab(QWidget):
         """Called on reconnect. Reset dedup so first batch is skipped, then new messages process."""
         self._seen_chat_ids = set()
         self._chat_initialized = False
+
+    def _admin_operation_error(self, message):
+        self.server._log(message)
+        if hasattr(self, "mod_log"):
+            self.mod_log.addItem(
+                f"[{time.strftime('%H:%M:%S')}] ERROR: {message}"
+            )
+
+    def _send_mod_chat(self, message, context="Send moderator chat"):
+        return submit_admin(
+            self,
+            lambda: self.server.send_chat(message),
+            context=context,
+        )
+
+    def _submit_mod_action(
+        self,
+        operation,
+        *,
+        context,
+        announcement=None,
+        log_message=None,
+        on_success=None,
+        on_failure=None,
+    ):
+        def accepted(result):
+            if log_message:
+                self.mod_log.addItem(log_message)
+            if on_success is not None:
+                on_success(result)
+            if announcement:
+                self._send_mod_chat(
+                    announcement, f"{context} announcement"
+                )
+
+        return submit_admin(
+            self,
+            operation,
+            accepted,
+            context,
+            on_failure,
+        )
+
+    def _start_skip_transition(self, announcement, log_message):
+        if self._skip_transition_pending:
+            return
+        self._skip_transition_pending = True
+        self._skip_timer.stop()
+        self._submit_mod_action(
+            lambda: self.server.cycle_mission(),
+            context="Cycle mission after skip vote",
+            announcement=announcement,
+            log_message=log_message,
+            on_success=lambda _result: self._skip_transition_succeeded(),
+            on_failure=lambda _message: self._skip_transition_failed(),
+        )
+
+    def _skip_transition_succeeded(self):
+        self._skip_transition_pending = False
+        self._skip_active = False
+        self._skip_cooldown_until = time.time() + 900
+
+    def _skip_transition_failed(self):
+        self._skip_transition_pending = False
+        self._skip_active = False
+
+    def _start_vote_transition(self, announcement, log_message):
+        if self._vote_transition_pending:
+            return
+        self._vote_transition_pending = True
+        self._vote_timer.stop()
+        target = (
+            self._vote_map_entry
+            if self._vote_source == "rotation"
+            else self._vote_map_file
+        )
+        self._submit_mod_action(
+            lambda: self.server.switch_mission(
+                target,
+                add_if_missing=self._vote_source == "available",
+            ),
+            context=f"Switch to voted mission {self._vote_map_name}",
+            announcement=announcement,
+            log_message=log_message,
+            on_success=lambda _result: self._vote_transition_succeeded(),
+            on_failure=lambda _message: self._vote_transition_failed(),
+        )
+
+    def _vote_transition_succeeded(self):
+        self._vote_transition_pending = False
+        self._vote_active = False
+        self._vote_cooldown_until = time.time() + 900
+
+    def _vote_transition_failed(self):
+        self._vote_transition_pending = False
+        self._vote_active = False
+
+    def _start_forced_map_vote(self, map_tab, now, sender):
+        map_tab._start_vote()
+        self.mod_log.addItem(
+            f"[{now}] {sender} triggered an early map vote"
+        )
+
+    def _mod_team_workflow_succeeded(self, results, log_message):
+        for line in results:
+            self.server._log(line)
+        self.mod_log.addItem(log_message)
 
     def _config_path(self):
         base = os.path.dirname(sys.argv[0]) if not getattr(sys, 'frozen', False) else os.path.dirname(sys.executable)
@@ -4339,9 +5037,8 @@ class ModsTab(QWidget):
 
     def _refresh_maps(self):
         """Re-fetch missions from server to update the store."""
-        self.server.send('mission list')
-        time.sleep(0.3)
-        self.server.send('mission available')
+        self.server.refresh_missions()
+        self.server.refresh_available_maps()
         self.mod_log.addItem(f"[{time.strftime('%H:%M:%S')}] Refreshing maps from server...")
         # Update info label after a short delay (responses arrive async)
         QTimer.singleShot(2000, self._update_maps_info)
@@ -4455,10 +5152,13 @@ class ModsTab(QWidget):
             stats = stats_store.get_player(target_name)
             if stats:
                 kd_str = f"{stats['name']}: Kills: {stats['kills']} | Deaths: {stats['deaths']} | KD: {stats['kd']}"
-                self.server.send_chat(kd_str)
+                self._send_mod_chat(kd_str, "Send KD response")
                 wire_log(f"[MODS] !kd: sent '{kd_str}'")
             else:
-                self.server.send_chat(f"No stats found for {target_name}")
+                self._send_mod_chat(
+                    f"No stats found for {target_name}",
+                    "Send missing stats response",
+                )
                 wire_log(f"[MODS] !kd: no stats for '{target_name}'")
             return
 
@@ -4486,7 +5186,7 @@ class ModsTab(QWidget):
             if not name:
                 return None, None, None
             q = name.lower().strip()
-            for ext in ('.bms', '.npaj', '.npj'):
+            for ext in ('.bms', '.npj', '.npz'):
                 if q.endswith(ext):
                     q = q[:-len(ext)]
                     break
@@ -4515,10 +5215,12 @@ class ModsTab(QWidget):
             player = find_player(sender)
             if player and player.get('ping') and player['ping'] != '-':
                 ping_str = f"{player['name']}: {player['ping']}ms"
-                self.server.send_chat(ping_str)
+                self._send_mod_chat(ping_str, "Send ping response")
                 wire_log(f"[MODS] !ping: sent '{ping_str}'")
             else:
-                self.server.send_chat(f"{sender}: ping unavailable")
+                self._send_mod_chat(
+                    f"{sender}: ping unavailable", "Send ping response"
+                )
                 wire_log(f"[MODS] !ping: ping unavailable for '{sender}'")
             return
 
@@ -4526,23 +5228,26 @@ class ModsTab(QWidget):
         if cmd == '!list':
             rotation = self.missions_store._data.get('rotation', [])
             if not rotation:
-                self.server.send_chat("No maps in rotation")
+                self._send_mod_chat(
+                    "No maps in rotation", "Send empty rotation response"
+                )
                 return
-            # Build numbered list, send in chunks to respect 69-char limit
+            # Build numbered list, send in chunks that fit the chat limit
             names = [r['name'] for r in rotation]
             full = "Rotation: " + ", ".join(f"{i}.{n}" for i, n in enumerate(names, 1))
-            # Split into 69-char chunks
             chunk = ""
             for part in full.split(", "):
                 test = f"{chunk}, {part}" if chunk else part
-                if len(test) > 69:
+                if len(test) > CHAT_MAX_LEN:
                     if chunk:
-                        self.server.send_chat(chunk)
+                        self._send_mod_chat(
+                            chunk, "Send rotation list"
+                        )
                     chunk = part
                 else:
                     chunk = test
             if chunk:
-                self.server.send_chat(chunk)
+                self._send_mod_chat(chunk, "Send rotation list")
             return
 
         # !vote <map> - any player can start a map vote
@@ -4550,31 +5255,62 @@ class ModsTab(QWidget):
             if not self._vote_enabled:
                 return
             if self._vote_active:
-                self.server.send_chat("Vote already in progress")
+                self._send_mod_chat(
+                    "Vote already in progress", "Send vote status"
+                )
                 return
             map_name = ' '.join(args) if args else ''
             if not map_name:
-                self.server.send_chat("Usage: !vote <map name>")
+                self._send_mod_chat(
+                    "Usage: !vote <map name>", "Send vote usage"
+                )
                 return
             # Need 2+ players
             player_count = len(self.server.players)
             if player_count < 2:
-                self.server.send_chat("Need at least 2 players to vote")
+                self._send_mod_chat(
+                    "Need at least 2 players to vote",
+                    "Send vote player requirement",
+                )
                 return
             # Find the map
             name, filename, source = find_map(map_name)
             if not name or not filename:
-                self.server.send_chat(f"Map not found: {map_name}")
+                self._send_mod_chat(
+                    f"Map not found: {map_name}", "Send missing map response"
+                )
                 return
+            mission_entry = None
+            if source == "rotation":
+                try:
+                    mission_entry = MissionsTab._resolve_unique_mission_entry(
+                        self.server.mission_entries, filename
+                    )
+                except ValueError:
+                    self._send_mod_chat(
+                        f"Map is queued more than once: {name}",
+                        "Reject ambiguous map vote",
+                    )
+                    return
+                if mission_entry is None:
+                    self._send_mod_chat(
+                        f"Map queue changed: {name}",
+                        "Reject stale map vote",
+                    )
+                    return
             # Start the vote
             self._vote_active = True
             self._vote_map_name = name
             self._vote_map_file = filename
+            self._vote_map_entry = mission_entry
             self._vote_source = source
             self._vote_voters = set()
             self._vote_total = player_count
             self._vote_voters.add(sender)  # starter auto-votes
-            self.server.send_chat(f"Map vote: {name}. Type !yes. 60 seconds.")
+            self._send_mod_chat(
+                f"Map vote: {name}. Type !yes. 60 seconds.",
+                "Announce map vote",
+            )
             self._vote_timer.start(60000)
             self._vote_id = getattr(self, '_vote_id', 0) + 1
             self._schedule_vote_milestones(self._vote_id)
@@ -4586,18 +5322,26 @@ class ModsTab(QWidget):
             if not self._skip_enabled:
                 return
             if self._skip_active:
-                self.server.send_chat("Skip vote already in progress")
+                self._send_mod_chat(
+                    "Skip vote already in progress", "Send skip vote status"
+                )
                 return
             # 15-minute cooldown check
             remaining = int(self._skip_cooldown_until - time.time())
             if remaining > 0:
                 mins = remaining // 60
                 secs = remaining % 60
-                self.server.send_chat(f"Skip on cooldown - {mins}m {secs}s left")
+                self._send_mod_chat(
+                    f"Skip on cooldown - {mins}m {secs}s left",
+                    "Send skip cooldown",
+                )
                 return
             player_count = len(self.server.players)
             if player_count < 1:
-                self.server.send_chat("Need at least 1 player to vote")
+                self._send_mod_chat(
+                    "Need at least 1 player to vote",
+                    "Send skip player requirement",
+                )
                 return
             self._skip_active = True
             self._skip_voters = set()
@@ -4606,14 +5350,17 @@ class ModsTab(QWidget):
             # Check if auto-vote already meets threshold (solo player)
             threshold = int(self._skip_total * self._skip_threshold / 100) + 1
             if len(self._skip_voters) >= threshold:
-                self.server.send_chat("Skip vote passed! Skipping map...")
-                self.mod_log.addItem(f"[{now}] Skip vote passed ({len(self._skip_voters)}/{self._skip_total})")
                 wire_log(f"[SKIP] Passed immediately ({len(self._skip_voters)}/{self._skip_total})")
-                self.server.send('GOTO GAMESTATE')
-                self._skip_active = False
-                self._skip_cooldown_until = time.time() + 900  # 15 min cooldown
+                self._start_skip_transition(
+                    "Skip vote passed! Skipping map...",
+                    f"[{now}] Skip vote passed "
+                    f"({len(self._skip_voters)}/{self._skip_total})",
+                )
                 return
-            self.server.send_chat("Skip current map? Type !yes. 60 seconds.")
+            self._send_mod_chat(
+                "Skip current map? Type !yes. 60 seconds.",
+                "Announce skip vote",
+            )
             self._skip_timer.start(60000)
             self._skip_id = getattr(self, '_skip_id', 0) + 1
             self._schedule_skip_milestones(self._skip_id)
@@ -4637,12 +5384,11 @@ class ModsTab(QWidget):
                         threshold = int(self._skip_total * self._skip_threshold / 100) + 1
                         wire_log(f"[SKIP] {sender} voted yes. {votes}/{self._skip_total} (need {threshold}, {self._skip_threshold}%)")
                         if votes >= threshold:
-                            self._skip_timer.stop()
-                            self.server.send_chat("Skip vote passed! Skipping map...")
-                            self.mod_log.addItem(f"[{now}] Skip vote passed ({votes}/{self._skip_total})")
-                            self.server.send('GOTO GAMESTATE')
-                            self._skip_active = False
-                            self._skip_cooldown_until = time.time() + 900  # 15 min cooldown
+                            self._start_skip_transition(
+                                "Skip vote passed! Skipping map...",
+                                f"[{now}] Skip vote passed "
+                                f"({votes}/{self._skip_total})",
+                            )
                             return
 
             # Map vote
@@ -4664,36 +5410,19 @@ class ModsTab(QWidget):
             wire_log(f"[VOTE] {sender} voted yes. {votes}/{self._vote_total} (need {threshold}, {self._vote_threshold}%)")
             # Check if we hit threshold
             if votes >= threshold:
-                self._vote_timer.stop()
-                self.server.send_chat(f"Vote passed! Switching to {self._vote_map_name}...")
-                self.mod_log.addItem(f"[{now}] Vote passed: {self._vote_map_name} ({votes}/{self._vote_total})")
-                # If map is available but not in rotation, add it first
-                if self._vote_source == 'available':
-                    MissionsTab._send_mission_add_to_server(self.server, self._vote_map_file, 1)
-                    time.sleep(0.5)
-                    self.server.send('mission list')
-                    time.sleep(0.5)
-                # Set the voted map as next, then cycle
-                mtab = getattr(self.server, '_missions_tab', None)
-                if mtab:
-                    idx = mtab._get_server_index(self._vote_map_file)
-                    if idx is not None:
-                        self.server.send(f'MISSION SETNEXT {idx}')
-                    else:
-                        wire_log(f"[VOTE] Could not find index for {self._vote_map_file}, falling back to 999")
-                        self.server.send('MISSION SETNEXT 999')
-                else:
-                    wire_log(f"[VOTE] No missions_tab found, falling back to 999")
-                    self.server.send('MISSION SETNEXT 999')
-                time.sleep(0.3)
-                self.server.send('GOTO GAMESTATE')
-                self._vote_active = False
+                self._start_vote_transition(
+                    f"Vote passed! Switching to {self._vote_map_name}...",
+                    f"[{now}] Vote passed: {self._vote_map_name} "
+                    f"({votes}/{self._vote_total})",
+                )
             return
 
         # If it's a ! command but not recognized, tell them
         valid_commands = {'!warn', '!kick', '!ban', '!swap', '!kill', '!next', '!map', '!add', '!remove', '!1', '!2', '!3', '!startvote', '!mixteams', '!balanceteams', '!time', '!gametime'}
         if cmd not in valid_commands:
-            self.server.send_chat(f"Unknown command: {cmd}")
+            self._send_mod_chat(
+                f"Unknown command: {cmd}", "Send unknown command response"
+            )
             return
 
         # Map voting commands (!1, !2, !3) - any player can vote
@@ -4718,90 +5447,142 @@ class ModsTab(QWidget):
             map_tab = getattr(self.server, '_map_voting_tab', None)
             if map_tab:
                 if map_tab._vote_active:
-                    self.server.send_chat("Vote is already running.")
+                    self._send_mod_chat(
+                        "Vote is already running.", "Send vote status"
+                    )
                 else:
-                    self.server.send_chat(f"Mod {sender} forced an early end-of-match map vote.")
-                    map_tab._start_vote()
-                    self.mod_log.addItem(f"[{now}] {sender} triggered an early map vote")
+                    submit_admin(
+                        self,
+                        lambda: self.server.send_chat(
+                            f"Mod {sender} forced an early end-of-match map vote."
+                        ),
+                        lambda _result: self._start_forced_map_vote(
+                            map_tab, now, sender
+                        ),
+                        "Announce forced map vote",
+                    )
             else:
-                self.server.send_chat("Map voting tab not found.")
+                self._send_mod_chat(
+                    "Map voting tab not found.", "Send vote error"
+                )
             return
 
         if cmd == '!warn':
             target = find_player(args[0]) if args else None
             wire_log(f"[MODS] !warn: target={target.get('name') if target else None} args={args}")
             if target:
+                target_entry = player_entry_from_legacy(target)
                 reason = args[1] if len(args) > 1 else "You have been warned"
-                self.server.warn_player(int(target['id']), reason)
-                time.sleep(0.3)
-                self.server.send_chat(f"{target['name']} was warned by a mod")
-                self.mod_log.addItem(f"[{now}] {sender} warned {target['name']}: {reason}")
+                self._submit_mod_action(
+                    lambda: self.server.warn_player(
+                        target_entry, reason
+                    ),
+                    context=f"Warn {target['name']}",
+                    log_message=(
+                        f"[{now}] {sender} warned {target['name']}: {reason}"
+                    ),
+                )
             else:
                 self.mod_log.addItem(f"[{now}] {sender} tried to warn but player not found")
 
         elif cmd == '!kick':
             target = find_player(args[0]) if args else None
             if target:
+                target_entry = player_entry_from_legacy(target)
                 reason = args[1] if len(args) > 1 else "Kicked by mod"
-                self.server.punt_player(int(target['id']), reason)
-                time.sleep(0.3)
-                self.server.send_chat(f"{target['name']} was kicked by a mod")
-                self.mod_log.addItem(f"[{now}] {sender} kicked {target['name']}: {reason}")
+                self._submit_mod_action(
+                    lambda: self.server.punt_player(
+                        target_entry, reason
+                    ),
+                    context=f"Kick {target['name']}",
+                    announcement=f"{target['name']} was kicked by a mod",
+                    log_message=(
+                        f"[{now}] {sender} kicked {target['name']}: {reason}"
+                    ),
+                )
             else:
                 self.mod_log.addItem(f"[{now}] {sender} tried to kick but player not found")
 
         elif cmd == '!ban':
             target = find_player(args[0]) if args else None
             if target:
-                self.server.ban_player(int(target['id']), "Banned by mod")
-                time.sleep(0.3)
-                self.server.send_chat(f"{target['name']} was banned by a mod")
-                self.mod_log.addItem(f"[{now}] {sender} banned {target['name']}")
+                target_entry = player_entry_from_legacy(target)
+                self._submit_mod_action(
+                    lambda: self.server.ban_player(
+                        target_entry, "Banned by mod"
+                    ),
+                    context=f"Ban {target['name']}",
+                    announcement=f"{target['name']} was banned by a mod",
+                    log_message=(
+                        f"[{now}] {sender} banned {target['name']}"
+                    ),
+                )
             else:
                 self.mod_log.addItem(f"[{now}] {sender} tried to ban but player not found")
 
         elif cmd == '!swap':
             target = find_player(args[0]) if args else None
             if target:
-                self.server.swap_player(int(target['id']))
-                time.sleep(0.3)
-                self.server.kill_player(int(target['id']))
-                time.sleep(0.3)
-                self.server.send_chat(f"{target['name']} was swapped by a mod")
-                self.mod_log.addItem(f"[{now}] {sender} swapped {target['name']}")
+                target_entry = player_entry_from_legacy(target)
+                self._submit_mod_action(
+                    lambda: self.server.swap_and_kill(
+                        target_entry, target['name']
+                    ),
+                    context=f"Swap {target['name']}",
+                    announcement=f"{target['name']} was swapped by a mod",
+                    log_message=(
+                        f"[{now}] {sender} swapped {target['name']}"
+                    ),
+                )
             else:
                 self.mod_log.addItem(f"[{now}] {sender} tried to swap but player not found")
 
         elif cmd == '!kill':
             target = find_player(args[0]) if args else None
             if target:
-                self.server.kill_player(int(target['id']))
-                time.sleep(0.3)
-                self.server.send_chat(f"{target['name']} was killed by a mod")
-                self.mod_log.addItem(f"[{now}] {sender} killed {target['name']}")
+                target_entry = player_entry_from_legacy(target)
+                self._submit_mod_action(
+                    lambda: self.server.kill_player(target_entry),
+                    context=f"Kill {target['name']}",
+                    announcement=f"{target['name']} was killed by a mod",
+                    log_message=(
+                        f"[{now}] {sender} killed {target['name']}"
+                    ),
+                )
             else:
                 self.mod_log.addItem(f"[{now}] {sender} tried to kill but player not found")
 
         elif cmd == '!next':
-            self.server.send('GOTO GAMESTATE')
-            self.server.send_chat("Skipping to next map...")
-            self.mod_log.addItem(f"[{now}] {sender} skipped to next map")
+            self._submit_mod_action(
+                lambda: self.server.cycle_mission(),
+                context="Cycle to next mission",
+                announcement="Skipping to next map...",
+                log_message=f"[{now}] {sender} skipped to next map",
+            )
 
         elif cmd == '!mixteams':
             if sender not in self.mods and sender != 'web_admin':
                 return
-            results = self.server.shuffle_teams()
-            for line in results:
-                self.server._log(line)
-            self.mod_log.addItem(f"[{now}] {sender} mixed teams")
+            submit_team_workflow(
+                self,
+                self.server.shuffle_teams,
+                lambda results: self._mod_team_workflow_succeeded(
+                    results, f"[{now}] {sender} mixed teams"
+                ),
+                "Moderator team mix",
+            )
 
         elif cmd == '!balanceteams':
             if sender not in self.mods and sender != 'web_admin':
                 return
-            results = self.server.mix_teams()
-            for line in results:
-                self.server._log(line)
-            self.mod_log.addItem(f"[{now}] {sender} balanced teams")
+            submit_team_workflow(
+                self,
+                self.server.mix_teams,
+                lambda results: self._mod_team_workflow_succeeded(
+                    results, f"[{now}] {sender} balanced teams"
+                ),
+                "Moderator team balance",
+            )
 
         elif cmd == '!time':
             if sender not in self.mods and sender != 'web_admin':
@@ -4811,7 +5592,10 @@ class ModsTab(QWidget):
             raw = raw.replace(':', '')
             # Validate: must be all digits
             if not raw.isdigit() or not raw:
-                self.server.send_chat("Usage: !time <0000-2300> e.g. !time 0100")
+                self._send_mod_chat(
+                    "Usage: !time <0000-2300> e.g. !time 0100",
+                    "Send time usage",
+                )
                 return
             # Pad to 4 digits: "1" -> "0100", "13" -> "1300", "930" -> "0930"
             if len(raw) == 1:
@@ -4829,24 +5613,40 @@ class ModsTab(QWidget):
             # Wrap 24 -> 0
             hour = hour % 24
             time_str = f"{hour:02d}00"
-            self.server.send(f"CMD TOD {time_str}")
-            self.server.send_chat(f"Time of day set to {hour:02d}:00")
-            self.mod_log.addItem(f"[{now}] {sender} set time of day to {hour:02d}:00")
+            self._submit_mod_action(
+                lambda: self.server.set_time_of_day(time_str),
+                context="Set time of day",
+                announcement=f"Time of day set to {hour:02d}:00",
+                log_message=(
+                    f"[{now}] {sender} set time of day to {hour:02d}:00"
+                ),
+            )
 
         elif cmd == '!gametime':
             if sender not in self.mods and sender != 'web_admin':
                 return
             raw = args[0] if args else ''
             if not raw.isdigit() or not raw:
-                self.server.send_chat("Usage: !gametime <1-240> minutes")
+                self._send_mod_chat(
+                    "Usage: !gametime <1-240> minutes",
+                    "Send game time usage",
+                )
                 return
             val = int(raw)
             if val < 1 or val > 240:
-                self.server.send_chat("Game time must be 1-240 minutes")
+                self._send_mod_chat(
+                    "Game time must be 1-240 minutes",
+                    "Send game time range",
+                )
                 return
-            self.server.set_setting("gameTime", str(val))
-            self.server.send_chat(f"Game time set to {val} minutes")
-            self.mod_log.addItem(f"[{now}] {sender} set game time to {val} minutes")
+            self._submit_mod_action(
+                lambda: self.server.set_setting("gameTime", str(val)),
+                context="Set game time",
+                announcement=f"Game time set to {val} minutes",
+                log_message=(
+                    f"[{now}] {sender} set game time to {val} minutes"
+                ),
+            )
 
         elif cmd == '!map':
             map_name = ' '.join(args) if args else ''
@@ -4854,71 +5654,103 @@ class ModsTab(QWidget):
             name, filename, source = find_map(map_name)
             wire_log(f"[MODS] !map result: name={name} file={filename} source={source}")
             if name and filename:
-                if source == 'available':
-                    # Map is on server but not in rotation - add it first
-                    MissionsTab._send_mission_add_to_server(self.server, filename, 1)
-                    time.sleep(0.5)
-                    self.server.send('mission list')  # refresh rotation
-                    time.sleep(0.5)
-                    self.mod_log.addItem(f"[{now}] {sender} added {name} to rotation")
-                    mtab = getattr(self.missions_store, '_missions_tab', None)
-                    if mtab:
-                        idx = len(mtab._rotation_maps)
-                        self.server.send(f"MISSION SETNEXT {idx}")
-                        time.sleep(0.3)
-                        self.server.send('GOTO GAMESTATE')
-                    else:
-                        self.server.send('GOTO GAMESTATE')
-                else:
-                    mtab = getattr(self.missions_store, '_missions_tab', None)
-                    if mtab:
-                        mtab._switch_to_map_by_name(filename)
-                    else:
-                        self.server.send_chat(f"Could not switch to {name} - missions tab unavailable")
+                mission_target = filename
+                if source == "rotation":
+                    try:
+                        mission_target = (
+                            MissionsTab._resolve_unique_mission_entry(
+                                self.server.mission_entries, filename
+                            )
+                        )
+                    except ValueError:
+                        self._send_mod_chat(
+                            f"Map is queued more than once: {name}",
+                            "Reject ambiguous mission switch",
+                        )
                         return
-                self.server.send_chat(f"Switching to {name}...")
-                self.mod_log.addItem(f"[{now}] {sender} switched to {name}")
+                    if mission_target is None:
+                        self._send_mod_chat(
+                            f"Map queue changed: {name}",
+                            "Reject stale mission switch",
+                        )
+                        return
+                self._submit_mod_action(
+                    lambda: self.server.switch_mission(
+                        mission_target,
+                        add_if_missing=source == "available",
+                    ),
+                    context=f"Switch to mission {name}",
+                    announcement=f"Switching to {name}...",
+                    log_message=f"[{now}] {sender} switched to {name}",
+                )
             else:
-                self.server.send_chat(f"Map not found: {map_name}")
+                self._send_mod_chat(
+                    f"Map not found: {map_name}", "Send missing map response"
+                )
                 self.mod_log.addItem(f"[{now}] {sender} tried !map but '{map_name}' not found")
 
         elif cmd == '!add':
             map_name = ' '.join(args) if args else ''
             name, filename, source = find_map(map_name)
             if name and filename:
-                MissionsTab._send_mission_add_to_server(self.server, filename, 1)
-                time.sleep(0.3)
-                self.server.send_chat(f"Added {name} to rotation")
-                self.server.send('mission list')  # refresh
-                self.mod_log.addItem(f"[{now}] {sender} added {name} to rotation")
+                self._submit_mod_action(
+                    lambda: MissionsTab._send_mission_add_to_server(
+                        self.server, filename, 1
+                    ),
+                    context=f"Add mission {name}",
+                    announcement=f"Added {name} to rotation",
+                    log_message=(
+                        f"[{now}] {sender} added {name} to rotation"
+                    ),
+                )
             else:
-                self.server.send_chat(f"Map not found: {map_name}")
+                self._send_mod_chat(
+                    f"Map not found: {map_name}", "Send missing map response"
+                )
                 self.mod_log.addItem(f"[{now}] {sender} tried !add but '{map_name}' not found")
 
         elif cmd == '!remove':
             map_name = ' '.join(args) if args else ''
             name, filename, source = find_map(map_name)
             if name and filename and source == 'rotation':
-                # Find the index in the rotation
-                idx = None
-                for i, m in enumerate(self.server.missions):
-                    if name.lower() in m.lower():
-                        idx = i
-                        break
-                if idx is not None:
-                    self.server.send(f'mission remove {idx}')
-                    time.sleep(0.3)
-                    self.server.send_chat(f"Removed {name} from rotation")
-                    self.server.send('mission list')  # refresh
-                    self.mod_log.addItem(f"[{now}] {sender} removed {name} from rotation")
-                else:
-                    self.server.send_chat(f"Could not find {name} index")
-                    self.mod_log.addItem(f"[{now}] {sender} tried !remove but index not found")
+                try:
+                    mission_target = MissionsTab._resolve_unique_mission_entry(
+                        self.server.mission_entries, filename
+                    )
+                except ValueError:
+                    self._send_mod_chat(
+                        f"Map is queued more than once: {name}",
+                        "Reject ambiguous mission removal",
+                    )
+                    return
+                if mission_target is None:
+                    self._send_mod_chat(
+                        f"Could not find {name} in the current queue",
+                        "Send missing mission identity response",
+                    )
+                    self.mod_log.addItem(
+                        f"[{now}] {sender} tried !remove but identity "
+                        "was not found"
+                    )
+                    return
+                self._submit_mod_action(
+                    lambda: self.server.remove_mission(mission_target),
+                    context=f"Remove mission {name}",
+                    announcement=f"Removed {name} from rotation",
+                    log_message=(
+                        f"[{now}] {sender} removed {name} from rotation"
+                    ),
+                )
             elif name and filename and source == 'available':
-                self.server.send_chat(f"{name} is not in the rotation")
+                self._send_mod_chat(
+                    f"{name} is not in the rotation",
+                    "Send mission rotation response",
+                )
                 self.mod_log.addItem(f"[{now}] {sender} tried !remove but {name} not in rotation")
             else:
-                self.server.send_chat(f"Map not found: {map_name}")
+                self._send_mod_chat(
+                    f"Map not found: {map_name}", "Send missing map response"
+                )
                 self.mod_log.addItem(f"[{now}] {sender} tried !remove but '{map_name}' not found")
 
     def _schedule_vote_milestones(self, vote_id):
@@ -4932,9 +5764,15 @@ class ModsTab(QWidget):
         threshold = int(self._vote_total * self._vote_threshold / 100) + 1
         needed = max(0, threshold - votes)
         if seconds == 20:
-            self.server.send_chat(f"Map Vote (20s): {votes} votes cast so far. Type !yes")
+            self._send_mod_chat(
+                f"Map Vote (20s): {votes} votes cast so far. Type !yes",
+                "Send map vote milestone",
+            )
         elif seconds == 40:
-            self.server.send_chat(f"Map Vote (40s): Need {needed} more votes to pass! Type !yes")
+            self._send_mod_chat(
+                f"Map Vote (40s): Need {needed} more votes to pass! Type !yes",
+                "Send map vote milestone",
+            )
 
     def _schedule_skip_milestones(self, skip_id):
         QTimer.singleShot(20000, lambda: self._skip_milestone(skip_id, 20))
@@ -4947,9 +5785,15 @@ class ModsTab(QWidget):
         threshold = int(self._skip_total * self._skip_threshold / 100) + 1
         needed = max(0, threshold - votes)
         if seconds == 20:
-            self.server.send_chat(f"Skip Vote (20s): {votes} votes cast so far. Type !yes")
+            self._send_mod_chat(
+                f"Skip Vote (20s): {votes} votes cast so far. Type !yes",
+                "Send skip vote milestone",
+            )
         elif seconds == 40:
-            self.server.send_chat(f"Skip Vote (40s): Need {needed} more votes to skip! Type !yes")
+            self._send_mod_chat(
+                f"Skip Vote (40s): Need {needed} more votes to skip! Type !yes",
+                "Send skip vote milestone",
+            )
 
     def _vote_expired(self):
         """Called when the 60-second vote timer expires."""
@@ -4959,28 +5803,20 @@ class ModsTab(QWidget):
         name = self._vote_map_name
         threshold = int(self._vote_total * self._vote_threshold / 100) + 1
         if votes >= threshold:
-            self.server.send_chat(f"Vote passed! Switching to {name}...")
-            self.mod_log.addItem(f"Vote passed on expiry: {name} ({votes}/{self._vote_total})")
             wire_log(f"[VOTE] Passed on expiry: {name} ({votes}/{self._vote_total})")
-            # Switch map
-            mtab = getattr(self.server, '_missions_tab', None)
-            if mtab:
-                idx = mtab._get_server_index(self._vote_map_file)
-                if idx is not None:
-                    self.server.send(f'MISSION SETNEXT {idx}')
-                else:
-                    wire_log(f"[VOTE] Could not find index for {self._vote_map_file}, falling back to 999")
-                    self.server.send('MISSION SETNEXT 999')
-            else:
-                self.server.send('MISSION SETNEXT 999')
-            time.sleep(0.3)
-            self.server.send('GOTO GAMESTATE')
-            self._vote_cooldown_until = time.time() + 900
+            self._start_vote_transition(
+                f"Vote passed! Switching to {name}...",
+                f"Vote passed on expiry: {name} "
+                f"({votes}/{self._vote_total})",
+            )
         else:
-            self.server.send_chat(f"Vote ended: not enough votes ({votes}/{self._vote_total})")
+            self._send_mod_chat(
+                f"Vote ended: not enough votes ({votes}/{self._vote_total})",
+                "Announce expired map vote",
+            )
             self.mod_log.addItem(f"Vote expired: {name} ({votes}/{self._vote_total})")
             wire_log(f"[VOTE] Expired: {name} ({votes}/{self._vote_total})")
-        self._vote_active = False
+            self._vote_active = False
 
     def _skip_expired(self):
         """Called when the 60-second skip vote timer expires."""
@@ -4989,35 +5825,44 @@ class ModsTab(QWidget):
         votes = len(self._skip_voters)
         threshold = int(self._skip_total * self._skip_threshold / 100) + 1
         if votes >= threshold:
-            self.server.send_chat("Skip vote passed! Skipping map...")
-            self.mod_log.addItem(f"Skip vote passed ({votes}/{self._skip_total})")
             wire_log(f"[SKIP] Passed on expiry ({votes}/{self._skip_total})")
-            self.server.send('GOTO GAMESTATE')
-            self._skip_cooldown_until = time.time() + 900
+            self._start_skip_transition(
+                "Skip vote passed! Skipping map...",
+                f"Skip vote passed ({votes}/{self._skip_total})",
+            )
         else:
-            self.server.send_chat(f"Skip vote ended: not enough votes ({votes}/{self._skip_total})")
+            self._send_mod_chat(
+                f"Skip vote ended: not enough votes ({votes}/{self._skip_total})",
+                "Announce expired skip vote",
+            )
             self.mod_log.addItem(f"Skip vote expired ({votes}/{self._skip_total})")
             wire_log(f"[SKIP] Expired ({votes}/{self._skip_total})")
-        self._skip_active = False
+            self._skip_active = False
 
 
 class MapVotingTab(QWidget):
     """End-of-match map voting management."""
 
+    raw_chat_signal = pyqtSignal(str)
+
     def __init__(self, server: ServerManager, missions_tab: MissionsTab):
         super().__init__()
         self.server = server
+        self._admin_futures = AdminFutureBridge(self, self.log)
         self.missions_tab = missions_tab
         self.server._map_voting_tab = self  # allow mods system to forward votes
 
-        # Register raw chat callback for vote detection
-        if hasattr(self.server, 'proto') and self.server.proto:
-            self.server.proto._on_raw_chat = self._on_raw_chat
+        # Session callbacks run on the serialized admin worker.  Always cross
+        # an explicit queued signal before touching vote state or Qt widgets.
+        self.raw_chat_signal.connect(
+            self._on_raw_chat, Qt.ConnectionType.QueuedConnection
+        )
+        self.server.set_raw_chat_callback(self.raw_chat_signal.emit)
 
         self._vote_active = False
         self._vote_stage = 'idle'
         self._votes = {}  # pid -> map_index (1,2,3)
-        self._map_choices = [] # [(row_idx, filename), ...]
+        self._map_choices = [] # [(MissionEntry, filename), ...]
         self._last_progress_update = 0
         self._server_game_time_total = 0  # total minutes from server
         self._server_game_time_remaining = 0  # remaining minutes from server
@@ -5076,6 +5921,13 @@ class MapVotingTab(QWidget):
         self._tick_timer = QTimer()
         self._tick_timer.timeout.connect(self._tick)
         self._tick_timer.start(5000)
+
+    def _send_vote_chat(self, message, context="Send map vote chat"):
+        return submit_admin(
+            self,
+            lambda: self.server.send_chat(message),
+            context=context,
+        )
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -5350,9 +6202,12 @@ class MapVotingTab(QWidget):
         num_choices = self.choices_spin.value()
         pool = []
         for idx, filename in enumerate(rotation):
+            mission = self.missions_tab._mission_entry_at(idx)
+            if mission is None:
+                continue
             if filename not in self._recently_played:
                 if not (filename.lower().startswith("00tr") or "training" in filename.lower()):
-                    pool.append((idx, filename))
+                    pool.append((mission, filename))
 
         # If pool is too small, just use full rotation
         if len(pool) < num_choices:
@@ -5361,11 +6216,25 @@ class MapVotingTab(QWidget):
                 self._recently_played.clear()
                 self._save_recently_played()
                 QTimer.singleShot(500, self._update_blacklist_label)
-                pool = [(idx, fname) for idx, fname in enumerate(rotation)
-                        if not (fname.lower().startswith("00tr") or "training" in fname.lower())]
+                pool = [
+                    (self.missions_tab._mission_entry_at(idx), fname)
+                    for idx, fname in enumerate(rotation)
+                    if self.missions_tab._mission_entry_at(idx) is not None
+                    and not (
+                        fname.lower().startswith("00tr")
+                        or "training" in fname.lower()
+                    )
+                ]
             else:
-                pool = [(idx, fname) for idx, fname in enumerate(rotation)
-                        if not (fname.lower().startswith("00tr") or "training" in fname.lower())]
+                pool = [
+                    (self.missions_tab._mission_entry_at(idx), fname)
+                    for idx, fname in enumerate(rotation)
+                    if self.missions_tab._mission_entry_at(idx) is not None
+                    and not (
+                        fname.lower().startswith("00tr")
+                        or "training" in fname.lower()
+                    )
+                ]
 
         random.shuffle(pool)
         self._map_choices = pool[:num_choices]
@@ -5381,24 +6250,37 @@ class MapVotingTab(QWidget):
 
         self.log("Map voting started.")
         options_text = ", ".join([f"!{i+1}" for i in range(num_choices)])
-        self.server.send_chat(f"Map Voting Started! Type {options_text} to vote.")
+        self._send_vote_chat(
+            f"Map Voting Started! Type {options_text} to vote.",
+            "Announce map voting",
+        )
 
         # Send options with delays to avoid truncation
         def send_opt(i):
             if i >= len(self._map_choices): return
-            idx, fname = self._map_choices[i]
+            _mission, fname = self._map_choices[i]
             display = self.missions_tab._find_display_name(fname)
-            # Trim to 69-char chat limit (prefix "N: " = 3 chars)
-            if len(display) > 66:
-                display = display[:63] + "..."
-            self.server.send_chat(f"{i+1}: {display}")
+            # Leave room for the "N: " prefix so the name is trimmed here rather
+            # than blindly chopped off the end by send_chat.
+            room = CHAT_MAX_LEN - len(f"{i+1}: ")
+            if len(display) > room:
+                display = display[:room - 3] + "..."
+            self._send_vote_chat(
+                f"{i+1}: {display}", "Send map vote option"
+            )
 
         # Dynamically queue chat messages for however many choices we have
         for i in range(num_choices):
             QTimer.singleShot((i + 1) * 1000, lambda idx=i: send_opt(idx))
 
         dur_mins = self.duration_spin.value()
-        QTimer.singleShot((num_choices + 1) * 1000, lambda: self.server.send_chat(f"Type {options_text}. You have {dur_mins} mins!"))
+        QTimer.singleShot(
+            (num_choices + 1) * 1000,
+            lambda: self._send_vote_chat(
+                f"Type {options_text}. You have {dur_mins} mins!",
+                "Send map vote instructions",
+            ),
+        )
 
     def _send_progress_update(self):
         """Send a mid-vote progress update to chat."""
@@ -5407,14 +6289,20 @@ class MapVotingTab(QWidget):
             num_choices = self.choices_spin.value()
             if total == 0:
                 options = ", ".join([f"!{i+1}" for i in range(num_choices)])
-                self.server.send_chat(f"No votes yet! Type {options} to vote.")
+                self._send_vote_chat(
+                    f"No votes yet! Type {options} to vote.",
+                    "Send map vote progress",
+                )
             else:
                 parts = []
                 for i in range(num_choices):
                     fname = self._map_choices[i][1]
                     display = self.missions_tab._find_display_name(fname)
                     parts.append(f"{i+1}:{counts.get(i+1,0)}")
-                self.server.send_chat(f"Votes: {', '.join(parts)} ({total} total)")
+                self._send_vote_chat(
+                    f"Votes: {', '.join(parts)} ({total} total)",
+                    "Send map vote progress",
+                )
         except Exception:
             pass
 
@@ -5436,11 +6324,12 @@ class MapVotingTab(QWidget):
 
     def _end_vote(self):
         self._vote_active = False
-        self._vote_stage = 'done'
-        self.status_lbl.setText("Status: Vote Complete")
+        self._vote_stage = 'finishing'
+        self.status_lbl.setText("Status: Applying vote winner...")
 
         try:
             if not self._map_choices:
+                self._vote_winner_failed("selected mission")
                 return
 
             # Tally
@@ -5467,74 +6356,81 @@ class MapVotingTab(QWidget):
             if winner_idx >= len(self._map_choices):
                 winner_idx = 0
 
-            row_idx, fname = self._map_choices[winner_idx]
+            mission, fname = self._map_choices[winner_idx]
             display = self.missions_tab._find_display_name(fname)
 
-            if total > 0:
-                if is_draw:
-                    self.server.send_chat(f"Draw! Server coin flip selected: {display}")
-                else:
-                    self.server.send_chat(f"Vote Complete! {display} wins with {max_v} vote{'s' if max_v != 1 else ''}!")
-
-            # --- FIX: Dynamically find the correct index at execution time ---
             mtab = getattr(self, 'missions_tab', None)
             if not mtab and hasattr(self.parent(), 'missions_tab'):
                 mtab = self.parent().missions_tab
 
             if mtab:
-                idx = mtab._get_server_index(fname)
-                if idx >= 0:
-                    self.log(f"Winner declared: {display} (Found at Server Index {idx})")
-                    self.server.send(f"MISSION SETNEXT {idx}")
-                elif mtab._find_rotation_row(fname) >= 0:
-                    row = mtab._find_rotation_row(fname)
-                    self.log(f"Winner declared: {display} (Found at Row {row})")
-                    self.server.send(f"MISSION SETNEXT {row}")
-                else:
-                    self.log(f"Winner declared: {display} (Not in rotation, adding first)")
-                    import time
-                    # Map not in server rotation anymore, add it to the end
-                    mtab._send_mission_add_to_server(self.server, fname, 1)
-                    time.sleep(0.5)
-                    # Its new index will be the current length of the rotation list
-                    idx = len(mtab._rotation_maps)
-                    self.server.send(f"MISSION SETNEXT {idx}")
-                    # Request a refresh so the UI updates with the newly added map
-                    self.server.send("mission list")
+                submit_admin(
+                    self,
+                    lambda: self.server.set_next_mission(
+                        mission, add_if_missing=False
+                    ),
+                    lambda _result: self._vote_winner_queued(
+                        fname, display, total, is_draw, max_v, mtab
+                    ),
+                    f"Queue voted mission {display}",
+                    lambda _message: self._vote_winner_failed(display),
+                )
             else:
-                # Fallback if we can't access MissionsTab (shouldn't happen)
-                self.log(f"Winner declared: {display} (Fallback queueing)")
-                # Just guess it's at the end
-                self.server.send(f"MISSION SETNEXT 999")
-            # ---------------------------------------------------------------
-
-            # --- FIX: Clear list if it hits 50% of the total rotation ---
-            if mtab and mtab._rotation_maps:
-                total_maps = len(mtab._rotation_maps)
-                pct = self.reset_pool_slider.value() / 100.0
-                limit = max(1, int(total_maps * pct))
-                if len(self._recently_played) >= limit:
-                    self.log(f"Recent maps reached {limit} ({self.reset_pool_slider.value()}% of {total_maps}). Clearing list.")
-                    self._recently_played.clear()
-            # ------------------------------------------------------------
-
-            # --- FIX: Do not blacklist the winner if no votes were cast ---
-            if total > 0:
-                if fname not in self._recently_played:
-                    self._recently_played.append(fname)
-            else:
-                self.log(f"0 votes cast. {fname} not added to blacklist.")
-            # --------------------------------------------------------------
-
-            self._save_recently_played()
-            QTimer.singleShot(500, self._update_blacklist_label)
+                self.log(
+                    f"Winner {display} was not queued: mission context unavailable"
+                )
+                self._vote_winner_failed(display)
 
         except Exception as e:
             self.log(f"Error ending vote: {e}")
-            try:
-                self.server.send_chat("Vote ended with an error. Map unchanged.")
-            except:
-                pass
+            self._vote_winner_failed("selected mission")
+
+    def _vote_winner_queued(
+        self, fname, display, total, is_draw, max_v, missions_tab
+    ):
+        self._vote_stage = 'done'
+        self.status_lbl.setText("Status: Vote Complete")
+        self.log(f"Winner queued: {display}")
+
+        if total > 0:
+            if is_draw:
+                message = f"Draw! Server coin flip selected: {display}"
+            else:
+                suffix = "s" if max_v != 1 else ""
+                message = (
+                    f"Vote Complete! {display} wins with "
+                    f"{max_v} vote{suffix}!"
+                )
+            self._send_vote_chat(message, "Announce map vote winner")
+
+        if missions_tab._rotation_maps:
+            total_maps = len(missions_tab._rotation_maps)
+            pct = self.reset_pool_slider.value() / 100.0
+            limit = max(1, int(total_maps * pct))
+            if len(self._recently_played) >= limit:
+                self.log(
+                    f"Recent maps reached {limit} "
+                    f"({self.reset_pool_slider.value()}% of {total_maps}). "
+                    "Clearing list."
+                )
+                self._recently_played.clear()
+
+        if total > 0:
+            if fname not in self._recently_played:
+                self._recently_played.append(fname)
+        else:
+            self.log(f"0 votes cast. {fname} not added to blacklist.")
+
+        self._save_recently_played()
+        QTimer.singleShot(500, self._update_blacklist_label)
+
+    def _vote_winner_failed(self, display):
+        self._vote_stage = 'done'
+        self.status_lbl.setText("Status: Vote failed; map unchanged")
+        self._send_vote_chat(
+            "Vote ended with an error. Map unchanged.",
+            f"Announce failure to queue {display}",
+        )
 
     def _on_raw_chat(self, data):
         """Process raw chat payload directly for votes. Bypasses overlap detection."""
@@ -5628,19 +6524,11 @@ class DownloadWorker(QThread):
 class WeaponsTab(QWidget):
     """Weapons Availability Matrix Tab"""
 
-    WEAPON_LIST = [
-        "M4A1", "M16A2", "AK-47", "AKS-74U", "G36C", "MP5", "MP5-SD",
-        "P90", "UMP45", "Spas12", "USAS12", "M249", "RPK", "Dragunov",
-        "Barrett", "M40", "PSG1", "SOCOM", "Glock18", "Beretta", "DEagle",
-        "Colt", "M60", "FN FAL", "Steyr", "LR300", "G3A3", "SG552",
-        "Binoculars", "C4", "Claymore", "Grenade", "Flashbang", "Smoke",
-        "Knife", "MedKit", "Binocular", "RPG", "M203", "GP25",
-    ]
-
     def __init__(self, server):
         super().__init__()
         self.server = server
-        self._weapon_rows = {}
+        self._admin_futures = AdminFutureBridge(self, self.server._log)
+        self._weapons_by_row = []
         self._loading = False
         self._build_ui()
 
@@ -5654,18 +6542,24 @@ class WeaponsTab(QWidget):
         override_row.addWidget(QLabel("Set All:"))
 
         all_yes_btn = SatisfyingButton("Yes")
-        all_yes_btn.setToolTip("Set all weapons to Yes (available)")
-        all_yes_btn.clicked.connect(lambda: self._set_all_weapons("0"))
+        all_yes_btn.setToolTip("Make every weapon available")
+        all_yes_btn.clicked.connect(
+            lambda: self._set_all_weapons(WeaponMode.ALWAYS)
+        )
         override_row.addWidget(all_yes_btn)
 
         all_armory_btn = SatisfyingButton("Armory")
-        all_armory_btn.setToolTip("Set all weapons to Armory (spawn with armory)")
-        all_armory_btn.clicked.connect(lambda: self._set_all_weapons("1"))
+        all_armory_btn.setToolTip("Make every weapon armory-only")
+        all_armory_btn.clicked.connect(
+            lambda: self._set_all_weapons(WeaponMode.ARMORY)
+        )
         override_row.addWidget(all_armory_btn)
 
         all_no_btn = SatisfyingButton("No")
-        all_no_btn.setToolTip("Set all weapons to No (disabled)")
-        all_no_btn.clicked.connect(lambda: self._set_all_weapons("2"))
+        all_no_btn.setToolTip("Disable every weapon")
+        all_no_btn.clicked.connect(
+            lambda: self._set_all_weapons(WeaponMode.NEVER)
+        )
         override_row.addWidget(all_no_btn)
 
         override_row.addStretch()
@@ -5673,7 +6567,7 @@ class WeaponsTab(QWidget):
 
         update_list_btn = SatisfyingButton("Update List from Server")
         update_list_btn.setToolTip("Refresh weapons list from server")
-        update_list_btn.clicked.connect(lambda: self.server.send("get settings"))
+        update_list_btn.clicked.connect(self.server.refresh_weapons)
         weapon_layout.addWidget(update_list_btn)
 
         warn_label = QLabel(
@@ -5696,19 +6590,22 @@ class WeaponsTab(QWidget):
         self.weapon_table.setColumnWidth(3, 60)
         self.weapon_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.weapon_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._populate_weapon_table()
         weapon_layout.addWidget(self.weapon_table)
 
         weapon_group.setLayout(weapon_layout)
         layout.addWidget(weapon_group)
 
-    def _populate_weapon_table(self):
+    def update_weapons(self, weapons):
+        """Render the authoritative ADMDEF list returned by retail."""
+        self._loading = True
+        self._weapons_by_row = list(weapons)
         self.weapon_table.setRowCount(0)
-        for i, weapon in enumerate(self.WEAPON_LIST):
+        for i, weapon in enumerate(self._weapons_by_row):
             self.weapon_table.insertRow(i)
-            self._weapon_rows[weapon.lower()] = i
 
-            w_item = QTableWidgetItem(weapon)
+            w_item = QTableWidgetItem(
+                f"{weapon.name}  [ADMDEF {weapon.admdef_id}]"
+            )
             self.weapon_table.setItem(i, 0, w_item)
 
             bg_group = QButtonGroup(self)
@@ -5717,8 +6614,12 @@ class WeaponsTab(QWidget):
             for col in range(1, 4):
                 cb = QRadioButton()
                 cb.setStyleSheet("margin-left: 10px;")
-                if col == 1:
-                    cb.setChecked(True)
+                mode = {
+                    1: WeaponMode.ALWAYS,
+                    2: WeaponMode.ARMORY,
+                    3: WeaponMode.NEVER,
+                }[col]
+                cb.setChecked(weapon.mode is mode)
                 bg_group.addButton(cb, col)
 
                 widget = QWidget()
@@ -5730,43 +6631,37 @@ class WeaponsTab(QWidget):
                 self.weapon_table.setCellWidget(i, col, widget)
 
                 cb.toggled.connect(lambda checked, r=i, c=col: self._on_weapon_toggled(checked, r, c))
+        self._loading = False
 
     def _on_weapon_toggled(self, checked, row, col):
-        if self._loading or not checked: return
-        weapon = self.weapon_table.item(row, 0).text()
-        val = str(col - 1)
-        self.server.set_setting(f"weapon_{weapon}", val)
+        if self._loading or not checked or row >= len(self._weapons_by_row):
+            return
+        mode = {
+            1: WeaponMode.ALWAYS,
+            2: WeaponMode.ARMORY,
+            3: WeaponMode.NEVER,
+        }[col]
+        weapon = self._weapons_by_row[row]
+        submit_admin(
+            self,
+            lambda: self.server.set_weapon(weapon.admdef_id, mode),
+            lambda _result: self.server._log(
+                f"ADMDEF {weapon.admdef_id} is now {mode.value}"
+            ),
+            f"Change weapon ADMDEF {weapon.admdef_id}",
+            lambda _message: self.server.refresh_weapons(),
+        )
 
-    def _set_all_weapons(self, value):
-        labels = {"0": "Yes", "1": "Armory", "2": "No"}
-        for row in range(self.weapon_table.rowCount()):
-            self._loading = True
-            for col in range(1, 4):
-                w = self.weapon_table.cellWidget(row, col)
-                if w:
-                    rb = w.layout().itemAt(0).widget()
-                    rb.setChecked(col - 1 == int(value))
-            self._loading = False
-            weapon = self.weapon_table.item(row, 0).text()
-            self.server.set_setting(f"weapon_{weapon}", value)
-
-    def update_settings(self, settings: dict):
-        for key, val in settings.items():
-            if key.lower().startswith("weapon_"):
-                weapon_name = key[7:]
-                if weapon_name in self._weapon_rows:
-                    row = self._weapon_rows[weapon_name]
-                    try:
-                        col = int(val) + 1
-                        if 1 <= col <= 3:
-                            w = self.weapon_table.cellWidget(row, col)
-                            if w:
-                                rb = w.layout().itemAt(0).widget()
-                                self._loading = True
-                                rb.setChecked(True)
-                                self._loading = False
-                    except ValueError:
-                        pass
+    def _set_all_weapons(self, mode):
+        submit_admin(
+            self,
+            lambda: self.server.set_all_weapons(mode),
+            lambda _result: self.server._log(
+                f"Every weapon is now {mode.value}"
+            ),
+            "Change every weapon",
+            lambda _message: self.server.refresh_weapons(),
+        )
 
 
 class WebAdminTab(QWidget):
@@ -6058,11 +6953,11 @@ class WebAdminTab(QWidget):
 
 
 class MainWindow(QMainWindow):
-    """WolfRAT 2.4.10 Main Window."""
+    """WolfRAT 2.4.11 Main Window."""
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("WolfRAT 2.4.10 - Joint Operations Server Admin")
+        self.setWindowTitle("WolfRAT 2.4.11 - Joint Operations Server Admin")
 
         # Set Window Icon
         icon_path = os.path.join(os.path.dirname(__file__), 'icon.ico')
@@ -6079,7 +6974,7 @@ class MainWindow(QMainWindow):
         self.missions_store = MissionsStore()
         self.stats_store = StatsStore()
 
-        # Web server for mobile access (v2.4.10) - disabled by default
+        # Web server for mobile access - disabled by default
         self.web_server = WolfWebServer(self.server)
         # Don't start here - WebAdminTab controls start/stop
 
@@ -6091,9 +6986,9 @@ class MainWindow(QMainWindow):
             on_missions=lambda m: self.signals.missions_signal.emit(m),
             on_settings=lambda s: self.signals.settings_signal.emit(s),
             on_available_maps=lambda d: self.signals.available_maps_signal.emit(d),
+            on_weapons=lambda entries: self.signals.weapons_signal.emit(entries),
             on_log=lambda msg: self.signals.log_signal.emit(msg),
             on_disconnect_ui=lambda: self.signals.disconnected_signal.emit(),
-            on_connect_done=lambda: (self.chatbot_tab.reset_chat(), self.mods_tab.on_connect()),
         )
 
         # Build UI
@@ -6121,8 +7016,8 @@ class MainWindow(QMainWindow):
         self.signals.available_maps_signal.connect(self.missions_store.update_available)
         self.signals.gamestate_signal.connect(self._update_status_bar)
         self.signals.settings_signal.connect(self.settings_tab.update_settings)
-        self.signals.settings_signal.connect(self.weapons_tab.update_settings)
         self.signals.settings_signal.connect(self.server_tab.update_settings)
+        self.signals.weapons_signal.connect(self.weapons_tab.update_weapons)
         # Link settings tab to map voting tab for GameTime sync
         self.settings_tab._map_voting_tab = self.map_voting_tab
         self.signals.settings_signal.connect(lambda s: self._update_title(s.get('servername', '')))
@@ -6132,10 +7027,12 @@ class MainWindow(QMainWindow):
         self.signals.gamestate_signal.connect(lambda s: self.flash_sync_led())
         self.signals.players_signal.connect(lambda s: self.flash_sync_led())
         self.signals.connected_signal.connect(lambda: self.set_connected(True))
+        self.signals.connected_signal.connect(self.chatbot_tab.reset_chat)
+        self.signals.connected_signal.connect(self.mods_tab.on_connect)
         self.signals.connected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.connected_signal.connect(lambda: sounds.play("connect"))
         self.signals.disconnected_signal.connect(lambda: self.set_connected(False, 'Disconnected'))
-        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.4.10 - Joint Operations Server Admin"))
+        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.4.11 - Joint Operations Server Admin"))
         self.signals.disconnected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.disconnected_signal.connect(lambda: self.server_tab.handle_disconnect_ui())
         self.signals.reconnecting_signal.connect(lambda attempt: self.set_connected(False, f'Reconnecting (Attempt {attempt})...'))
@@ -6146,9 +7043,9 @@ class MainWindow(QMainWindow):
     def _update_title(self, server_name=""):
         """Update window title with server name when connected."""
         if server_name:
-            self.setWindowTitle(f"WolfRAT 2.4.10 \u2014 {server_name}")
+            self.setWindowTitle(f"WolfRAT 2.4.11 \u2014 {server_name}")
         else:
-            self.setWindowTitle("WolfRAT 2.4.10 - Joint Operations Server Admin")
+            self.setWindowTitle("WolfRAT 2.4.11 - Joint Operations Server Admin")
 
     def _build_ui(self):
         central = QWidget()
@@ -6156,7 +7053,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(central)
 
         # Header
-        header = QLabel("WolfRAT 2.4.10")
+        header = QLabel("WolfRAT 2.4.11")
         header.setStyleSheet("font-size: 22pt; font-weight: bold; color: #e8c840; padding: 12px; letter-spacing: 4px;")
         header.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(header)
@@ -6276,7 +7173,7 @@ class MainWindow(QMainWindow):
 
         status_bar.addSpacing(10)
 
-        ver_label = QLabel("v2.4.10 · Built by BadgerLove · FMJ Squad")
+        ver_label = QLabel("v2.4.11 · Built by BadgerLove · FMJ Squad")
         ver_label.setStyleSheet("font-size: 9pt; color: #444;")
         status_bar.addWidget(ver_label)
 
@@ -6356,8 +7253,8 @@ class MainWindow(QMainWindow):
             data = json.loads(resp.read())
 
             wolfrat_data = data.get("wolfrat", {})
-            latest_version = wolfrat_data.get("version", "2.4.10")
-            current = "2.4.10"
+            latest_version = wolfrat_data.get("version", "2.4.11")
+            current = "2.4.11"
 
             if latest_version != current:
                 # Custom dialog with scrollable changelog
@@ -6491,14 +7388,14 @@ def main():
     # Log startup
     try:
         from protocol import wire_log
-        wire_log("=== WolfRAT 2.4.10 STARTED ===")
+        wire_log("=== WolfRAT 2.4.11 STARTED ===")
     except Exception:
         pass
 
     # B-Stats: anonymous usage analytics
     try:
-        import bstats
-        bstats.bstats_start("wolfrat", "2.4.10")
+        from wolfrat import bstats
+        bstats.bstats_start("wolfrat", "2.4.11")
     except Exception:
         pass
 
@@ -6521,7 +7418,7 @@ def main():
 
     app = QApplication(sys.argv)
     app.setStyleSheet(DARK_STYLE)
-    app.setApplicationName("WolfRAT 2.4.10")
+    app.setApplicationName("WolfRAT 2.4.11")
 
     window = MainWindow()
     _set_dark_title_bar(window)

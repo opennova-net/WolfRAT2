@@ -6,6 +6,145 @@ let selectedPlayer = null;
 let authToken = localStorage.getItem('wolfauth') || sessionStorage.getItem('wolfauth');
 let savedUser = localStorage.getItem('wolfuser') || '';
 let savedToken = localStorage.getItem('wolftoken') || '';
+let pendingChatTexts = [];
+
+function operationResultSurface() {
+    let surface = document.getElementById('operation-result');
+    if (surface) return surface;
+
+    surface = document.createElement('div');
+    surface.id = 'operation-result';
+    surface.setAttribute('role', 'status');
+    surface.setAttribute('aria-live', 'polite');
+    Object.assign(surface.style, {
+        position: 'fixed',
+        top: '58px',
+        left: '12px',
+        right: '12px',
+        zIndex: '300',
+        padding: '10px 14px',
+        borderRadius: '8px',
+        border: '1px solid #555',
+        background: '#171717',
+        color: '#e8e8d0',
+        fontSize: '10pt',
+        fontWeight: '600',
+        boxShadow: '0 4px 16px rgba(0,0,0,0.7)',
+    });
+    document.body.appendChild(surface);
+    return surface;
+}
+
+function renderOperationResult(data, context = {}) {
+    const result = data && typeof data === 'object' ? data : {};
+    let outcome = 'error';
+    if (result.accepted === false || result.ok === false) {
+        outcome = 'rejected';
+    } else if (result.verified === false) {
+        outcome = 'rejected';
+    } else if (result.verified === true) {
+        outcome = 'verified';
+    } else if (result.accepted === true || (result.accepted === undefined && result.ok === true)) {
+        outcome = 'accepted';
+    }
+
+    const labels = {
+        accepted: 'Accepted',
+        rejected: 'Rejected',
+        error: 'Error',
+        verified: 'Verified',
+    };
+    const colors = {
+        accepted: ['#173517', '#50ff50'],
+        rejected: ['#3a1a1a', '#ff6040'],
+        error: ['#3a1a1a', '#ff6040'],
+        verified: ['#182c38', '#60c8ff'],
+    };
+    const subject = context.label
+        || result.command
+        || (result.action ? `${result.action} player ${result.pid || ''}`.trim() : '')
+        || (result.type === 'chat_result' ? 'Server chat' : 'Server operation');
+    const replies = Array.isArray(result.replies) ? result.replies.filter(Boolean) : [];
+    const unverified = (
+        result.accepted === true
+        && result.ok === false
+        && result.verified !== true
+    );
+    const detail = result.verification_error
+        || result.error
+        || (unverified ? 'Retail ACK was not independently verified' : '')
+        || replies[replies.length - 1]
+        || subject;
+    const message = detail === subject
+        ? `${labels[outcome]}: ${subject}`
+        : `${labels[outcome]}: ${subject} — ${detail}`;
+
+    const surface = operationResultSurface();
+    surface.dataset.outcome = outcome;
+    surface.textContent = message;
+    surface.style.background = colors[outcome][0];
+    surface.style.color = colors[outcome][1];
+    surface.style.borderColor = colors[outcome][1];
+    surface.style.display = 'block';
+    return { ...result, outcome };
+}
+
+function handleWebSocketMessage(data) {
+    if (data.type === 'state') {
+        updateUI(data);
+    } else if (data.type === 'chat') {
+        updateChat(data.chat || []);
+    } else if (data.type === 'error' || String(data.type || '').endsWith('_result')) {
+        const result = renderOperationResult(data);
+        if (
+            data.type === 'chat_result'
+            && pendingChatTexts.length
+        ) {
+            const submittedText = pendingChatTexts.shift();
+            const input = document.getElementById('chat-input');
+            if (
+                (result.outcome === 'accepted' || result.outcome === 'verified')
+                && input.value.trim() === submittedText
+            ) {
+                input.value = '';
+            }
+        }
+    }
+}
+
+async function submitHttpOperation(path, body, context = {}) {
+    try {
+        const response = await fetch(path, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': 'Bearer ' + authToken,
+            },
+            body: JSON.stringify(body),
+        });
+        let data;
+        try {
+            data = await response.json();
+        } catch (error) {
+            data = { error: `Invalid server response (HTTP ${response.status})` };
+        }
+        if (!response.ok) {
+            data = {
+                ...data,
+                ok: undefined,
+                accepted: undefined,
+                verified: undefined,
+                error: data.error || `HTTP ${response.status}`,
+            };
+        }
+        return renderOperationResult(data, context);
+    } catch (error) {
+        return renderOperationResult(
+            { error: error && error.message ? error.message : 'Connection error' },
+            context,
+        );
+    }
+}
 
 // --- Login ---
 function doLogin(e) {
@@ -92,8 +231,7 @@ function connectWS() {
     ws.onmessage = (event) => {
         try {
             const data = JSON.parse(event.data);
-            if (data.type === 'state') updateUI(data);
-            else if (data.type === 'chat') updateChat(data.chat || []);
+            handleWebSocketMessage(data);
         } catch (e) {}
     };
 
@@ -159,11 +297,23 @@ function renderPlayers(players) {
     document.getElementById('player-count').textContent = `(${players.length})`;
     if (!players.length) { el.innerHTML = '<p class="empty">No players connected</p>'; return; }
     el.innerHTML = players.map(p => {
+        const playerId = Number(p.id);
+        const revision = Number(p.revision);
+        const playerName = String(p.name || '');
+        if (
+            !Number.isInteger(playerId)
+            || !Number.isInteger(revision)
+            || !playerName
+        ) return '';
         const teamClass = p.team === '1' ? 'team-1' : p.team === '2' ? 'team-2' : '';
         const teamLabel = p.team_name || p.team || '?';
-        return `<div class="player-item" onclick="openActionSheet('${esc(p.id)}', '${esc(p.name)}')">
+        return `<div class="player-item"
+            data-player-id="${playerId}"
+            data-player-name="${esc(playerName)}"
+            data-player-revision="${revision}"
+            onclick="openActionSheetFromElement(this)">
             <div class="player-info">
-                <div class="player-name">${esc(p.name)}</div>
+                <div class="player-name">${esc(playerName)}</div>
                 <div class="player-meta">
                     <span class="team-badge ${teamClass}">${esc(teamLabel)}</span>
                     ${p.class ? ' · ' + esc(p.class) : ''}
@@ -187,45 +337,36 @@ function renderChat(messages) {
 function renderMaps(missions) {
     const el = document.getElementById('map-list');
     if (!missions.length) { el.innerHTML = '<p class="empty">No maps loaded</p>'; return; }
-    el.innerHTML = missions.map((m, i) => {
-        const isCurrent = m.includes('<CURRENT MISSION>');
-        // Strip tags
-        let clean = m.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
-        // Strip index prefix ("0: ")
-        const colonIdx = clean.indexOf(':');
-        if (colonIdx > -1 && colonIdx < 5) clean = clean.substring(colonIdx + 1).trim();
-        // Extract filename (first token ending in .bms/.npj/.npaj)
-        const extMatch = clean.match(/(\S+\.(?:bms|npj|npaj))/i);
-        const filename = extMatch ? extMatch[1] : clean.split(' - ')[0].split(' ')[0];
-        // Extract display name: text before the filename, or description after extension
-        let missionName = clean;
-        if (extMatch) {
-            const idx = clean.indexOf(extMatch[1]);
-            const before = idx > 0 ? clean.substring(0, idx).trim() : '';
-            if (before && before !== filename) {
-                missionName = before.replace(/-\s*$/, '').trim();
-            } else {
-                // Fallback: strip extension
-                missionName = filename.replace(/\.(bms|npj|npaj)$/i, '');
-            }
-        }
-        return `<div class="map-item ${isCurrent ? 'current' : ''}" onclick="switchMap('${esc(filename)}')">
-            <span class="map-index">${i + 1}</span>${esc(missionName)}
+    el.innerHTML = missions.map(mission => {
+        const queueIndex = Number(mission.queue_index);
+        const revision = Number(mission.revision);
+        const filename = String(mission.filename || '');
+        const missionName = String(
+            mission.display_name
+            || filename.replace(/\.(bms|npj|npz)$/i, '')
+        );
+        if (
+            !Number.isInteger(queueIndex)
+            || !Number.isInteger(revision)
+            || !filename
+        ) return '';
+        return `<div class="map-item ${mission.is_current ? 'current' : ''}"
+            data-queue-index="${queueIndex}"
+            data-filename="${esc(filename)}"
+            data-mission-revision="${revision}"
+            onclick="switchMapFromElement(this)">
+            <span class="map-index">${queueIndex}</span>${esc(missionName)}
         </div>`;
     }).join('');
 }
 
 // --- Actions ---
-function sendCommand(cmd) {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'command', command: cmd }));
-    } else {
-        fetch('/api/command', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + authToken },
-            body: JSON.stringify({ command: cmd })
-        });
-    }
+function quickAction(action, label) {
+    return submitHttpOperation(
+        '/api/action',
+        { action },
+        { label },
+    );
 }
 
 function sendChat() {
@@ -234,15 +375,23 @@ function sendChat() {
     if (!msg) return;
     const sendMsg = '[ADMIN] ' + msg;
     if (ws && ws.readyState === WebSocket.OPEN) {
+        pendingChatTexts.push(msg);
         ws.send(JSON.stringify({ type: 'chat', message: sendMsg }));
     } else {
-        fetch('/api/chat/send', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + authToken },
-            body: JSON.stringify({ message: sendMsg })
+        return submitHttpOperation(
+            '/api/chat/send',
+            { message: sendMsg },
+            { label: 'Server chat' },
+        ).then(result => {
+            if (
+                result.outcome === 'accepted'
+                || result.outcome === 'verified'
+            ) {
+                if (input.value.trim() === msg) input.value = '';
+            }
+            return result;
         });
     }
-    input.value = '';
 }
 
 // Enter key to send chat
@@ -250,23 +399,34 @@ document.getElementById('chat-input').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') sendChat();
 });
 
-function switchMap(filename) {
+function switchMapFromElement(element) {
+    return switchMap(
+        Number(element.dataset.queueIndex),
+        element.dataset.filename,
+        Number(element.dataset.missionRevision),
+    );
+}
+
+function switchMap(queueIndex, filename, revision) {
     if (!confirm('Switch to ' + filename + '?')) return;
-    fetch('/api/map/switch', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + authToken },
-        body: JSON.stringify({ map: filename })
-    })
-    .then(r => r.json())
-    .then(data => {
-        if (!data.ok) alert('Error: ' + (data.error || 'Unknown error'));
-    })
-    .catch(() => alert('Connection error'));
+    return submitHttpOperation(
+        '/api/map/switch',
+        { index: queueIndex, map: filename, revision },
+        { label: `Switch to ${filename}` },
+    );
 }
 
 // --- Player action sheet ---
-function openActionSheet(pid, name) {
-    selectedPlayer = { pid, name };
+function openActionSheetFromElement(element) {
+    return openActionSheet(
+        element.dataset.playerId,
+        element.dataset.playerName,
+        Number(element.dataset.playerRevision),
+    );
+}
+
+function openActionSheet(pid, name, revision) {
+    selectedPlayer = { pid, name, revision };
     document.getElementById('action-player-name').textContent = name;
     document.getElementById('action-sheet').classList.remove('hidden');
 }
@@ -278,16 +438,32 @@ function closeActionSheet() {
 
 function playerAction(action) {
     if (!selectedPlayer) return;
-    const name = selectedPlayer.name;
+    const target = { ...selectedPlayer };
+    const name = target.name;
     const confirmActions = { kick: 'Kick ' + name + '?', ban: 'BAN ' + name + '?' };
     if (confirmActions[action] && !confirm(confirmActions[action])) return;
 
-    fetch('/api/player/action', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + authToken },
-        body: JSON.stringify({ pid: selectedPlayer.pid, action })
+    return submitHttpOperation(
+        '/api/player/action',
+        {
+            pid: target.pid,
+            name: target.name,
+            revision: target.revision,
+            action,
+        },
+        { label: `${action} ${target.name}` },
+    ).then(result => {
+        if (
+            (result.outcome === 'accepted' || result.outcome === 'verified')
+            && selectedPlayer
+            && selectedPlayer.pid === target.pid
+            && selectedPlayer.name === target.name
+            && selectedPlayer.revision === target.revision
+        ) {
+            closeActionSheet();
+        }
+        return result;
     });
-    closeActionSheet();
 }
 
 // Close action sheet on background tap

@@ -6,6 +6,8 @@ All commands go through the same protocol.py path as the desktop UI.
 """
 
 import asyncio
+from dataclasses import fields, is_dataclass
+from enum import Enum
 import json
 import os
 import re
@@ -14,6 +16,7 @@ import sys
 import threading
 import time
 import logging
+from collections.abc import Mapping
 
 # Suppress aiohttp access logs (noisy GET /api/status every 5s)
 logging.getLogger('aiohttp.access').setLevel(logging.WARNING)
@@ -25,6 +28,28 @@ except ImportError:
     HAS_AIOHTTP = False
 
 from wolfrat.protocol import wire_log
+
+
+_SECRET_SETTING_NAMES = frozenset({
+    'serverpassword',
+    'sideapassword',
+    'sidebpassword',
+    'gamepass',
+    'bluepass',
+    'redpass',
+})
+
+
+class AmbiguousMissionTarget(ValueError):
+    """A filename names more than one authoritative queue entry."""
+
+
+class StaleMissionTarget(ValueError):
+    """A posted mission identity no longer matches the queue snapshot."""
+
+
+class StalePlayerTarget(ValueError):
+    """A posted player identity no longer matches the roster snapshot."""
 
 
 def _get_template_path():
@@ -45,6 +70,7 @@ class WolfWebServer:
     """Embedded web server for WolfRAT mobile access."""
 
     def __init__(self, server_manager, host='0.0.0.0', port=8070):
+        self.sm = server_manager
         self._enabled = False
         self._running = False
         self._auth_lock = threading.Lock()
@@ -58,7 +84,6 @@ class WolfWebServer:
         self._enabled = True
         self._template_path = _get_template_path()
         wire_log(f"WEB SERVER: template path = {self._template_path} (exists={os.path.exists(self._template_path)})")
-        self.sm = server_manager
         self.host = host
         self.port = port
         self._app = web.Application()
@@ -86,6 +111,7 @@ class WolfWebServer:
         self._app.router.add_get('/api/maps', self._handle_maps)
         self._app.router.add_get('/api/settings', self._handle_settings)
         self._app.router.add_get('/api/login-ips', self._handle_login_ips)
+        self._app.router.add_post('/api/action', self._handle_quick_action)
         self._app.router.add_post('/api/command', self._handle_command)
         self._app.router.add_post('/api/chat/send', self._handle_send_chat)
         self._app.router.add_post('/api/player/action', self._handle_player_action)
@@ -143,7 +169,6 @@ class WolfWebServer:
     def restart(self):
         """Restart the web server (e.g. after port change)."""
         self.stop()
-        time.sleep(1)
         self.start()
 
     def _run(self):
@@ -220,7 +245,10 @@ class WolfWebServer:
         """Push chat update immediately (no throttle). Called on new chat messages."""
         if not self._enabled or not self._running or not self._loop or not self._ws_clients:
             return
-        state = {'type': 'chat', 'chat': (self.sm.chat_messages or [])[-50:]}
+        state = {
+            'type': 'chat',
+            'chat': self._json_safe((self.sm.chat_messages or [])[-50:]),
+        }
         asyncio.run_coroutine_threadsafe(self._broadcast(json.dumps(state)), self._loop)
 
     async def _broadcast(self, message):
@@ -234,13 +262,9 @@ class WolfWebServer:
         self._ws_clients -= dead
 
     def _resolve_missions(self):
-        """Resolve display names for mission list using available maps data."""
-        import re
-        missions_raw = self.sm.missions or []
+        """Render identity-bearing rows from the authoritative queue snapshot."""
+        missions = tuple(self.sm.mission_entries)
         avail_raw = self.sm.available_maps_data or ''
-        if not avail_raw:
-            return missions_raw
-        # Build filename -> display name lookup
         name_map = {}
         for line in avail_raw.split('\n'):
             line = line.strip()
@@ -249,7 +273,7 @@ class WolfWebServer:
             m = re.match(r'^\d+[.:]\s*', line)
             if m:
                 line = line[m.end():]
-            ext_match = re.search(r'(?i)\.(bms|npaj|npj)\b', line)
+            ext_match = re.search(r'(?i)\.(bms|npj|npz)\b', line)
             if ext_match:
                 filename = line[:ext_match.end()].strip()
                 desc = line[ext_match.end():].strip()
@@ -257,49 +281,270 @@ class WolfWebServer:
                 if desc.startswith('('): desc = desc[1:].strip()
                 if desc.endswith(')'): desc = desc[:-1].strip()
                 name_map[filename.upper()] = desc if desc else filename
-        # Replace filenames with display names
-        missions_out = []
-        for m in missions_raw:
-            display = m
-            ext_match = re.search(r'(?i)(\S+\.(?:bms|npj|npaj))', m)
-            if ext_match:
-                fname = ext_match.group(1)
-                resolved = name_map.get(fname.upper())
-                if resolved:
-                    display = m.replace(fname, resolved)
-            missions_out.append(display)
-        return missions_out
+        return [
+            {
+                'queue_index': mission.queue_index,
+                'filename': mission.filename,
+                'display_name': (
+                    name_map.get(mission.filename.upper())
+                    or re.sub(
+                        r'(?i)\.(?:bms|npj|npz)$', '', mission.filename
+                    )
+                ),
+                'is_current': mission.is_current,
+                'is_next': mission.is_next,
+                'double_time': mission.double_time,
+                'revision': mission.revision,
+            }
+            for mission in missions
+        ]
+
+    def _resolve_players(self):
+        """Render players with the identity required for safe mutations."""
+        legacy_by_id = {}
+        for raw in self.sm.players or []:
+            if not isinstance(raw, Mapping):
+                continue
+            try:
+                legacy_by_id[int(raw.get('id'))] = dict(raw)
+            except (TypeError, ValueError):
+                continue
+
+        players = []
+        for player in self.sm.player_entries:
+            if player.server_id == 0:
+                continue
+            rendered = legacy_by_id.get(player.server_id, {})
+            rendered.update({
+                'id': player.server_id,
+                'name': player.name,
+                'team': str(player.team),
+                'team_name': {
+                    1: 'Joint Ops',
+                    2: 'Rebels',
+                }.get(player.team, 'Unknown'),
+                'class': player.player_class,
+                'kills': str(
+                    player.kills if player.kills is not None else 0
+                ),
+                'score': str(
+                    player.kills if player.kills is not None else 0
+                ),
+                'deaths': str(
+                    player.deaths if player.deaths is not None else '-'
+                ),
+                'ping': str(
+                    player.ping if player.ping is not None else '-'
+                ),
+                'revision': player.revision,
+            })
+            players.append(rendered)
+        return players
 
     def _build_state(self):
         """Build a JSON-safe state snapshot from ServerManager."""
+        players = self._json_safe(self._resolve_players())
+        chat = self._json_safe((self.sm.chat_messages or [])[-50:])
+        game_state = self._json_safe(self.sm.game_state or {})
         return {
             'type': 'state',
             'timestamp': time.time(),
-            'connected': self.sm.proto.connected if self.sm.proto else False,
-            'players': self.sm.players or [],
-            'chat': (self.sm.chat_messages or [])[-50:],
-            'game_state': self.sm.game_state or {},
+            'connected': self.sm.is_connected,
+            'players': players,
+            'chat': chat,
+            'game_state': game_state,
             'missions': self._resolve_missions(),
-            'settings': self.sm.game_settings or {},
-            'player_count': len(self.sm.players) if self.sm.players else 0,
+            'settings': self._safe_settings(),
+            'player_count': len(players),
             'game_mode': self.sm.game_state.get('mode', 'Unknown') if self.sm.game_state else 'Unknown',
         }
 
-    def _find_map_index(self, filename):
-        """Find a map's rotation index. MISSION SETNEXT expects the rotation index, not the available maps index."""
-        wire_log(f"MAP LOOKUP: searching for '{filename}' in rotation")
-        # Search rotation list first — this is what MISSION SETNEXT expects
-        missions = self.sm.missions or []
-        for line in missions:
-            match = re.match(r'(\d+):\s*(\S+\.(?:bms|npj|npaj))', line, re.IGNORECASE)
-            if match:
-                idx = int(match.group(1))
-                server_filename = match.group(2)
-                if server_filename.lower() == filename.lower():
-                    wire_log(f"MAP LOOKUP: found '{filename}' at rotation index {idx}")
-                    return idx
-        wire_log(f"MAP LOOKUP: '{filename}' not found in rotation")
-        return -1
+    @classmethod
+    def _json_safe(cls, value):
+        if isinstance(value, Enum):
+            return value.value
+        if is_dataclass(value) and not isinstance(value, type):
+            return {
+                field.name: cls._json_safe(getattr(value, field.name))
+                for field in fields(value)
+            }
+        if isinstance(value, Mapping):
+            return {
+                str(key): cls._json_safe(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [cls._json_safe(item) for item in value]
+        return value
+
+    def _safe_settings(self):
+        settings = self.sm.game_settings or {}
+        if hasattr(settings, 'items'):
+            settings = dict(settings.items())
+        else:
+            settings = dict(settings)
+        return self._json_safe({
+            key: value
+            for key, value in settings.items()
+            if str(key).casefold() not in _SECRET_SETTING_NAMES
+        })
+
+    @staticmethod
+    def _redact_command(command):
+        tokens = command.split(maxsplit=2)
+        if (
+            len(tokens) == 3
+            and tokens[0].casefold() == 'set'
+            and tokens[1].casefold() in _SECRET_SETTING_NAMES
+        ):
+            return f'{tokens[0]} {tokens[1]} <redacted>'
+        return command
+
+    def _find_mission_entry(
+        self, filename=None, *, queue_index=None, revision=None
+    ):
+        """Resolve an exact queue identity, never a guessed duplicate name."""
+        missions = tuple(self.sm.mission_entries)
+        target_name = str(filename or '').strip()
+        name_matches = [
+            mission
+            for mission in missions
+            if mission.filename.casefold() == target_name.casefold()
+        ] if target_name else []
+
+        if queue_index is None or str(queue_index).strip() == '':
+            if len(name_matches) > 1:
+                raise AmbiguousMissionTarget(
+                    f"mission filename {target_name!r} is ambiguous; "
+                    "send its queue index and revision"
+                )
+            raise ValueError(
+                "mission identity requires queue index, filename, and revision"
+            )
+        if not target_name or revision is None or str(revision).strip() == '':
+            raise ValueError(
+                "mission identity requires queue index, filename, and revision"
+            )
+
+        try:
+            target_index = int(queue_index)
+            target_revision = int(revision)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "mission queue index and revision must be integers"
+            ) from error
+        if target_index < 0 or target_revision < 0:
+            raise ValueError(
+                "mission queue index and revision cannot be negative"
+            )
+        mission = next(
+            (
+                item
+                for item in missions
+                if item.queue_index == target_index
+            ),
+            None,
+        )
+        if mission is None:
+            raise StaleMissionTarget(
+                f"stale mission identity: queue index {target_index} "
+                "is no longer present"
+            )
+        if mission.filename.casefold() != target_name.casefold():
+            raise StaleMissionTarget(
+                f"stale mission identity: queue index {target_index} is "
+                f"{mission.filename!r}, not {target_name!r}"
+            )
+        if mission.revision != target_revision:
+            raise StaleMissionTarget(
+                f"stale mission identity: revision changed from "
+                f"{target_revision} to {mission.revision}"
+            )
+        return mission
+
+    def _find_player_entry(self, player_id, name, revision):
+        """Resolve a complete player identity against the current snapshot."""
+        target_name = str(name or '').strip()
+        if not target_name or revision is None or str(revision).strip() == '':
+            raise ValueError(
+                "player identity requires id, name, and revision"
+            )
+        try:
+            target_id = int(player_id)
+            target_revision = int(revision)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "player id and revision must be integers"
+            ) from error
+        if target_revision < 0:
+            raise ValueError("player revision cannot be negative")
+
+        player = next(
+            (
+                item
+                for item in self.sm.player_entries
+                if item.server_id == target_id
+            ),
+            None,
+        )
+        if player is None:
+            raise StalePlayerTarget(
+                f"stale player identity: id {target_id} is no longer present"
+            )
+        if player.name != target_name:
+            raise StalePlayerTarget(
+                f"stale player identity: id {target_id} is now "
+                f"{player.name!r}, not {target_name!r}"
+            )
+        if player.revision != target_revision:
+            raise StalePlayerTarget(
+                f"stale player identity: revision changed from "
+                f"{target_revision} to {player.revision}"
+            )
+        return player
+
+    @staticmethod
+    def _result_payload(result, **context):
+        replies = list(getattr(result, 'replies', ()) or ())
+        accepted = bool(getattr(result, 'accepted', False))
+        has_verification = hasattr(result, 'verified')
+        verified = result.verified if has_verification else None
+        payload = {
+            'ok': (
+                accepted and verified is True
+                if has_verification
+                else accepted
+            ),
+            'accepted': accepted,
+            'replies': replies,
+            **context,
+        }
+        if has_verification:
+            payload['verified'] = verified
+            payload['verification_error'] = result.verification_error
+        if not accepted:
+            payload['error'] = replies[-1] if replies else 'Retail command rejected'
+        return payload
+
+    async def _await_result(self, future):
+        return await asyncio.wrap_future(future)
+
+    async def _ws_result(self, ws, message_type, future, **context):
+        try:
+            result = await self._await_result(future)
+            payload = self._result_payload(
+                result, type=f'{message_type}_result', **context
+            )
+        except Exception as error:
+            payload = {
+                'type': f'{message_type}_result',
+                'ok': False,
+                'accepted': False,
+                'replies': [],
+                'error': str(error),
+                **context,
+            }
+        await ws.send_str(json.dumps(payload))
 
     # --- Auth ---
 
@@ -381,9 +626,10 @@ class WolfWebServer:
         """GET /api/players — Current player list."""
         if not self._check_auth(request):
             return web.json_response({'error': 'Unauthorized'}, status=401)
+        players = self._json_safe(self._resolve_players())
         return web.json_response({
-            'players': self.sm.players or [],
-            'count': len(self.sm.players) if self.sm.players else 0,
+            'players': players,
+            'count': len(players),
         })
 
     async def _handle_chat(self, request):
@@ -391,7 +637,7 @@ class WolfWebServer:
         if not self._check_auth(request):
             return web.json_response({'error': 'Unauthorized'}, status=401)
         return web.json_response({
-            'messages': (self.sm.chat_messages or [])[-100:],
+            'messages': self._json_safe((self.sm.chat_messages or [])[-100:]),
         })
 
     async def _handle_maps(self, request):
@@ -399,7 +645,7 @@ class WolfWebServer:
         if not self._check_auth(request):
             return web.json_response({'error': 'Unauthorized'}, status=401)
         return web.json_response({
-            'missions': self._resolve_missions(),
+            'missions': self._json_safe(self._resolve_missions()),
             'available': self.sm.available_maps_data or '',
         })
 
@@ -408,7 +654,7 @@ class WolfWebServer:
         if not self._check_auth(request):
             return web.json_response({'error': 'Unauthorized'}, status=401)
         return web.json_response({
-            'settings': self.sm.game_settings or {},
+            'settings': self._safe_settings(),
         })
 
     async def _handle_login_ips(self, request):
@@ -419,6 +665,41 @@ class WolfWebServer:
             'ips': self.get_login_ips(),
         })
 
+    async def _handle_quick_action(self, request):
+        """POST /api/action — Execute a named, typed dashboard operation."""
+        if not self._check_auth(request):
+            return web.json_response({'error': 'Unauthorized'}, status=401)
+        try:
+            body = await request.json()
+            action = str(body.get('action', '')).strip().lower()
+            if not action:
+                return web.json_response({'error': 'No action provided'}, status=400)
+            if not self.sm.is_connected:
+                return web.json_response(
+                    {'error': 'Not connected to server'}, status=503
+                )
+
+            actions = {
+                'next_map': self.sm.cycle_mission,
+                'refresh_players': self.sm.refresh_players,
+                'refresh_chat': self.sm.refresh_chat,
+            }
+            operation = actions.get(action)
+            if operation is None:
+                return web.json_response(
+                    {'error': f'Unknown action: {action}'}, status=400
+                )
+
+            wire_log(f"WEB QUICK ACTION: {action}")
+            result = await self._await_result(operation())
+            return web.json_response(
+                self._result_payload(result, action=action)
+            )
+        except ValueError as error:
+            return web.json_response({'error': str(error)}, status=400)
+        except Exception as error:
+            return web.json_response({'error': str(error)}, status=502)
+
     async def _handle_command(self, request):
         """POST /api/command — Send a raw command to the server."""
         if not self._check_auth(request):
@@ -428,13 +709,18 @@ class WolfWebServer:
             cmd = body.get('command', '').strip()
             if not cmd:
                 return web.json_response({'error': 'No command provided'}, status=400)
-            if not self.sm.proto.connected:
+            if not self.sm.is_connected:
                 return web.json_response({'error': 'Not connected to server'}, status=503)
-            wire_log(f"WEB CMD: {cmd}")
-            self.sm.send(cmd)
-            return web.json_response({'ok': True, 'command': cmd})
+            display_command = self._redact_command(cmd)
+            wire_log(f"WEB CMD: {display_command}")
+            result = await self._await_result(self.sm.execute_raw(cmd))
+            return web.json_response(
+                self._result_payload(result, command=display_command)
+            )
+        except ValueError as e:
+            return web.json_response({'error': str(e)}, status=400)
         except Exception as e:
-            return web.json_response({'error': str(e)}, status=500)
+            return web.json_response({'error': str(e)}, status=502)
 
     async def _handle_send_chat(self, request):
         """POST /api/chat/send — Send a chat message."""
@@ -445,12 +731,14 @@ class WolfWebServer:
             msg = body.get('message', '').strip()
             if not msg:
                 return web.json_response({'error': 'No message provided'}, status=400)
-            if not self.sm.proto.connected:
+            if not self.sm.is_connected:
                 return web.json_response({'error': 'Not connected to server'}, status=503)
-            self.sm.send_chat(msg)
-            return web.json_response({'ok': True})
+            result = await self._await_result(self.sm.send_chat(msg))
+            return web.json_response(self._result_payload(result))
+        except ValueError as e:
+            return web.json_response({'error': str(e)}, status=400)
         except Exception as e:
-            return web.json_response({'error': str(e)}, status=500)
+            return web.json_response({'error': str(e)}, status=502)
 
     async def _handle_player_action(self, request):
         """POST /api/player/action — Admin action on a player."""
@@ -458,28 +746,61 @@ class WolfWebServer:
             return web.json_response({'error': 'Unauthorized'}, status=401)
         try:
             body = await request.json()
-            pid = body.get('pid', '').strip()
-            action = body.get('action', '').strip().lower()
+            pid = str(body.get('pid', '')).strip()
+            player_name = str(body.get('name', '')).strip()
+            revision = body.get('revision')
+            action = str(body.get('action', '')).strip().lower()
             if not pid or not action:
                 return web.json_response({'error': 'Missing pid or action'}, status=400)
-            if not self.sm.proto.connected:
+            if not self.sm.is_connected:
                 return web.json_response({'error': 'Not connected to server'}, status=503)
 
-            actions = {
-                'kick': lambda: self.sm.punt_player(pid),
-                'ban': lambda: self.sm.ban_player(pid),
-                'kill': lambda: self.sm.kill_player(pid),
-                'swap': lambda: self.sm.swap_player(pid),
-                'zero': lambda: self.sm.zero_player(pid),
-            }
-            if action not in actions:
+            # The server parses this with (uint8)atol(), so anything unparseable
+            # -- a player name, say -- silently becomes 0, which is the host.
+            # KILL, SWAPTEAM and ZEROSCORE are not guarded against id 0 the way
+            # PUNT is, so validate before we let it near them.
+            try:
+                pid_num = int(pid)
+            except ValueError:
+                return web.json_response({'error': f'Invalid player id: {pid!r}'}, status=400)
+            if not 1 <= pid_num <= 250:
+                return web.json_response(
+                    {'error': f'Player id {pid_num} out of range (1-250)'}, status=400)
+
+            if action not in {'kick', 'ban', 'kill', 'swap', 'zero'}:
                 return web.json_response({'error': f'Unknown action: {action}'}, status=400)
 
-            wire_log(f"WEB PLAYER ACTION: {action} on {pid}")
-            actions[action]()
-            return web.json_response({'ok': True, 'action': action, 'pid': pid})
+            player = self._find_player_entry(
+                pid_num, player_name, revision
+            )
+            actions = {
+                'kick': lambda: self.sm.punt_player(player),
+                'ban': lambda: self.sm.ban_player(player),
+                'kill': lambda: self.sm.kill_player(player),
+                'swap': lambda: self.sm.swap_player(player),
+                'zero': lambda: self.sm.zero_player(player),
+            }
+
+            wire_log(
+                f"WEB PLAYER ACTION: {action} on "
+                f"{player.server_id}/{player.name}"
+            )
+            result = await self._await_result(actions[action]())
+            return web.json_response(
+                self._result_payload(
+                    result,
+                    action=action,
+                    pid=player.server_id,
+                    name=player.name,
+                    revision=player.revision,
+                )
+            )
+        except StalePlayerTarget as error:
+            return web.json_response({'error': str(error)}, status=409)
+        except ValueError as e:
+            return web.json_response({'error': str(e)}, status=400)
         except Exception as e:
-            return web.json_response({'error': str(e)}, status=500)
+            return web.json_response({'error': str(e)}, status=502)
 
     async def _handle_map_switch(self, request):
         """POST /api/map/switch — Switch to a specific map by filename."""
@@ -487,27 +808,38 @@ class WolfWebServer:
             return web.json_response({'error': 'Unauthorized'}, status=401)
         try:
             body = await request.json()
-            map_name = body.get('map', '').strip()
-            if not map_name:
-                return web.json_response({'error': 'No map name provided'}, status=400)
-            if not self.sm.proto.connected:
+            map_name = str(body.get('map', '')).strip()
+            queue_index = body.get('index')
+            revision = body.get('revision')
+            if not map_name and queue_index is None:
+                return web.json_response(
+                    {'error': 'No mission identity provided'}, status=400
+                )
+            if not self.sm.is_connected:
                 return web.json_response({'error': 'Not connected to server'}, status=503)
 
-            # Find the server index for this map
-            idx = self._find_map_index(map_name)
-            if idx >= 0:
-                wire_log(f"WEB MAP SWITCH: {map_name} -> server index {idx}")
-                self.sm.send(f"MISSION SETNEXT {idx}")
-                time.sleep(0.3)
-                self.sm.send("GOTO GAMESTATE")
-                return web.json_response({'ok': True, 'map': map_name, 'index': idx})
-            else:
-                # Fallback: try sending as mission name directly
-                wire_log(f"WEB MAP SWITCH: index not found, trying direct command for {map_name}")
-                self.sm.set_mission(map_name)
-                return web.json_response({'ok': True, 'map': map_name, 'method': 'direct'})
+            mission = self._find_mission_entry(
+                map_name,
+                queue_index=queue_index,
+                revision=revision,
+            )
+            wire_log(
+                f"WEB MAP SWITCH: {mission.filename} at queue index "
+                f"{mission.queue_index}"
+            )
+            result = await self._await_result(self.sm.switch_mission(mission))
+            return web.json_response(self._result_payload(
+                result,
+                map=mission.filename,
+                index=mission.queue_index,
+                revision=mission.revision,
+            ))
+        except (AmbiguousMissionTarget, StaleMissionTarget) as error:
+            return web.json_response({'error': str(error)}, status=409)
+        except ValueError as e:
+            return web.json_response({'error': str(e)}, status=400)
         except Exception as e:
-            return web.json_response({'error': str(e)}, status=500)
+            return web.json_response({'error': str(e)}, status=502)
 
     async def _handle_websocket(self, request):
         """WebSocket endpoint for live state updates."""
@@ -529,12 +861,46 @@ class WolfWebServer:
                 if msg.type == web.WSMsgType.TEXT:
                     try:
                         data = json.loads(msg.data)
-                        if data.get('type') == 'command' and self.sm.proto.connected:
-                            self.sm.send(data.get('command', ''))
-                        elif data.get('type') == 'chat' and self.sm.proto.connected:
-                            self.sm.send_chat(data.get('message', ''))
-                    except json.JSONDecodeError:
-                        pass
+                        message_type = data.get('type')
+                        if message_type not in {'command', 'chat'}:
+                            await ws.send_str(json.dumps({
+                                'type': 'error',
+                                'error': f'Unknown message type: {message_type}',
+                            }))
+                            continue
+                        if not self.sm.is_connected:
+                            await ws.send_str(json.dumps({
+                                'type': f'{message_type}_result',
+                                'ok': False,
+                                'accepted': False,
+                                'replies': [],
+                                'error': 'Not connected to server',
+                            }))
+                            continue
+                        if message_type == 'command':
+                            command = str(data.get('command', '')).strip()
+                            if not command:
+                                raise ValueError('No command provided')
+                            await self._ws_result(
+                                ws,
+                                message_type,
+                                self.sm.execute_raw(command),
+                                command=self._redact_command(command),
+                            )
+                        else:
+                            message = str(data.get('message', '')).strip()
+                            if not message:
+                                raise ValueError('No message provided')
+                            await self._ws_result(
+                                ws,
+                                message_type,
+                                self.sm.send_chat(message),
+                            )
+                    except (json.JSONDecodeError, ValueError) as error:
+                        await ws.send_str(json.dumps({
+                            'type': 'error',
+                            'error': str(error),
+                        }))
                 elif msg.type in (web.WSMsgType.ERROR, web.WSMsgType.CLOSE):
                     break
         except Exception:

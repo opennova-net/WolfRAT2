@@ -74,9 +74,9 @@
                 <div class="card">
                     <h2>Quick Actions</h2>
                     <div class="action-grid">
-                        <button class="btn btn-action" onclick="sendCommand('MISSION CYCLE')">⏭ Next Map</button>
-                        <button class="btn btn-action" onclick="sendCommand('player list')">🔄 Refresh</button>
-                        <button class="btn btn-action" onclick="sendCommand('chat get')">💬 Sync Chat</button>
+                        <button class="btn btn-action" onclick="quickAction('next_map', 'Next map')">⏭ Next Map</button>
+                        <button class="btn btn-action" onclick="quickAction('refresh_players', 'Refresh players')">🔄 Refresh</button>
+                        <button class="btn btn-action" onclick="quickAction('refresh_chat', 'Sync chat')">💬 Sync Chat</button>
                     </div>
                 </div>
                 <div class="card">
@@ -101,7 +101,10 @@
                     <h2>Server Chat</h2>
                     <div id="chat-messages" class="chat-messages"></div>
                     <div class="chat-input-row">
-                        <input id="chat-input" type="text" placeholder="Type a message or !command..." maxlength="65" autocomplete="off">
+<!-- 54 = the 62-char server chat limit minus the 8-char "[ADMIN] " prefix
+                             app.js prepends. At 65 the tail was silently eaten, which
+                             also mangled !commands the mods tab matches on. -->
+                        <input id="chat-input" type="text" placeholder="Type a message or !command..." maxlength="54" autocomplete="off">
                         <button class="btn btn-send" onclick="sendChat()">Send</button>
                     </div>
                 </div>
