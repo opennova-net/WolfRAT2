@@ -1,4 +1,4 @@
-WolfRAT 2.0 — Joint Operations Server Admin Tool
+WolfRAT 2.4.11 — Joint Operations Server Admin Tool
 ==================================================
 
 A modern replacement for the original WolfRAT v0.95 (2005).
@@ -26,8 +26,12 @@ Requirements:
   - pyinstaller (for building .exe)
 
 Protocol:
-  Connects to Joint Operations game servers on TCP port 40000.
-  Uses the same plaintext protocol as the original WolfRAT v0.95.
-  Username-only authentication (password not required by the game server).
+  Connects to the server's configured admin port (commonly TCP 4000).
+  Uses 8-byte framed packets and the retail login challenge/response.
+  Both username and password fields from admin.cfg are authenticated.
+  All active features share one ordered session and typed command facade.
+  Mutations require their exact retail acknowledgement and, where the
+  server exposes the result, an authoritative readback before WolfRAT
+  reports the change as verified.
 
 Based on reverse engineering of WolfRAT v0.95 binary.

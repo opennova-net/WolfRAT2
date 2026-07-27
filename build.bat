@@ -1,6 +1,6 @@
 @echo off
 echo ============================================
-echo  WolfRAT 2.1 — Build Script
+echo  WolfRAT 2.4.11 — Build Script
 echo ============================================
 echo.
 
@@ -12,10 +12,10 @@ IF EXIST venv\Scripts\activate.bat (
 )
 
 echo Installing/updating dependencies...
-python -m pip install PyQt6 pyinstaller --quiet
+python -m pip install PyQt6 aiohttp pyinstaller --quiet
 
 echo.
-echo Building WolfRAT 2.1 executable...
+echo Building WolfRAT 2.4.11 executable...
 python -m PyInstaller ^
     --onefile ^
     --windowed ^

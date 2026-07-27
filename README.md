@@ -4,13 +4,16 @@
 
 A complete rewrite of the original WolfRAT v0.95 (2005) — rebuilt from scratch in Python 3 + PyQt6 with a dark theme UI, web dashboard, and features the original never had.
 
-![Version](https://img.shields.io/badge/version-2.4.9-blue)
+![Version](https://img.shields.io/badge/version-2.4.11-blue)
 ![Python](https://img.shields.io/badge/python-3.11+-green)
 ![License](https://img.shields.io/badge/license-MIT-yellow)
 
 ## What Is This?
 
-WolfRAT2 connects to Joint Operations game servers on TCP port 4000 and gives server admins a full GUI for managing players, maps, chat, and server settings. No more typing commands into a console — point, click, done.
+WolfRAT2 connects to a Joint Operations server's configured admin port
+(commonly TCP 4000) and gives server admins a full GUI for managing players,
+maps, chat, and server settings. No more typing commands into a console —
+point, click, done.
 
 "RAT" = **R**emote **A**dmin **T**ool. Not a backdoor. Just a better way to run your server.
 
@@ -80,9 +83,32 @@ python main.py
 
 ## How It Works
 
-WolfRAT2 connects to the Joint Operations admin interface on TCP port 4000 using the same plaintext protocol as the original WolfRAT v0.95 (2005). Authentication is username-only — the game server doesn't require a password for admin connections.
+WolfRAT2 connects to the Joint Operations admin interface over TCP (port 4000 by
+convention; the server reads `remote_admin_port` from `game.cfg`) using the same
+protocol as the original WolfRAT v0.95 (2005).
 
-The protocol was reverse-engineered from the original WolfRAT v0.95 binary.
+Login is a challenge/response exchange: the server sends a framed 32-byte
+challenge plus NUL, and the client returns an encrypted 65-byte response holding
+the username and password fields from `admin.cfg`. Both are checked. Everything
+after login is plaintext ASCII.
+
+One mandatory session owns framing, authentication, request ordering, and the
+authoritative snapshots. Every desktop and web feature uses typed semantic
+operations through that session; background reads are coalesced and cannot race
+interactive commands. Semantic mutations retain the workflow gate through their
+confirmation readback, so a later mutation cannot act on an identity that the
+first operation shifted. Mutations require their exact retail acknowledgement
+and, where available, an independent state readback before WolfRAT reports them
+as verified.
+
+The connection is kept persistent. Teardown uses an abortive TCP close because
+the retail server fails to retire orderly-FIN admin clients correctly; repeated
+orderly reconnects can corrupt its retained client table. Accepted raw mutations
+conservatively invalidate typed snapshots before any queued command can reuse an
+old player, mission, or weapon identity.
+
+The wire contract and command catalog were cross-checked against retail
+`CAdminServer` behavior in IDA and the OpenNova implementation.
 
 ## History
 

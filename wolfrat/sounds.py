@@ -1,8 +1,4 @@
-"""
-WolfRAT 2.0 — Sound Effects (Sirius Cybernetics Edition)
-Generates Hitchhiker's Guide style door sounds on first run,
-then plays them via PyQt6 QSoundEffect.
-"""
+"""Generate and play WolfRAT interface sounds."""
 
 import os
 import struct

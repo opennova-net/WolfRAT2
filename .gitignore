@@ -11,6 +11,13 @@ __pycache__/
 # Logs
 *.log
 
+# Local runtime state, saved credentials, and test caches
+/wolfrat_*.json
+/wolfrat_*.db
+/wolfrat/settings_preset.json
+/.uv-cache/
+*.bak
+
 # Releases (binary outputs)
 releases/
 

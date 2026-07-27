@@ -1,15 +1,4 @@
-"""
-B-Stats — Anonymous Usage Analytics
-====================================
-Drop this file into any FMJ tool. Call `bstats_start("wolfrat", "2.2")` on launch.
-Sends a startup ping + periodic heartbeats. Fails silently. Zero dependencies.
-
-Usage:
-    import bstats
-    bstats.bstats_start("wolfrat", "2.2")
-
-That's it. Runs in a background daemon thread. Won't block or crash your app.
-"""
+"""Anonymous startup and heartbeat analytics used by WolfRAT."""
 
 import json
 import platform
@@ -98,7 +87,7 @@ def bstats_start(tool, version):
     
     Args:
         tool: Tool name — "wolfrat" or "jomonitor"
-        version: Version string — "2.2", "1.0.1", etc.
+        version: Application version string.
     """
     global _tool, _version, _os, _client_id, _running
     _tool = tool.lower()
