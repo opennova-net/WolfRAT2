@@ -1,10 +1,10 @@
-# WolfRAT2
+﻿# WolfRAT2
 
 **Modern Remote Admin Tool for Joint Operations: Typhoon Rising**
 
-A complete rewrite of the original WolfRAT v0.95 (2005) — rebuilt from scratch in Python 3 + PyQt6 with a dark theme UI, web dashboard, and features the original never had.
+A complete rewrite of the original WolfRAT v0.95 (2005) â€” rebuilt from scratch in Python 3 + PyQt6 with a dark theme UI, web dashboard, and features the original never had.
 
-![Version](https://img.shields.io/badge/version-2.4.11-blue)
+![Version](https://img.shields.io/badge/version-2.5.0-blue)
 ![Python](https://img.shields.io/badge/python-3.11--3.14-green)
 ![License](https://img.shields.io/badge/license-MIT-yellow)
 
@@ -12,14 +12,14 @@ A complete rewrite of the original WolfRAT v0.95 (2005) — rebuilt from scratch
 
 WolfRAT2 connects to a Joint Operations server's configured admin port
 (commonly TCP 4000) and gives server admins a full GUI for managing players,
-maps, chat, and server settings. No more typing commands into a console —
+maps, chat, and server settings. No more typing commands into a console â€”
 point, click, done.
 
 "RAT" = **R**emote **A**dmin **T**ool. Not a backdoor. Just a better way to run your server.
 
 ## Features
 
-### 🖥️ Desktop GUI (12 Tabs)
+### ðŸ–¥ï¸ Desktop GUI (12 Tabs)
 
 | Tab | What It Does |
 |-----|-------------|
@@ -27,26 +27,26 @@ point, click, done.
 | **Console** | Raw command console with send/receive log |
 | **Players** | Live player list with admin actions (Warn, Punt, Ban, Kill, Swap, Zero Score) |
 | **Missions** | Map browser, one-click map switching, next map, mission presets |
-| **Settings** | Server config — auto-balance, team switching, vote percent, respawn delay |
+| **Settings** | Server config â€” auto-balance, team switching, vote percent, respawn delay |
 | **Chat Bot** | Live chat monitor, send chat, bad word filter, auto-team-swap trigger |
 | **Messages** | Recurring messages, welcome messages, and persistent KD tracking |
-| **Spree** | Kill streak tracker — auto-announces 3/5/7/10 kill streaks with gold heat gradient |
+| **Spree** | Kill streak tracker â€” auto-announces 3/5/7/10 kill streaks with gold heat gradient |
 | **Mods** | TAC mod management and configuration |
 | **Map Voting** | In-game map voting system |
 | **Weapons** | Weapon loadout editor and configuration |
 | **Web Admin** | Embedded dashboard listener, credentials, and access history |
 
-### 🌐 Web Dashboard
+### ðŸŒ Web Dashboard
 
 Mobile-friendly web UI for remote administration from your phone or tablet. Runs on a configurable LAN port, token-protected. Same commands as the desktop UI.
 
-### 🎨 Dark Theme
+### ðŸŽ¨ Dark Theme
 
 Catppuccin Mocha-inspired dark theme with gold accents. Easy on the eyes during long sessions.
 
-### 📦 Single Executable
+### ðŸ“¦ Single Executable
 
-Packages into a single `.exe` via PyInstaller — no Python install needed on the target machine.
+Packages into a single `.exe` via PyInstaller â€” no Python install needed on the target machine.
 
 ## Getting the Executable
 
@@ -119,7 +119,7 @@ installation or pull-request code.
 ## Requirements
 
 - **Node.js 24 with npm 11** (only for browser-client validation)
-- **Python 3.11–3.14** (for building/running from source)
+- **Python 3.11â€“3.14** (for building/running from source)
 
 Runtime and development dependencies are declared in `pyproject.toml`; Node
 toolchain requirements and browser-client commands are declared in
@@ -156,16 +156,16 @@ The wire contract and command catalog were cross-checked against retail
 
 ## History
 
-The original **WolfRAT** was built in 2005 by WolfGaming using MFC70 (Visual C++ .NET). It served the JO community well but is long dead — won't run on modern Windows, source is gone.
+The original **WolfRAT** was built in 2005 by WolfGaming using MFC70 (Visual C++ .NET). It served the JO community well but is long dead â€” won't run on modern Windows, source is gone.
 
 **WolfRAT2** is a from-scratch rebuild. Same protocol, same purpose, modern everything.
 
 ## License
 
-MIT — do what you want with it.
+MIT â€” do what you want with it.
 
 ## Credits
 
-- **WolfGaming** — original WolfRAT v0.95 (2005)
-- **BadgerLove** — WolfRAT2 rewrite
-- **NovaLogic** — Joint Operations: Typhoon Rising (2004)
+- **WolfGaming** â€” original WolfRAT v0.95 (2005)
+- **BadgerLove** â€” WolfRAT2 rewrite
+- **NovaLogic** â€” Joint Operations: Typhoon Rising (2004)
