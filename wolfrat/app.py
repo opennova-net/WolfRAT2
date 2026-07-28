@@ -7144,6 +7144,15 @@ class MainWindow(QMainWindow):
 
         status_bar.addSpacing(10)
 
+        self.update_btn = QPushButton("Check for Updates")
+        self.update_btn.setStyleSheet(
+            "font-size: 8pt; color: #555; background: transparent; "
+            "border: 1px solid #333; padding: 1px 6px; margin: 0 4px;"
+        )
+        self.update_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.update_btn.clicked.connect(self._check_for_updates)
+        status_bar.addWidget(self.update_btn)
+
         ver_label = QLabel("v2.5.0 · Built by BadgerLove · FMJ Squad")
         ver_label.setStyleSheet("font-size: 9pt; color: #444;")
         status_bar.addWidget(ver_label)
