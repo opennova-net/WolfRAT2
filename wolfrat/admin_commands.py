@@ -370,7 +370,7 @@ def parse_missions(payload: str, revision: int) -> tuple[MissionEntry, ...]:
 
 
 _AVAILABLE_RE = re.compile(
-    r"^\s*(?P<index>\d+)\.\s+(?P<file>\S+\.(?:BMS|NPJ|NPZ))\s+\((?P<description>.*)\)\s*$",
+    r"^\s*(?P<index>\d+)\.\s+(?P<file>.+\.(?:BMS|NPJ|NPZ))\s+\((?P<description>.*)\)\s*$",
     re.IGNORECASE,
 )
 

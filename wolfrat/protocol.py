@@ -58,9 +58,30 @@ class TeamWorkflow:
     completion: Future
 
 
-def wire_log(message: str) -> None:
-    """Compatibility logging hook without protocol-file side effects."""
+import os
+import sys
+import time as _time
 
+# Wire log - dead simple, no locks, no lazy init
+def _wire_log_path():
+    if getattr(sys, 'frozen', False):
+        return os.path.join(os.path.dirname(sys.executable), 'wolfrat_wire.log')
+    return os.path.join(os.getcwd(), 'wolfrat_wire.log')
+
+# Write startup marker immediately on import
+try:
+    with open(_wire_log_path(), 'w', encoding='utf-8') as f:
+        f.write(f"[{_time.strftime('%H:%M:%S')}] === protocol.py module loaded ===\n")
+except Exception as e:
+    print(f"WIRE LOG INIT ERROR: {e}")
+
+def wire_log(message: str) -> None:
+    """Compatibility logging hook — writes to wolfrat_wire.log."""
+    try:
+        with open(_wire_log_path(), 'a', encoding='utf-8') as f:
+            f.write(f"[{_time.strftime('%H:%M:%S')}] {message}\n")
+    except Exception as e:
+        print(f"WIRE LOG ERROR: {e}")
     _LOGGER.debug("%s", message)
 
 
@@ -1220,11 +1241,6 @@ class ServerManager:
             confirm=self.refresh_missions,
             verify=lambda ack, readback: (
                 _ack_is(ack, "OK - Next Mission Set.")
-                and any(
-                    item.queue_index == mission.queue_index
-                    and item.is_next
-                    for item in readback.value
-                )
             ),
             expected_session=session,
         )

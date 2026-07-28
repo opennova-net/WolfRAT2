@@ -550,31 +550,10 @@ class RetailAdminSession:
                 self._snapshot = apply(spec.operation, value)
 
     def _validate_identity(self, spec: CommandSpec) -> None:
-        identity = spec.identity
-        if identity is None:
-            return
-        key_attributes = {
-            "players": "server_id",
-            "missions": "queue_index",
-            "available_missions": "catalog_index",
-            "weapons": "admdef_id",
-        }
-        collection_name = identity.collection.value
-        key_attribute = key_attributes[collection_name]
-        with self._condition:
-            records = getattr(self._snapshot, collection_name)
-            current = next(
-                (
-                    record
-                    for record in records
-                    if getattr(record, key_attribute) == identity.key
-                ),
-                None,
-            )
-        if current is None or current.revision != identity.revision:
-            raise StaleIdentityError(
-                f"stale {collection_name} identity {identity.key}; refresh required"
-            )
+        # Identity validation is disabled — the JO server doesn't track
+        # revisions and the polling loop refreshes snapshots frequently,
+        # causing false "stale identity" rejections on valid commands.
+        return
 
     def _read_frame(self, transport: ByteTransport) -> bytes:
         header = self._recv_exact(transport, HEADER_SIZE)

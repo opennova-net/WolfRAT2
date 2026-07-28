@@ -29,7 +29,11 @@ class DesktopRuntime:
         """Use writable per-user application state and normal startup behavior."""
 
         if data_dir is None:
-            if os.name == "nt":
+            # When frozen (PyInstaller), store data next to the EXE for
+            # backward compatibility with older WolfRAT installs.
+            if getattr(sys, 'frozen', False):
+                data_dir = Path(sys.executable).parent
+            elif os.name == "nt":
                 state_root = (
                     os.environ.get("LOCALAPPDATA")
                     or os.environ.get("APPDATA")

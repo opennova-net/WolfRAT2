@@ -136,7 +136,10 @@ class QtAdminDispatcher(QObject):
         result: Any,
         error: BaseException | None,
     ) -> None:
+        from wolfrat.protocol import wire_log
+        wire_log(f"[DISPATCH] _deliver: context={pending.context} error={error} accepted={getattr(result, 'accepted', None)} verified={getattr(result, 'verified', None)}")
         if error is not None:
+            wire_log(f"[DISPATCH] FAILED (error): {pending.context} failed: {error}")
             self._report_failure(
                 pending,
                 f"{pending.context} failed: {error}",
@@ -149,6 +152,7 @@ class QtAdminDispatcher(QObject):
                 if replies
                 else "retail server rejected the operation"
             )
+            wire_log(f"[DISPATCH] FAILED (rejected): {pending.context} rejected: {detail}")
             self._report_failure(
                 pending,
                 f"{pending.context} rejected: {detail}",
@@ -166,8 +170,10 @@ class QtAdminDispatcher(QObject):
                     f"{pending.context} was accepted but not verified "
                     "by retail"
                 )
+            wire_log(f"[DISPATCH] FAILED (verification): {message}")
             self._report_failure(pending, message)
             return
+        wire_log(f"[DISPATCH] SUCCESS: {pending.context}")
         if pending.on_success is not None:
             try:
                 pending.on_success(result)

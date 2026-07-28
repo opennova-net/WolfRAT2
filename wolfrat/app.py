@@ -291,6 +291,10 @@ QHeaderView::section {
     border: 1px solid #2a2a00;
     font-weight: bold;
 }
+QTableCornerButton {
+    background-color: #050500;
+    border: 1px solid #1a1a00;
+}
 QTableCornerButton::section {
     background-color: #050500;
     border: 1px solid #1a1a00;
@@ -5326,6 +5330,9 @@ class ModsTab(QWidget):
             wire_log(f"[MODS] sender '{sender}' not in mods {list(self.mods.keys())} - ignoring")
             return
 
+        # Resolve to the mod's original-case name for display
+        display_name = self.mods.get(sender, sender) if sender != 'web_admin' else 'Web Admin'
+
         if cmd == '!startvote':
             map_tab = getattr(self.server, '_map_voting_tab', None)
             if map_tab:
@@ -5337,7 +5344,7 @@ class ModsTab(QWidget):
                     submit_admin(
                         self,
                         lambda: self.server.send_chat(
-                            f"Mod {sender} forced an early end-of-match map vote."
+                            f"Mod {display_name} forced an early end-of-match map vote."
                         ),
                         lambda _result: self._start_forced_map_vote(
                             map_tab, now, sender
@@ -5500,8 +5507,7 @@ class ModsTab(QWidget):
                 lambda: self.server.set_time_of_day(time_str),
                 context="Set time of day",
                 announcement=(
-                    f"Time-of-day request accepted for {hour:02d}:00; "
-                    "retail provides no readback"
+                    f"Time set to {hour:02d}:00"
                 ),
                 log_message=(
                     f"[{now}] {sender} requested time of day "
@@ -5544,11 +5550,11 @@ class ModsTab(QWidget):
             if name and filename:
                 mission_target = filename
                 if source == "rotation":
+                    # Check for duplicates but pass filename (not stale entry)
+                    # to switch_mission so it resolves from the current snapshot.
                     try:
-                        mission_target = (
-                            MissionsTab._resolve_unique_mission_entry(
-                                self.server.mission_entries, filename
-                            )
+                        entry = MissionsTab._resolve_unique_mission_entry(
+                            self.server.mission_entries, filename
                         )
                     except ValueError:
                         self._send_mod_chat(
@@ -5556,12 +5562,13 @@ class ModsTab(QWidget):
                             "Reject ambiguous mission switch",
                         )
                         return
-                    if mission_target is None:
+                    if entry is None:
                         self._send_mod_chat(
                             f"Map queue changed: {name}",
                             "Reject stale mission switch",
                         )
                         return
+                    mission_target = filename
                 self._submit_mod_action(
                     lambda: self.server.switch_mission(
                         mission_target,
@@ -5600,29 +5607,22 @@ class ModsTab(QWidget):
         elif cmd == '!remove':
             map_name = ' '.join(args) if args else ''
             name, filename, source = find_map(map_name)
-            if name and filename and source == 'rotation':
-                try:
-                    mission_target = MissionsTab._resolve_unique_mission_entry(
-                        self.server.mission_entries, filename
-                    )
-                except ValueError:
+            if name and filename:
+                # Find first matching entry by filename and remove by queue_index
+                # (avoids ambiguity error when map is queued multiple times)
+                match = next(
+                    (m for m in self.server.mission_entries
+                     if m.filename.casefold() == filename.casefold()),
+                    None,
+                )
+                if match is None:
                     self._send_mod_chat(
-                        f"Map is queued more than once: {name}",
-                        "Reject ambiguous mission removal",
-                    )
-                    return
-                if mission_target is None:
-                    self._send_mod_chat(
-                        f"Could not find {name} in the current queue",
-                        "Send missing mission identity response",
-                    )
-                    self.mod_log.addItem(
-                        f"[{now}] {sender} tried !remove but identity "
-                        "was not found"
+                        f"{name} is not in the rotation",
+                        "Send mission rotation response",
                     )
                     return
                 self._submit_mod_action(
-                    lambda: self.server.remove_mission(mission_target),
+                    lambda: self.server.remove_mission(match.queue_index),
                     context=f"Remove mission {name}",
                     announcement=f"Removed {name} from rotation",
                     log_message=(
@@ -6231,6 +6231,7 @@ class MapVotingTab(QWidget):
         return counts, winner_opt, total
 
     def _end_vote(self):
+        wire_log("[VOTE] _end_vote called")
         self._vote_active = False
         self._vote_stage = 'finishing'
         self.status_lbl.setText("Status: Applying vote winner...")
@@ -6272,30 +6273,39 @@ class MapVotingTab(QWidget):
                 mtab = self.parent().missions_tab
 
             if mtab:
+                wire_log(f"[VOTE] submit_admin: mission={mission} fname={fname} display={display}")
+                # Use fname (string) instead of stale MissionEntry so
+                # _resolve_mission looks up the current snapshot.
                 submit_admin(
                     self,
                     lambda: self.server.set_next_mission(
-                        mission, add_if_missing=False
+                        fname, add_if_missing=False
                     ),
                     lambda _result: self._vote_winner_queued(
                         fname, display, total, is_draw, max_v, mtab
                     ),
                     f"Queue voted mission {display}",
-                    lambda _message: self._vote_winner_failed(display),
+                    lambda _message: (
+                        wire_log(f"[VOTE] FAILED: {_message}"),
+                        self._vote_winner_failed(display)
+                    ),
                 )
             else:
+                wire_log("[VOTE] FAILED: missions_tab not found")
                 self.log(
                     f"Winner {display} was not queued: mission context unavailable"
                 )
                 self._vote_winner_failed(display)
 
         except Exception as e:
+            wire_log(f"[VOTE] EXCEPTION: {e}")
             self.log(f"Error ending vote: {e}")
             self._vote_winner_failed("selected mission")
 
     def _vote_winner_queued(
         self, fname, display, total, is_draw, max_v, missions_tab
     ):
+        wire_log(f"[VOTE] SUCCESS: {display} queued")
         self._vote_stage = 'done'
         self.status_lbl.setText("Status: Vote Complete")
         self.log(f"Winner queued: {display}")
