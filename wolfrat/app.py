@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
     QScrollArea, QMessageBox, QFrame, QListWidget, QListWidgetItem,
     QAbstractItemView, QMenu, QSlider, QPlainTextEdit, QTableView,
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QAbstractTableModel
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QAbstractTableModel, QThread
 from PyQt6.QtGui import QColor, QIcon, QTextCursor
 
 from wolfrat.protocol import (
@@ -6900,6 +6900,38 @@ class WebAdminTab(QWidget):
         self.ip_list.setText("\n".join(lines))
 
 
+class DownloadWorker(QThread):
+    progress = pyqtSignal(int)
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+    def __init__(self, url, dest):
+        super().__init__()
+        self.url = url
+        self.dest = dest
+
+    def run(self):
+        try:
+            import urllib.request
+            req = urllib.request.Request(self.url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=10) as response, open(self.dest, 'wb') as out_file:
+                total_size = int(response.getheader('Content-Length', 0))
+                downloaded = 0
+                chunk_size = 8192
+                while True:
+                    chunk = response.read(chunk_size)
+                    if not chunk:
+                        break
+                    out_file.write(chunk)
+                    downloaded += len(chunk)
+                    if total_size > 0:
+                        percent = int((downloaded / total_size) * 100)
+                        self.progress.emit(percent)
+            self.finished.emit(self.dest)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
 class MainWindow(QMainWindow):
     """WolfRAT 2.5.0 Main Window."""
 
@@ -7144,18 +7176,14 @@ class MainWindow(QMainWindow):
 
         status_bar.addSpacing(10)
 
-        self.update_btn = QPushButton("Update")
-        self.update_btn.setObjectName("updateBtn")
-        self.update_btn.setFixedHeight(20)
-        self.update_btn.setStyleSheet(
-            "font-size: 8pt; padding: 1px 8px; min-height: 0;"
-        )
-        self.update_btn.clicked.connect(self._check_for_updates)
-        status_bar.addWidget(self.update_btn)
-
         ver_label = QLabel("v2.5.0 · Built by BadgerLove · FMJ Squad")
         ver_label.setStyleSheet("font-size: 9pt; color: #444;")
         status_bar.addWidget(ver_label)
+
+        self.update_btn = QPushButton("Check for Updates")
+        self.update_btn.setStyleSheet("font-size: 8pt; padding: 2px 8px; background: #222; border: 1px solid #444; border-radius: 3px;")
+        self.update_btn.clicked.connect(self._check_for_updates)
+        status_bar.addWidget(self.update_btn)
 
         status_widget = QWidget()
         status_widget.setLayout(status_bar)
@@ -7173,8 +7201,8 @@ class MainWindow(QMainWindow):
             self.web_admin_tab.start_configured_server()
         if self.runtime.auto_connect_enabled:
             self._autoconnect_timer.start(500)
-        # Check for updates in background (non-blocking)
-        QTimer.singleShot(2000, self._check_for_updates)
+        # Check for updates in background (non-blocking, silent if up to date)
+        QTimer.singleShot(2000, self._auto_check_updates)
 
     def _refresh_web_led(self):
         self.update_web_led(self.web_server.is_running)
@@ -7206,62 +7234,126 @@ class MainWindow(QMainWindow):
     _VERSION_URL = "https://fmj-squad.com/version.json"
     _CURRENT_VERSION = "2.5.0"
 
+    def _auto_check_updates(self):
+        """Silent startup check — only pop up if update available."""
+        try:
+            import urllib.request, json
+            req = urllib.request.Request(self._VERSION_URL, headers={'User-Agent': 'Mozilla/5.0'})
+            resp = urllib.request.urlopen(req, timeout=5)
+            data = json.loads(resp.read())
+            wolfrat_data = data.get('wolfrat', {})
+            latest_version = wolfrat_data.get('version', self._CURRENT_VERSION)
+            if latest_version > self._CURRENT_VERSION:
+                self._show_update_dialog(wolfrat_data, latest_version)
+        except Exception:
+            pass  # Silent on failure
+
     def _check_for_updates(self):
-        """Fetch version.json in background and compare."""
-        import threading
-        def fetch():
-            try:
-                import urllib.request, json
-                req = urllib.request.Request(self._VERSION_URL, headers={'User-Agent': 'WolfRAT'})
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    data = json.loads(resp.read())
-                remote = data.get('wolfrat', {})
-                remote_ver = remote.get('version', '')
-                if remote_ver and remote_ver > self._CURRENT_VERSION:
-                    QTimer.singleShot(0, lambda: self._show_update_dialog(remote))
-            except Exception as e:
-                wire_log(f"Update check failed: {e}")
-        threading.Thread(target=fetch, daemon=True).start()
+        """Manual check — show popup either way."""
+        try:
+            import urllib.request, json
+            req = urllib.request.Request(
+                self._VERSION_URL,
+                headers={'User-Agent': 'Mozilla/5.0'}
+            )
+            resp = urllib.request.urlopen(req, timeout=5)
+            data = json.loads(resp.read())
 
-    def _show_update_dialog(self, remote):
-        """Show update dialog and start download if accepted."""
-        from PyQt6.QtWidgets import QMessageBox
-        ver = remote.get('version', '?')
-        notes = remote.get('notes', 'No release notes.')
-        msg = QMessageBox(self)
-        msg.setWindowTitle("WolfRAT Update Available")
-        msg.setIcon(QMessageBox.Icon.Information)
-        msg.setText(f"WolfRAT v{ver} is available.")
-        msg.setInformativeText(notes[:500])
-        msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        msg.setDefaultButton(QMessageBox.StandardButton.Yes)
-        if msg.exec() == QMessageBox.StandardButton.Yes:
-            self._download_update(remote)
+            wolfrat_data = data.get('wolfrat', {})
+            latest_version = wolfrat_data.get('version', self._CURRENT_VERSION)
 
-    def _download_update(self, remote):
-        """Download new exe in background thread."""
-        import threading
-        exe_url = remote.get('exe_url')
-        if not exe_url:
+            if latest_version > self._CURRENT_VERSION:
+                self._show_update_dialog(wolfrat_data, latest_version)
+            else:
+                QMessageBox.information(self, 'Up to Date', 'You are running the latest version of WolfRAT.')
+
+        except Exception as e:
+            QMessageBox.warning(self, 'Update Check Failed', f'Could not check for updates.\n\nError: {e}')
+
+    def _show_update_dialog(self, wolfrat_data, latest_version):
+        """Show the update dialog with scrollable changelog."""
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Update Available')
+        dlg.setMinimumSize(450, 350)
+        dlg.setMaximumSize(600, 500)
+        dlg.resize(500, 400)
+        layout = QVBoxLayout(dlg)
+
+        header = QLabel('A new version of WolfRAT is available!')
+        header.setStyleSheet('font-weight: bold; font-size: 11pt; color: #e8c840;')
+        layout.addWidget(header)
+
+        versions = QLabel(f'Current: v{self._CURRENT_VERSION}    \u2192    Latest: v{latest_version}')
+        versions.setStyleSheet('color: #a89830; font-size: 10pt;')
+        layout.addWidget(versions)
+
+        changelog = QTextEdit()
+        changelog.setReadOnly(True)
+        changelog.setPlainText(wolfrat_data.get('notes', 'No changelog available.'))
+        changelog.setStyleSheet(
+            "font-family: 'Segoe UI', Arial; font-size: 9pt; color: #e8c840; "
+            "background-color: #050500; border: 1px solid #1a1a00; padding: 6px;"
+        )
+        layout.addWidget(changelog, 1)
+
+        question = QLabel('Would you like to download and install it now?')
+        question.setStyleSheet('color: #e8c840; font-size: 10pt; padding-top: 6px;')
+        layout.addWidget(question)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        yes_btn = QPushButton('Yes')
+        yes_btn.setMinimumWidth(80)
+        yes_btn.clicked.connect(dlg.accept)
+        btn_row.addWidget(yes_btn)
+        no_btn = QPushButton('No')
+        no_btn.setMinimumWidth(80)
+        no_btn.clicked.connect(dlg.reject)
+        btn_row.addWidget(no_btn)
+        layout.addLayout(btn_row)
+
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._start_update_download(
+                wolfrat_data.get('exe_url', 'https://fmj-squad.com/downloads/WolfRAT2.exe')
+            )
+
+    def _start_update_download(self, url):
+        if not url:
+            QMessageBox.warning(self, 'Error', 'No download URL provided in the update config.')
             return
-        self.show_feedback("Downloading update...")
 
-        def download():
-            try:
-                import urllib.request
-                exe_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.getcwd()
-                target = os.path.join(exe_dir, 'WolfRAT2.exe.update')
-                urllib.request.urlretrieve(exe_url, target)
-                QTimer.singleShot(0, lambda: self._apply_update(target))
-            except Exception as e:
-                wire_log(f"Update download failed: {e}")
-                QTimer.singleShot(0, lambda: self.show_feedback(f"Update failed: {e}"))
-        threading.Thread(target=download, daemon=True).start()
+        from PyQt6.QtWidgets import QProgressDialog
+        self.progress_dialog = QProgressDialog('Downloading update...', 'Cancel', 0, 100, self)
+        self.progress_dialog.setWindowTitle('Updating WolfRAT')
+        self.progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        self.progress_dialog.setAutoClose(True)
+        self.progress_dialog.show()
 
-    def _apply_update(self, update_path):
-        """Write updater batch script and exit. The script swaps the exe."""
-        exe_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.getcwd()
-        current_exe = sys.executable if getattr(sys, 'frozen', False) else os.path.join(exe_dir, 'WolfRAT2.exe')
+        import tempfile
+        dest_path = os.path.join(tempfile.gettempdir(), 'WolfRAT2_update.exe')
+
+        self.dl_worker = DownloadWorker(url, dest_path)
+        self.dl_worker.progress.connect(self.progress_dialog.setValue)
+        self.dl_worker.finished.connect(self._on_download_finished)
+        self.dl_worker.error.connect(self._on_download_error)
+        self.progress_dialog.canceled.connect(self.dl_worker.terminate)
+        self.dl_worker.start()
+
+    def _on_download_error(self, err):
+        self.progress_dialog.close()
+        QMessageBox.warning(self, 'Download Failed', f'Failed to download update:\n\n{err}')
+
+    def _on_download_finished(self, dest_path):
+        self.progress_dialog.close()
+
+        if not getattr(sys, 'frozen', False):
+            QMessageBox.information(self, 'Update', 'Update downloaded! (Running from source, skipping update).')
+            return
+
+        current_exe = os.path.abspath(sys.executable)
+        exe_dir = os.path.dirname(current_exe)
         bat_path = os.path.join(exe_dir, '_update.bat')
 
         bat_content = (
@@ -7272,7 +7364,7 @@ class MainWindow(QMainWindow):
             '    timeout /t 1 /nobreak >nul\n'
             '    goto wait\n'
             ')\n'
-            f'move /y "{update_path}" "{current_exe}" >nul\n'
+            f'move /y "{dest_path}" "{current_exe}" >nul\n'
             f'start "" "{current_exe}"\n'
             'del "%~f0"\n'
         )
@@ -7280,8 +7372,11 @@ class MainWindow(QMainWindow):
             f.write(bat_content)
 
         import subprocess
-        subprocess.Popen(['cmd', '/c', bat_path], creationflags=subprocess.CREATE_NO_WINDOW)
-        wire_log("Update: exiting for swap")
+        subprocess.Popen(
+            ['cmd', '/c', bat_path],
+            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
+        )
+        wire_log('Update: exiting for swap')
         QApplication.quit()
 
     def flash_sync_led(self):
