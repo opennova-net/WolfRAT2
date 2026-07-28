@@ -7164,6 +7164,8 @@ class MainWindow(QMainWindow):
             self.web_admin_tab.start_configured_server()
         if self.runtime.auto_connect_enabled:
             self._autoconnect_timer.start(500)
+        # Check for updates in background (non-blocking)
+        QTimer.singleShot(2000, self._check_for_updates)
 
     def _refresh_web_led(self):
         self.update_web_led(self.web_server.is_running)
@@ -7189,6 +7191,92 @@ class MainWindow(QMainWindow):
 
     def _clear_feedback(self):
         self.feedback_label.setText("")
+
+    # ---- Auto-updater ---------------------------------------------------
+
+    _VERSION_URL = "https://fmj-squad.com/version.json"
+    _CURRENT_VERSION = "2.5.0"
+
+    def _check_for_updates(self):
+        """Fetch version.json in background and compare."""
+        import threading
+        def fetch():
+            try:
+                import urllib.request, json
+                req = urllib.request.Request(self._VERSION_URL, headers={'User-Agent': 'WolfRAT'})
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    data = json.loads(resp.read())
+                remote = data.get('wolfrat', {})
+                remote_ver = remote.get('version', '')
+                if remote_ver and remote_ver > self._CURRENT_VERSION:
+                    # Schedule dialog on Qt thread
+                    QTimer.singleShot(0, lambda: self._show_update_dialog(remote))
+            except Exception as e:
+                wire_log(f"Update check failed: {e}")
+        threading.Thread(target=fetch, daemon=True).start()
+
+    def _show_update_dialog(self, remote):
+        """Show update dialog and start download if accepted."""
+        from PyQt6.QtWidgets import QMessageBox
+        ver = remote.get('version', '?')
+        notes = remote.get('notes', 'No release notes.')
+        msg = QMessageBox(self)
+        msg.setWindowTitle("WolfRAT Update Available")
+        msg.setIcon(QMessageBox.Icon.Information)
+        msg.setText(f"WolfRAT v{ver} is available.")
+        msg.setInformativeText(notes[:500])
+        msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        msg.setDefaultButton(QMessageBox.StandardButton.Yes)
+        if msg.exec() == QMessageBox.StandardButton.Yes:
+            self._download_update(remote)
+
+    def _download_update(self, remote):
+        """Download new exe in background thread."""
+        import threading
+        exe_url = remote.get('exe_url')
+        if not exe_url:
+            return
+        self.show_feedback("Downloading update...")
+
+        def download():
+            try:
+                import urllib.request, tempfile
+                exe_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.getcwd()
+                target = os.path.join(exe_dir, 'WolfRAT2.exe.update')
+                urllib.request.urlretrieve(exe_url, target)
+                QTimer.singleShot(0, lambda: self._apply_update(target))
+            except Exception as e:
+                wire_log(f"Update download failed: {e}")
+                QTimer.singleShot(0, lambda: self.show_feedback(f"Update failed: {e}"))
+        threading.Thread(target=download, daemon=True).start()
+
+    def _apply_update(self, update_path):
+        """Write updater batch script and exit. The script swaps the exe."""
+        import tempfile
+        exe_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.getcwd()
+        current_exe = sys.executable if getattr(sys, 'frozen', False) else os.path.join(exe_dir, 'WolfRAT2.exe')
+        bat_path = os.path.join(exe_dir, '_update.bat')
+
+        # Batch script: wait for exe to exit, swap, restart, delete self
+        bat_content = f'''@echo off
+:wait
+tasklist /fi "imagename eq WolfRAT2.exe" | find "WolfRAT2.exe" >nul
+if not errorlevel 1 (
+    timeout /t 1 /nobreak >nul
+    goto wait
+)
+move /y "{update_path}" "{current_exe}" >nul
+start "" "{current_exe}"
+del "%~f0"
+'''
+        with open(bat_path, 'w') as f:
+            f.write(bat_content)
+
+        # Start the batch script and exit
+        import subprocess
+        subprocess.Popen(['cmd', '/c', bat_path], creationflags=subprocess.CREATE_NO_WINDOW)
+        wire_log("Update: exiting for swap")
+        QApplication.quit()
 
     def flash_sync_led(self):
         """Flash the sync LED green to indicate server data reception."""
