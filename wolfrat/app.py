@@ -1,4 +1,4 @@
-﻿"""
+"""
 WolfRAT 2.5.0 - Modern Joint Operations Server Admin Tool
 Replaces the original WolfRAT v0.95 (2005, MFC70)
 """
@@ -1009,7 +1009,7 @@ class ConsoleTab(QWidget):
         if not cmd:
             return
         if not self.server.is_connected:
-            self.log("âš  Not connected to server")
+            self.log("⚠ Not connected to server")
             return
         submit_admin(
             self,
@@ -1313,9 +1313,9 @@ class PlayersTab(QWidget):
             self, "Balance Teams",
             "This will move players from the bigger team to even things up.\n\n"
             "This will:\n"
-            "â€¢ Randomly select players from the bigger team\n"
-            "â€¢ Swap them to the other team\n"
-            "â€¢ Kill them so they respawn at the correct base\n"
+            "• Randomly select players from the bigger team\n"
+            "• Swap them to the other team\n"
+            "• Kill them so they respawn at the correct base\n"
             "\nContinue?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
@@ -1374,7 +1374,7 @@ class PlayersTab(QWidget):
 
             balance_text = f"Joint Ops: {len(team_a)} players ({score_a} kills)  |  Rebels: {len(team_b)} players ({score_b} kills)"
             if count_diff > 1 or diff > 10:
-                balance_text += "  âš  UNBALANCED"
+                balance_text += "  ⚠ UNBALANCED"
                 self.balance_label.setStyleSheet("font-size: 11pt; color: #ff6040; font-weight: bold;")
             else:
                 self.balance_label.setStyleSheet("font-size: 11pt; color: #a89830;")
@@ -2522,7 +2522,7 @@ class SettingsTab(QWidget):
         center_col.addWidget(ping_group)
 
         # --- Voting ---
-        vote_group = QGroupBox("ðŸŒ Map Voting")
+        vote_group = QGroupBox("🌐 Map Voting")
         vote_layout = QGridLayout()
 
         self.vote_enabled_cb = QCheckBox("Enable Map Voting (!vote / !yes)")
@@ -2921,14 +2921,14 @@ class SettingsTab(QWidget):
             self._show_feedback(f"Save failed: {e}")
 
     def _on_slider_pressed(self, key):
-        """Slider drag started â€” block all sends until release."""
+        """Slider drag started — block all sends until release."""
         self._slider_dragging[key] = True
         # Cancel any pending debounce from spinbox
         if key in self._debounce_timers:
             self._debounce_timers[key].stop()
 
     def _on_slider_released(self, key):
-        """Slider drag ended â€” send the final value immediately."""
+        """Slider drag ended — send the final value immediately."""
         self._slider_dragging[key] = False
         if key in self._sliders:
             slider, spin = self._sliders[key]
@@ -2937,7 +2937,7 @@ class SettingsTab(QWidget):
             self._send_debounced(key)
 
     def _on_spinbox_changed(self, key, value):
-        """Spinbox value changed â€” only debounce if slider is NOT being dragged."""
+        """Spinbox value changed — only debounce if slider is NOT being dragged."""
         if self._loading:
             return
         if self._slider_dragging.get(key, False):
@@ -3385,7 +3385,7 @@ class ChatBotTab(QWidget):
         action = self.bad_word_action.currentText()
         if word and word not in self.bad_words:
             self.bad_words[word] = action
-            self.bad_words_list.addItem(f"{word} â†’ {action}")
+            self.bad_words_list.addItem(f"{word} → {action}")
             self.bad_word_input.clear()
             self._save_config()
 
@@ -3393,7 +3393,7 @@ class ChatBotTab(QWidget):
         row = self.bad_words_list.currentRow()
         if row >= 0:
             item = self.bad_words_list.item(row)
-            word = item.text().split(' â†’ ')[0].strip()
+            word = item.text().split(' → ')[0].strip()
             self.bad_words.pop(word, None)
             self.bad_words_list.takeItem(row)
             self._save_config()
@@ -4142,7 +4142,7 @@ class SpreeTab(QWidget):
         self.first_blood_checkbox.stateChanged.connect(self._toggle_first_blood)
         spree_layout.addWidget(self.first_blood_checkbox)
 
-        spree_layout.addWidget(QLabel("Streak Thresholds (kill count â†’ announcement message):"))
+        spree_layout.addWidget(QLabel("Streak Thresholds (kill count → announcement message):"))
         self.spree_table = QTableWidget(0, 2)
         self.spree_table.setHorizontalHeaderLabels(["Kills", "Announcement Message"])
         self.spree_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
@@ -6032,7 +6032,7 @@ class MapVotingTab(QWidget):
     def _tick(self):
         import time
 
-        # Voting stage â€” uses local timer for vote duration (short, self-contained)
+        # Voting stage — uses local timer for vote duration (short, self-contained)
         if self._vote_stage == 'voting':
             vote_elapsed = time.time() - self._vote_start_time
             vote_dur_secs = self.duration_spin.value() * 60
@@ -6050,20 +6050,20 @@ class MapVotingTab(QWidget):
                 self._end_vote()
             return
 
-        # Done stage â€” nothing to do
+        # Done stage — nothing to do
         if self._vote_stage == 'done':
             return
 
-        # Idle stage â€” use server GameTime to decide when to fire
+        # Idle stage — use server GameTime to decide when to fire
         if self._vote_stage == 'idle':
             trigger_mins = self.trigger_spin.value()
 
-            # No server time yet â€” show waiting
+            # No server time yet — show waiting
             if not self._server_time_updated:
                 self.status_lbl.setText("Status: Waiting for server data...")
                 return
 
-            # Server time stale (>60s old) â€” show warning
+            # Server time stale (>60s old) — show warning
             if (time.time() - self._server_time_updated) > 60:
                 self.status_lbl.setText(f"Status: Server data stale ({self._server_game_time_remaining}m). Waiting for update...")
                 return
@@ -6460,7 +6460,7 @@ class WeaponsTab(QWidget):
         weapon_layout.addWidget(update_list_btn)
 
         warn_label = QLabel(
-            "âš ï¸ Warning: Changing weapon/armoury settings live can crash your server.\n"
+            "⚠️ Warning: Changing weapon/armoury settings live can crash your server.\n"
             "Game corrupts memory pointers when weapon configs change at runtime."
         )
         warn_label.setWordWrap(True)
@@ -6668,7 +6668,7 @@ class WebAdminTab(QWidget):
         layout.addWidget(desc)
 
         # Warning
-        warning = QLabel("âš ï¸ OFF by default. When enabled, the web server listens on your network. Ensure your firewall is configured.")
+        warning = QLabel("⚠️ OFF by default. When enabled, the web server listens on your network. Ensure your firewall is configured.")
         warning.setStyleSheet("color: #ff8040; font-size: 10pt; padding: 8px; background: #1a1000; border-radius: 6px;")
         warning.setWordWrap(True)
         layout.addWidget(warning)
@@ -6811,7 +6811,7 @@ class WebAdminTab(QWidget):
 
     def _observe_web_start(self, future):
         self._pending_web_start = future
-        self.status_label.setText("Startingâ€¦")
+        self.status_label.setText("Starting…")
         self.status_label.setStyleSheet(
             "font-size: 12pt; font-weight: bold; color: #e8c840;"
         )
@@ -6896,7 +6896,7 @@ class WebAdminTab(QWidget):
                 ago_str = f"{ago // 3600}h ago"
             else:
                 ago_str = f"{ago // 86400}d ago"
-            lines.append(f"â— {ip}  -  {time_str} ({ago_str})")
+            lines.append(f"● {ip}  -  {time_str} ({ago_str})")
         self.ip_list.setText("\n".join(lines))
 
 
@@ -7064,18 +7064,18 @@ class MainWindow(QMainWindow):
         self.signals.missions_signal.connect(self.spree_tab.on_missions_updated)
         self.signals.chat_signal.connect(self.map_voting_tab.on_chat)
 
-        self.tabs.addTab(self.server_tab, "ðŸ–¥ï¸ Server")
-        self.tabs.addTab(self.console_tab, "ðŸ‘¥ Console")
-        self.tabs.addTab(self.players_tab, "ðŸ‘¥ Players")
-        self.tabs.addTab(self.missions_tab, "ðŸ—ºï¸ Missions")
-        self.tabs.addTab(self.settings_tab, "âš™ï¸ Settings")
-        self.tabs.addTab(self.weapons_tab, "ðŸ”« Weapons")
-        self.tabs.addTab(self.chatbot_tab, "ðŸ’¬ Chat Bot")
-        self.tabs.addTab(self.messages_tab, "ðŸ“¢ Messages")
-        self.tabs.addTab(self.spree_tab, "ðŸ”¥ Sprees")
-        self.tabs.addTab(self.mods_tab, "ðŸ›¡ï¸ Mods")
-        self.tabs.addTab(self.map_voting_tab, "ðŸŒ Map Voting")
-        self.tabs.addTab(self.web_admin_tab, "ðŸŒ Web Admin")
+        self.tabs.addTab(self.server_tab, "🖥️ Server")
+        self.tabs.addTab(self.console_tab, "👥 Console")
+        self.tabs.addTab(self.players_tab, "👥 Players")
+        self.tabs.addTab(self.missions_tab, "🗺️ Missions")
+        self.tabs.addTab(self.settings_tab, "⚙️ Settings")
+        self.tabs.addTab(self.weapons_tab, "🔫 Weapons")
+        self.tabs.addTab(self.chatbot_tab, "💬 Chat Bot")
+        self.tabs.addTab(self.messages_tab, "📢 Messages")
+        self.tabs.addTab(self.spree_tab, "🔥 Sprees")
+        self.tabs.addTab(self.mods_tab, "🛡️ Mods")
+        self.tabs.addTab(self.map_voting_tab, "🌐 Map Voting")
+        self.tabs.addTab(self.web_admin_tab, "🌐 Web Admin")
 
         layout.addWidget(self.tabs)
 
@@ -7087,11 +7087,11 @@ class MainWindow(QMainWindow):
         status_bar.setContentsMargins(4, 2, 4, 2)
         status_bar.setSpacing(0)
 
-        self.status_connected_label = QLabel(" â— Disconnected ")
+        self.status_connected_label = QLabel(" ● Disconnected ")
         self.status_connected_label.setStyleSheet("font-size: 9pt; color: #ff6040; padding: 2px 8px;")
         status_bar.addWidget(self.status_connected_label)
 
-        sep1 = QLabel("â”‚")
+        sep1 = QLabel("│")
         sep1.setStyleSheet("color: #333; padding: 0 4px;")
         status_bar.addWidget(sep1)
 
@@ -7099,7 +7099,7 @@ class MainWindow(QMainWindow):
         self.status_mode_label.setStyleSheet("font-size: 9pt; color: #a89830; padding: 2px 8px;")
         status_bar.addWidget(self.status_mode_label)
 
-        sep2 = QLabel("â”‚")
+        sep2 = QLabel("│")
         sep2.setStyleSheet("color: #333; padding: 0 4px;")
         status_bar.addWidget(sep2)
 
@@ -7107,7 +7107,7 @@ class MainWindow(QMainWindow):
         self.status_map_label.setStyleSheet("font-size: 10pt; color: #ffff00; font-weight: bold; padding: 2px 8px;")
         status_bar.addWidget(self.status_map_label)
 
-        sep3 = QLabel("â”‚")
+        sep3 = QLabel("│")
         sep3.setStyleSheet("color: #333; padding: 0 4px;")
         status_bar.addWidget(sep3)
 
@@ -7115,7 +7115,7 @@ class MainWindow(QMainWindow):
         self.status_players_label.setStyleSheet("font-size: 9pt; color: #a89830; padding: 2px 8px;")
         status_bar.addWidget(self.status_players_label)
 
-        sep4 = QLabel("â”‚")
+        sep4 = QLabel("│")
         sep4.setStyleSheet("color: #333; padding: 0 4px;")
         status_bar.addWidget(sep4)
 
@@ -7123,16 +7123,16 @@ class MainWindow(QMainWindow):
         self.feedback_label.setStyleSheet("font-size: 9pt; color: #50ff50; padding: 2px 8px;")
         status_bar.addWidget(self.feedback_label, 1)  # stretch
 
-        self.sync_led_label = QLabel("â—")
+        self.sync_led_label = QLabel("●")
         self.sync_led_label.setStyleSheet("font-size: 10pt; color: #444444; padding: 2px 4px;")
         self.sync_led_label.setToolTip("Server Sync Activity")
         status_bar.addWidget(self.sync_led_label)
 
-        sep5 = QLabel("â”‚")
+        sep5 = QLabel("│")
         sep5.setStyleSheet("color: #333; padding: 0 4px;")
         status_bar.addWidget(sep5)
 
-        self.web_led_label = QLabel(" â— Web: Off ")
+        self.web_led_label = QLabel(" ● Web: Off ")
         self.web_led_label.setStyleSheet("font-size: 9pt; color: #555; padding: 2px 8px;")
         self.web_led_label.setToolTip("Web Admin Server Status")
         status_bar.addWidget(self.web_led_label)
@@ -7144,7 +7144,7 @@ class MainWindow(QMainWindow):
 
         status_bar.addSpacing(10)
 
-        ver_label = QLabel("v2.5.0 Â· Built by BadgerLove Â· FMJ Squad")
+        ver_label = QLabel("v2.5.0 · Built by BadgerLove · FMJ Squad")
         ver_label.setStyleSheet("font-size: 9pt; color: #444;")
         status_bar.addWidget(ver_label)
 
@@ -7172,10 +7172,10 @@ class MainWindow(QMainWindow):
 
     def set_connected(self, connected, text="Connected"):
         if connected:
-            self.status_connected_label.setText(" â— Connected ")
+            self.status_connected_label.setText(" ● Connected ")
             self.status_connected_label.setStyleSheet("font-size: 9pt; color: #50ff50; padding: 2px 8px;")
         else:
-            self.status_connected_label.setText(" â— Disconnected ")
+            self.status_connected_label.setText(" ● Disconnected ")
             self.status_connected_label.setStyleSheet("font-size: 9pt; color: #ff6040; padding: 2px 8px;")
 
     def _auto_connect_last(self):
@@ -7209,7 +7209,6 @@ class MainWindow(QMainWindow):
                 remote = data.get('wolfrat', {})
                 remote_ver = remote.get('version', '')
                 if remote_ver and remote_ver > self._CURRENT_VERSION:
-                    # Schedule dialog on Qt thread
                     QTimer.singleShot(0, lambda: self._show_update_dialog(remote))
             except Exception as e:
                 wire_log(f"Update check failed: {e}")
@@ -7240,7 +7239,7 @@ class MainWindow(QMainWindow):
 
         def download():
             try:
-                import urllib.request, tempfile
+                import urllib.request
                 exe_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.getcwd()
                 target = os.path.join(exe_dir, 'WolfRAT2.exe.update')
                 urllib.request.urlretrieve(exe_url, target)
@@ -7252,27 +7251,25 @@ class MainWindow(QMainWindow):
 
     def _apply_update(self, update_path):
         """Write updater batch script and exit. The script swaps the exe."""
-        import tempfile
         exe_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.getcwd()
         current_exe = sys.executable if getattr(sys, 'frozen', False) else os.path.join(exe_dir, 'WolfRAT2.exe')
         bat_path = os.path.join(exe_dir, '_update.bat')
 
-        # Batch script: wait for exe to exit, swap, restart, delete self
-        bat_content = f'''@echo off
-:wait
-tasklist /fi "imagename eq WolfRAT2.exe" | find "WolfRAT2.exe" >nul
-if not errorlevel 1 (
-    timeout /t 1 /nobreak >nul
-    goto wait
-)
-move /y "{update_path}" "{current_exe}" >nul
-start "" "{current_exe}"
-del "%~f0"
-'''
+        bat_content = (
+            '@echo off\n'
+            ':wait\n'
+            'tasklist /fi "imagename eq WolfRAT2.exe" | find "WolfRAT2.exe" >nul\n'
+            'if not errorlevel 1 (\n'
+            '    timeout /t 1 /nobreak >nul\n'
+            '    goto wait\n'
+            ')\n'
+            f'move /y "{update_path}" "{current_exe}" >nul\n'
+            f'start "" "{current_exe}"\n'
+            'del "%~f0"\n'
+        )
         with open(bat_path, 'w') as f:
             f.write(bat_content)
 
-        # Start the batch script and exit
         import subprocess
         subprocess.Popen(['cmd', '/c', bat_path], creationflags=subprocess.CREATE_NO_WINDOW)
         wire_log("Update: exiting for swap")
@@ -7293,10 +7290,10 @@ del "%~f0"
         """Update the web server status LED in the status bar."""
         if hasattr(self, 'web_led_label'):
             if running:
-                self.web_led_label.setText(" â— Web: On ")
+                self.web_led_label.setText(" ● Web: On ")
                 self.web_led_label.setStyleSheet("font-size: 9pt; color: #50ff50; padding: 2px 8px;")
             else:
-                self.web_led_label.setText(" â— Web: Off ")
+                self.web_led_label.setText(" ● Web: Off ")
                 self.web_led_label.setStyleSheet("font-size: 9pt; color: #555; padding: 2px 8px;")
 
     def update_status_map(self, text):
