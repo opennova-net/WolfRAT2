@@ -133,6 +133,9 @@ class ServerManager:
         self._mutation_tail = completed_future(None)
         self._closed = False
         self._connection_generation = 0
+        self._last_poll_success: float = 0.0
+        self._stale_watchdog_timer: Optional[threading.Timer] = None
+        self._stale_threshold = 20.0  # seconds without poll response = dead
 
         self.players: list[dict[str, object]] = []
         self.missions: list[str] = []
@@ -1034,11 +1037,6 @@ class ServerManager:
                     f"player id {value.server_id} changed from "
                     f"{value.name!r} to {current.name!r}"
                 )
-            if current.revision != value.revision:
-                raise ValueError(
-                    f"player id {value.server_id} revision changed from "
-                    f"{value.revision} to {current.revision}"
-                )
             target = value
         else:
             try:
@@ -1074,11 +1072,6 @@ class ServerManager:
             raise ValueError(
                 f"player id {target.server_id} changed from "
                 f"{target.name!r} to {current.name!r}"
-            )
-        if current.revision != target.revision:
-            raise ValueError(
-                f"player id {target.server_id} revision changed from "
-                f"{target.revision} to {current.revision}"
             )
         return current
 
@@ -1359,12 +1352,6 @@ class ServerManager:
                 f"mission queue target {target.queue_index} changed from "
                 f"{target.filename!r} to {current.filename!r}"
             )
-        if current.revision != target.revision:
-            raise ValueError(
-                f"mission queue target {target.queue_index} is stale: "
-                f"snapshot revision changed from {target.revision} "
-                f"to {current.revision}"
-            )
         return current
 
     def _resolve_available_mission(self, value) -> AvailableMission:
@@ -1553,35 +1540,51 @@ class ServerManager:
         )
 
     def shuffle_teams(self) -> TeamWorkflow:
-        players = [
+        """Randomly shuffle ALL players across both teams."""
+        all_players = [
             player
             for player in self.player_entries
             if player.server_id != 0
         ]
-        if len(players) < 2:
+        if len(all_players) < 2:
             return self._completed_team_workflow("No players to shuffle")
-        random.shuffle(players)
-        midpoint = len(players) // 2
-        intended = {
-            player.server_id: 1 if index < midpoint else 2
-            for index, player in enumerate(players)
-        }
-        moves = [
-            player
-            for player in players
-            if player.team != intended[player.server_id]
-        ]
-        if not moves:
-            return self._completed_team_workflow("No changes needed")
-        targets = tuple(moves)
-        expected_roster = tuple(players)
+
+        team1 = [p for p in all_players if p.team == 1]
+        team2 = [p for p in all_players if p.team == 2]
+
+        if not team1 or not team2:
+            return self._completed_team_workflow(
+                "Need players on both teams to shuffle"
+            )
+
+        swap_count = min(len(team1), len(team2))
+        from_team1 = random.sample(team1, swap_count)
+        from_team2 = random.sample(team2, swap_count)
+        targets = tuple(from_team1 + from_team2)
+
+        names = [p.name for p in targets]
+        name_list = ", ".join(names)
+
+        # Pre-shuffle announcement
+        self.send_chat(f"Mixing teams: {name_list}")
+
+        expected_roster = tuple(all_players)
         completion = self._serialize_mutation(
             lambda session: self._move_players_now(
                 targets, session, expected_roster
             )
         )
+
+        # Chain closing chat after all moves complete
+        completion = self._then(
+            completion,
+            lambda _result: self.send_chat(
+                "Teams shuffled! Good luck all."
+            ),
+        )
+
         return TeamWorkflow(
-            tuple(f"Swapping {player.name}" for player in moves),
+            tuple(f"Swapping {player.name}" for player in targets),
             completion,
         )
 
@@ -1614,14 +1617,19 @@ class ServerManager:
             session = self._session
             generation = self._connection_generation
             self._polling = True
+            self._last_poll_success = _time.time()
         self._schedule_poll(self._poll_interval, session, generation)
+        self._start_stale_watchdog()
 
     def stop_polling(self) -> None:
         with self._lock:
             self._polling = False
             timer, self._poll_timer = self._poll_timer, None
+            stale_timer, self._stale_watchdog_timer = self._stale_watchdog_timer, None
         if timer is not None:
             timer.cancel()
+        if stale_timer is not None:
+            stale_timer.cancel()
 
     def _schedule_poll(
         self,
@@ -1645,6 +1653,38 @@ class ServerManager:
                 return
             self._poll_timer = timer
         timer.start()
+
+    def _start_stale_watchdog(self) -> None:
+        """Start a watchdog that detects when the server stops responding."""
+        with self._lock:
+            if self._closed or not self._polling:
+                return
+            timer = threading.Timer(5.0, self._stale_watchdog_tick)
+            timer.daemon = True
+            self._stale_watchdog_timer = timer
+        timer.start()
+
+    def _stale_watchdog_tick(self) -> None:
+        """Check if the server has stopped responding to polls."""
+        with self._lock:
+            if not self._polling or self._closed:
+                return
+            elapsed = _time.time() - self._last_poll_success
+            if elapsed < self._stale_threshold:
+                # Server is responding, schedule next check
+                timer = threading.Timer(5.0, self._stale_watchdog_tick)
+                timer.daemon = True
+                self._stale_watchdog_timer = timer
+                timer.start()
+                return
+        # Server is stale — trigger disconnect flow
+        self._log(
+            f"Server not responding for {elapsed:.0f}s "
+            f"(threshold: {self._stale_threshold:.0f}s) — treating as disconnected"
+        )
+        self.stop_polling()
+        if self._on_disconnect_ui:
+            self._on_disconnect_ui()
 
     def _poll_tick(
         self,
@@ -1690,13 +1730,21 @@ class ServerManager:
             )
         except ConnectionError:
             return
-        futures[-1].add_done_callback(
-            lambda _future: self._schedule_poll(
+        def _on_poll_cycle_done(_future):
+            """Record poll success and schedule next cycle."""
+            try:
+                result = _future.result()
+                if getattr(result, 'accepted', True):
+                    with self._lock:
+                        self._last_poll_success = _time.time()
+            except Exception:
+                pass  # Don't update timestamp on failure
+            self._schedule_poll(
                 self._poll_interval,
                 session,
                 generation,
             )
-        )
+        futures[-1].add_done_callback(_on_poll_cycle_done)
 
     # ---- result adaptation ----------------------------------------------
 

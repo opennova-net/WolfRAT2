@@ -237,7 +237,7 @@ class RetailAdminSession:
         password: str = "",
         *,
         transport_factory: Callable[[], ByteTransport] = SocketTransport,
-        timeout: float = 5.0,
+        timeout: float = 15.0,
     ) -> None:
         self._validate_credential("username", username)
         self._validate_credential("password", password)
