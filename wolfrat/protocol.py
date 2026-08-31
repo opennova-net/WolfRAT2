@@ -135,7 +135,10 @@ class ServerManager:
         self._connection_generation = 0
         self._last_poll_success: float = 0.0
         self._stale_watchdog_timer: Optional[threading.Timer] = None
-        self._stale_threshold = 20.0  # seconds without poll response = dead
+        # Must survive several failed poll cycles. The socket timeout is 15s
+        # and JO freezes 5-15s during map loads, so 20s tripped on ordinary
+        # map changes and forced a needless reconnect.
+        self._stale_threshold = 60.0  # seconds without poll response = dead
 
         self.players: list[dict[str, object]] = []
         self.missions: list[str] = []
@@ -1682,7 +1685,12 @@ class ServerManager:
             f"Server not responding for {elapsed:.0f}s "
             f"(threshold: {self._stale_threshold:.0f}s) — treating as disconnected"
         )
-        self.stop_polling()
+        # Tear the connection down for real, then tell the UI. disconnect()
+        # closes the socket, clears _session and bumps the connection
+        # generation, so ServerManager.is_connected becomes False. Without it
+        # the UI reconnect tick sees is_connected == True and refuses to
+        # reconnect, stranding the client silently.
+        self.disconnect()
         if self._on_disconnect_ui:
             self._on_disconnect_ui()
 
@@ -1729,16 +1737,25 @@ class ServerManager:
                 ),
             )
         except ConnectionError:
+            # Keep the loop alive. _schedule_poll bails out by itself if the
+            # session is genuinely gone, and the watchdog then takes over.
+            self._schedule_poll(self._poll_interval, session, generation)
             return
+
         def _on_poll_cycle_done(_future):
             """Record poll success and schedule next cycle."""
-            try:
-                result = _future.result()
+            # Any accepted command proves the server is alive. Keying this off
+            # game_settings alone meant one rejected settings read looked
+            # identical to a dead server.
+            for poll_future in futures:
+                try:
+                    result = poll_future.result(timeout=0)
+                except Exception:
+                    continue
                 if getattr(result, 'accepted', True):
                     with self._lock:
                         self._last_poll_success = _time.time()
-            except Exception:
-                pass  # Don't update timestamp on failure
+                    break
             self._schedule_poll(
                 self._poll_interval,
                 session,
