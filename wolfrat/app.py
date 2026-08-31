@@ -1,5 +1,5 @@
 """
-WolfRAT 2.5.3 - Modern Joint Operations Server Admin Tool
+WolfRAT 2.5.7 - Modern Joint Operations Server Admin Tool
 Replaces the original WolfRAT v0.95 (2005, MFC70)
 """
 
@@ -6967,7 +6967,7 @@ class DownloadWorker(QThread):
 
 
 class MainWindow(QMainWindow):
-    """WolfRAT 2.5.3 Main Window."""
+    """WolfRAT 2.5.7 Main Window."""
 
     def __init__(self, runtime: DesktopRuntime | None = None):
         super().__init__()
@@ -6986,7 +6986,7 @@ class MainWindow(QMainWindow):
         self._sync_led_timer = QTimer(self)
         self._sync_led_timer.setSingleShot(True)
         self._sync_led_timer.timeout.connect(self._clear_sync_led)
-        self.setWindowTitle("WolfRAT 2.5.3 - Joint Operations Server Admin")
+        self.setWindowTitle("WolfRAT 2.5.7 - Joint Operations Server Admin")
 
         # Set Window Icon
         icon_path = os.path.join(os.path.dirname(__file__), 'icon.ico')
@@ -7060,7 +7060,7 @@ class MainWindow(QMainWindow):
         self.signals.connected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.connected_signal.connect(lambda: sounds.play("connect"))
         self.signals.disconnected_signal.connect(lambda: self.set_connected(False, 'Disconnected'))
-        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.5.3 - Joint Operations Server Admin"))
+        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.5.7 - Joint Operations Server Admin"))
         self.signals.disconnected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.disconnected_signal.connect(lambda: self.server_tab.handle_disconnect_ui())
         self.signals.reconnecting_signal.connect(lambda attempt: self.set_connected(False, f'Reconnecting (Attempt {attempt})...'))
@@ -7071,9 +7071,9 @@ class MainWindow(QMainWindow):
     def _update_title(self, server_name=""):
         """Update window title with server name when connected."""
         if server_name:
-            self.setWindowTitle(f"WolfRAT 2.5.3 \u2014 {server_name}")
+            self.setWindowTitle(f"WolfRAT 2.5.7 \u2014 {server_name}")
         else:
-            self.setWindowTitle("WolfRAT 2.5.3 - Joint Operations Server Admin")
+            self.setWindowTitle("WolfRAT 2.5.7 - Joint Operations Server Admin")
 
     def _build_ui(self):
         central = QWidget()
@@ -7081,7 +7081,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(central)
 
         # Header
-        header = QLabel("WolfRAT 2.5.3")
+        header = QLabel("WolfRAT 2.5.7")
         header.setStyleSheet("font-size: 22pt; font-weight: bold; color: #e8c840; padding: 12px; letter-spacing: 4px;")
         header.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(header)
@@ -7210,7 +7210,7 @@ class MainWindow(QMainWindow):
 
         status_bar.addSpacing(10)
 
-        ver_label = QLabel("v2.5.3 · Built by BadgerLove · FMJ Squad")
+        ver_label = QLabel("v2.5.7 · Built by BadgerLove · FMJ Squad")
         ver_label.setStyleSheet("font-size: 9pt; color: #444;")
         status_bar.addWidget(ver_label)
 
@@ -7266,7 +7266,7 @@ class MainWindow(QMainWindow):
     # ---- Auto-updater ---------------------------------------------------
 
     _VERSION_URL = "https://fmj-squad.com/version.json"
-    _CURRENT_VERSION = "2.5.3"
+    _CURRENT_VERSION = "2.5.7"
 
     def _auto_check_updates(self):
         """Silent startup check — only pop up if update available."""
@@ -7389,74 +7389,33 @@ class MainWindow(QMainWindow):
         current_exe = os.path.abspath(sys.executable)
         exe_dir = os.path.dirname(current_exe)
         bat_path = os.path.join(exe_dir, '_update.bat')
+        log_path = os.path.join(exe_dir, '_update.log')
 
-        # Write a Python helper instead of batch — avoids tasklist/findstr pipe hangs
-        helper_path = os.path.join(exe_dir, '_update_helper.py')
-        helper_content = f'''
-import os, sys, time, subprocess, shutil
-
-src = r"{dest_path}"
-dst = r"{current_exe}"
-log = r"{exe_dir}\\_update.log"
-
-def log_msg(msg):
-    try:
-        with open(log, "a") as f:
-            f.write(f"[{{time.strftime("%Y-%m-%d %H:%M:%S")}}] {{msg}}\\n")
-    except: pass
-
-log_msg("Update helper started")
-
-# Wait for WolfRAT to exit (check if exe is locked)
-for i in range(60):
-    try:
-        # Try to open the exe exclusively — if it's still running, this will fail
-        with open(dst, "r+b") as f:
-            pass
-        break
-    except (PermissionError, OSError):
-        time.sleep(2)
-    except Exception as e:
-        log_msg(f"Unexpected error: {{e}}")
-        time.sleep(2)
-else:
-    log_msg("WARNING: Could not lock exe after 120s, attempting move anyway")
-
-log_msg("WolfRAT exited, swapping exe")
-
-if not os.path.exists(src):
-    log_msg(f"ERROR: temp file missing: {{src}}")
-    sys.exit(1)
-
-try:
-    shutil.move(src, dst)
-    log_msg("Update complete, launching")
-except Exception as e:
-    log_msg(f"ERROR: move failed: {{e}}")
-    # Try copy+delete as fallback
-    try:
-        shutil.copy2(src, dst)
-        os.remove(src)
-        log_msg("Update complete (copy fallback), launching")
-    except Exception as e2:
-        log_msg(f"ERROR: copy fallback failed: {{e2}}")
-        sys.exit(1)
-
-subprocess.Popen([dst], close_fds=True)
-
-# Clean up self
-try:
-    os.remove(__file__)
-except: pass
-'''
-        with open(helper_path, 'w') as f:
-            f.write(helper_content)
+        bat_content = (
+            '@echo off\n'
+            f'echo [%date% %time%] Update started >> "{log_path}"\n'
+            ':wait\n'
+            'tasklist /fi "imagename eq WolfRAT2.exe" | findstr /i "WolfRAT2.exe" >nul\n'
+            'if not errorlevel 1 (\n'
+            '    ping -n 2 127.0.0.1 >nul\n'
+            '    goto wait\n'
+            ')\n'
+            f'echo [%date% %time%] WolfRAT closed, moving update >> "{log_path}"\n'
+            f'move /y "{dest_path}" "{current_exe}" >> "{log_path}" 2>&1\n'
+            f'if errorlevel 1 echo [%date% %time%] ERROR: move failed >> "{log_path}"\n'
+            f'echo [%date% %time%] Update complete, launching >> "{log_path}"\n'
+            f'start "" "{current_exe}"\n'
+            'del "%~f0"\n'
+        )
+        with open(bat_path, 'w') as f:
+            f.write(bat_content)
 
         import subprocess
+        # CREATE_NO_WINDOW only. Combining it with DETACHED_PROCESS stops the
+        # batch completing (proven by test: swapped=False with DETACHED).
         subprocess.Popen(
-            [sys.executable, helper_path],
-            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
-            close_fds=True,
+            ['cmd', '/c', bat_path],
+            creationflags=subprocess.CREATE_NO_WINDOW
         )
         wire_log('Update: exiting for swap')
         QApplication.quit()
@@ -7546,7 +7505,7 @@ def start_desktop(
 
     runtime = runtime or DesktopRuntime.production()
     app.setStyleSheet(DARK_STYLE)
-    app.setApplicationName("WolfRAT 2.5.3")
+    app.setApplicationName("WolfRAT 2.5.7")
     sounds.set_enabled(runtime.audio_enabled)
     if runtime.audio_enabled:
         sounds.initialize()
@@ -7655,7 +7614,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
         print(f"WolfRAT startup error: {error}")
         return 2
     runtime = runtime or launch.runtime
-    wire_log("=== WolfRAT 2.5.3 STARTED ===")
+    wire_log("=== WolfRAT 2.5.7 STARTED ===")
 
     # Catch-all exception handler for debugging
     import traceback
@@ -7708,7 +7667,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
 
             bstats.bstats_start(
                 "wolfrat",
-                "2.5.3",
+                "2.5.7",
                 data_dir=runtime.data_dir,
             )
         except Exception:
