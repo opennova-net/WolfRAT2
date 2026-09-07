@@ -333,7 +333,9 @@ def parse_players(payload: str, revision: int) -> tuple[PlayerEntry, ...]:
 
 
 _MISSION_RE = re.compile(
-    r"^\s*(?P<index>\d+):\s+(?P<file>\S+\.(?:BMS|NPJ|NPZ))\s+-\s+"
+    # Filenames may contain spaces (e.g. "AS - Black Rock TAC.npj"), so match
+    # lazily up to the extension rather than requiring a single \S+ token.
+    r"^\s*(?P<index>\d+):\s+(?P<file>.+?\.(?:BMS|NPJ|NPZ))\s+-\s+"
     r"(?P<double>\(2x\)|\(\))\s+"
     r"(?P<flipped>\(IS FLIPPED\)|\(\))\s+"
     r"(?P<oneshot>\(ONE_SHOT\)|\(\))\s+"
@@ -720,7 +722,18 @@ class AdminCommands:
 
 def _validate_mission_filename(filename: str) -> str:
     filename = _validate_argument(filename)
-    if any(ch.isspace() for ch in filename) or "/" in filename or "\\" in filename:
+    if any(ch.isspace() for ch in filename):
+        # The JO admin port splits every command on whitespace with no quote
+        # handling, so a filename containing spaces can never reach the server
+        # intact ("AS - Black Rock TAC.npj" arrives as "AS").  Such maps can
+        # still be listed/managed once in the rotation (via game.cfg or the
+        # launcher), but cannot be added remotely by any admin tool.
+        raise ValueError(
+            f"'{filename}' has spaces in its filename; the JO admin port cannot "
+            "add it remotely. Use a copy without spaces (e.g. AS-MapName.npj) "
+            "or add it in game.cfg"
+        )
+    if "/" in filename or "\\" in filename:
         raise ValueError("mission filename must be one retail catalog basename")
     if not re.search(r"\.(?:bms|npj|npz)$", filename, re.IGNORECASE):
         raise ValueError("mission filename must end in .bms, .npj, or .npz")

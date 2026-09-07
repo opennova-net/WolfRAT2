@@ -1,1 +1,1 @@
-"""WolfRAT 2.5.8 package."""
+"""WolfRAT 2.5.9 package."""

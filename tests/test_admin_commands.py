@@ -386,6 +386,25 @@ class RetailParserTests(unittest.TestCase):
         self.assertTrue(missions[1].is_next)
         self.assertTrue(missions[1].one_shot)
 
+    def test_mission_parser_accepts_filenames_with_spaces(self):
+        # Real rows from a TAC-mod server (v2.5.8 rejected these as malformed).
+        payload = (
+            "0: AS - Black Rock TAC.npj - () () () <CURRENT MISSION> <>\n"
+            "1: AS - Dormant Volcano TAC.npj - (2x) () () <> <NEXT MISSION>\n"
+            "2: DM-COD4Killhouse.npj - () () () <> <>\n"
+        )
+        missions = parse_missions(payload, revision=9)
+        self.assertEqual(
+            [m.filename for m in missions],
+            ["AS - Black Rock TAC.npj", "AS - Dormant Volcano TAC.npj", "DM-COD4Killhouse.npj"],
+        )
+        self.assertTrue(missions[0].is_current)
+        self.assertTrue(missions[1].double_time)
+        self.assertTrue(missions[1].is_next)
+        # Structure is still enforced: a row missing the " - " separator fails.
+        with self.assertRaises(ValueError):
+            parse_missions("1: AS - Black Rock TAC.npj () () () <> <>\n", revision=9)
+
     def test_available_weapon_and_settings_parsers_are_typed(self):
         available = parse_available_missions(
             "0. CP08.BMS (Operation Copperhead)\n1. DM-DUST.NPZ (Dust)\n",
