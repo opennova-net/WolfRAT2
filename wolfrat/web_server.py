@@ -564,81 +564,65 @@ class WolfWebServer:
     def _find_mission_entry(
         self, filename=None, *, queue_index=None, revision=None
     ):
-        """Resolve an exact queue identity, never a guessed duplicate name."""
+        """Resolve the mission the admin tapped against the current queue.
+
+        ``revision`` is accepted and ignored. The session bumps it on every
+        command, so the queue gets a new one each 5 s poll and an exact match
+        rejected nearly every tap made from a phone. Filename is the identity;
+        the queue index only picks between duplicates of the same file.
+        """
         missions = tuple(self.sm.mission_entries)
         target_name = str(filename or '').strip()
+        if not target_name:
+            raise ValueError("mission identity requires a filename")
         name_matches = [
             mission
             for mission in missions
             if mission.filename.casefold() == target_name.casefold()
-        ] if target_name else []
+        ]
 
-        if queue_index is None or str(queue_index).strip() == '':
-            if len(name_matches) > 1:
-                raise AmbiguousMissionTarget(
-                    f"mission filename {target_name!r} is ambiguous; "
-                    "send its queue index and revision"
-                )
-            raise ValueError(
-                "mission identity requires queue index, filename, and revision"
-            )
-        if not target_name or revision is None or str(revision).strip() == '':
-            raise ValueError(
-                "mission identity requires queue index, filename, and revision"
-            )
+        target_index = None
+        if queue_index is not None and str(queue_index).strip() != '':
+            try:
+                target_index = int(queue_index)
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    "mission queue index must be an integer"
+                ) from error
+            if target_index < 0:
+                raise ValueError("mission queue index cannot be negative")
 
-        try:
-            target_index = int(queue_index)
-            target_revision = int(revision)
-        except (TypeError, ValueError) as error:
-            raise ValueError(
-                "mission queue index and revision must be integers"
-            ) from error
-        if target_index < 0 or target_revision < 0:
-            raise ValueError(
-                "mission queue index and revision cannot be negative"
+        if target_index is not None:
+            for mission in name_matches:
+                if mission.queue_index == target_index:
+                    return mission
+        if len(name_matches) == 1:
+            # The queue shifted under the phone; the file is still unambiguous.
+            return name_matches[0]
+        if not name_matches:
+            raise StaleMissionTarget(
+                f"stale mission identity: {target_name!r} is no longer "
+                "in the queue"
             )
-        mission = next(
-            (
-                item
-                for item in missions
-                if item.queue_index == target_index
-            ),
-            None,
+        raise AmbiguousMissionTarget(
+            f"mission filename {target_name!r} is ambiguous; "
+            "refresh and pick the queue entry again"
         )
-        if mission is None:
-            raise StaleMissionTarget(
-                f"stale mission identity: queue index {target_index} "
-                "is no longer present"
-            )
-        if mission.filename.casefold() != target_name.casefold():
-            raise StaleMissionTarget(
-                f"stale mission identity: queue index {target_index} is "
-                f"{mission.filename!r}, not {target_name!r}"
-            )
-        if mission.revision != target_revision:
-            raise StaleMissionTarget(
-                f"stale mission identity: revision changed from "
-                f"{target_revision} to {mission.revision}"
-            )
-        return mission
 
-    def _find_player_entry(self, player_id, name, revision):
-        """Resolve a complete player identity against the current snapshot."""
+    def _find_player_entry(self, player_id, name, revision=None):
+        """Resolve the player the admin tapped against the current roster.
+
+        Id + name is the guard against a reused slot. ``revision`` is accepted
+        and ignored: it changes on every 5 s poll whether or not the player
+        did, so matching it exactly failed most taps from the web panel.
+        """
         target_name = str(name or '').strip()
-        if not target_name or revision is None or str(revision).strip() == '':
-            raise ValueError(
-                "player identity requires id, name, and revision"
-            )
+        if not target_name:
+            raise ValueError("player identity requires id and name")
         try:
             target_id = int(player_id)
-            target_revision = int(revision)
         except (TypeError, ValueError) as error:
-            raise ValueError(
-                "player id and revision must be integers"
-            ) from error
-        if target_revision < 0:
-            raise ValueError("player revision cannot be negative")
+            raise ValueError("player id must be an integer") from error
 
         player = next(
             (
@@ -656,11 +640,6 @@ class WolfWebServer:
             raise StalePlayerTarget(
                 f"stale player identity: id {target_id} is now "
                 f"{player.name!r}, not {target_name!r}"
-            )
-        if player.revision != target_revision:
-            raise StalePlayerTarget(
-                f"stale player identity: revision changed from "
-                f"{target_revision} to {player.revision}"
             )
         return player
 
@@ -734,7 +713,8 @@ class WolfWebServer:
                     secrets.compare_digest(token, valid_token)):
                 # Track IP
                 ip = request.remote or 'unknown'
-                self._login_ips[ip] = time.time()
+                with self._auth_lock:
+                    self._login_ips[ip] = time.time()
                 wire_log(f"WEB AUTH: {username} logged in from {ip}")
                 # Notify for persistence
                 if self.on_login:
@@ -948,7 +928,9 @@ class WolfWebServer:
                 'kick': lambda: self.sm.punt_player(player),
                 'ban': lambda: self.sm.ban_player(player),
                 'kill': lambda: self.sm.kill_player(player),
-                'swap': lambda: self.sm.swap_player(player),
+                # SWAPTEAM flips the player where they stand, alive among their
+                # old team. Kill straight after, as !swap and !switch do.
+                'swap': lambda: self.sm.swap_and_kill(player, player.name),
                 'zero': lambda: self.sm.zero_player(player),
             }
 

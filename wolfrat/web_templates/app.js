@@ -7,6 +7,7 @@ let authToken = localStorage.getItem('wolfauth') || sessionStorage.getItem('wolf
 let savedUser = localStorage.getItem('wolfuser') || '';
 let savedToken = localStorage.getItem('wolftoken') || '';
 let pendingChatTexts = [];
+let operationResultTimer = null;
 
 function operationResultSurface() {
     let surface = document.getElementById('operation-result');
@@ -38,25 +39,29 @@ function operationResultSurface() {
 function renderOperationResult(data, context = {}) {
     const result = data && typeof data === 'object' ? data : {};
     let outcome = 'error';
-    if (result.accepted === false || result.ok === false) {
+    if (result.accepted === true) {
+        // The server took the command. A read-back that did not confirm it is
+        // its own outcome: the server did not reject anything.
+        if (result.verified === true) outcome = 'verified';
+        else if (result.verified === undefined && result.ok !== false) outcome = 'accepted';
+        else outcome = 'unverified';
+    } else if (result.accepted === false || result.ok === false) {
         outcome = 'rejected';
-    } else if (result.verified === false) {
-        outcome = 'rejected';
-    } else if (result.verified === true) {
-        outcome = 'verified';
-    } else if (result.accepted === true || (result.accepted === undefined && result.ok === true)) {
+    } else if (result.ok === true) {
         outcome = 'accepted';
     }
 
     const labels = {
         accepted: 'Accepted',
         rejected: 'Rejected',
+        unverified: 'Unverified',
         error: 'Error',
         verified: 'Verified',
     };
     const colors = {
         accepted: ['#173517', '#50ff50'],
         rejected: ['#3a1a1a', '#ff6040'],
+        unverified: ['#38300f', '#ffc840'],
         error: ['#3a1a1a', '#ff6040'],
         verified: ['#182c38', '#60c8ff'],
     };
@@ -72,7 +77,7 @@ function renderOperationResult(data, context = {}) {
     );
     const detail = result.verification_error
         || result.error
-        || (unverified ? 'Retail ACK was not independently verified' : '')
+        || (unverified ? 'sent, but the read-back did not confirm it' : '')
         || replies[replies.length - 1]
         || subject;
     const message = detail === subject
@@ -86,6 +91,8 @@ function renderOperationResult(data, context = {}) {
     surface.style.color = colors[outcome][1];
     surface.style.borderColor = colors[outcome][1];
     surface.style.display = 'block';
+    clearTimeout(operationResultTimer);
+    operationResultTimer = setTimeout(() => { surface.style.display = 'none'; }, 8000);
     return { ...result, outcome };
 }
 
@@ -214,7 +221,34 @@ document.querySelectorAll('.nav-btn').forEach(btn => {
 });
 
 // --- WebSocket ---
+// A browser never reveals why a WebSocket handshake failed, so ask the API.
+async function tokenWasRejected() {
+    try {
+        const response = await fetch('/api/status', {
+            headers: { 'Authorization': 'Bearer ' + authToken },
+        });
+        return response.status === 401;
+    } catch (error) {
+        return false;  // WolfRAT itself is unreachable; keep retrying
+    }
+}
+
+function showLogin(message) {
+    authToken = null;
+    localStorage.removeItem('wolfauth');
+    sessionStorage.removeItem('wolfauth');
+    if (ws) { ws.onclose = null; try { ws.close(); } catch (error) {} ws = null; }
+    document.getElementById('conn-overlay').classList.add('hidden');
+    document.getElementById('app').classList.add('hidden');
+    document.getElementById('login-overlay').classList.remove('hidden');
+    const err = document.getElementById('login-error');
+    err.textContent = message;
+    err.classList.remove('hidden');
+}
+
 function connectWS() {
+    if (!authToken) return;
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     ws = new WebSocket(proto + '//' + location.host + '/ws?token=' + encodeURIComponent(authToken));
 
@@ -225,7 +259,7 @@ function connectWS() {
             document.getElementById('app').classList.remove('hidden');
         }, 500);
         document.getElementById('conn-dot').className = 'conn-dot connected';
-        if (reconnectTimer) { clearInterval(reconnectTimer); reconnectTimer = null; }
+        if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     };
 
     ws.onmessage = (event) => {
@@ -237,11 +271,15 @@ function connectWS() {
 
     ws.onclose = () => {
         document.getElementById('conn-dot').className = 'conn-dot disconnected';
-        if (!reconnectTimer) {
-            reconnectTimer = setInterval(() => {
-                connectWS();
-            }, 3000);
-        }
+        if (reconnectTimer) return;
+        reconnectTimer = setTimeout(async () => {
+            reconnectTimer = null;
+            if (await tokenWasRejected()) {
+                showLogin('Access token no longer valid - log in again');
+                return;
+            }
+            connectWS();
+        }, 3000);
     };
 
     ws.onerror = () => {};
@@ -298,19 +336,13 @@ function renderPlayers(players) {
     if (!players.length) { el.innerHTML = '<p class="empty">No players connected</p>'; return; }
     el.innerHTML = players.map(p => {
         const playerId = Number(p.id);
-        const revision = Number(p.revision);
         const playerName = String(p.name || '');
-        if (
-            !Number.isInteger(playerId)
-            || !Number.isInteger(revision)
-            || !playerName
-        ) return '';
+        if (!Number.isInteger(playerId) || !playerName) return '';
         const teamClass = p.team === '1' ? 'team-1' : p.team === '2' ? 'team-2' : '';
         const teamLabel = p.team_name || p.team || '?';
         return `<div class="player-item"
             data-player-id="${playerId}"
             data-player-name="${esc(playerName)}"
-            data-player-revision="${revision}"
             onclick="openActionSheetFromElement(this)">
             <div class="player-info">
                 <div class="player-name">${esc(playerName)}</div>
@@ -339,21 +371,15 @@ function renderMaps(missions) {
     if (!missions.length) { el.innerHTML = '<p class="empty">No maps loaded</p>'; return; }
     el.innerHTML = missions.map(mission => {
         const queueIndex = Number(mission.queue_index);
-        const revision = Number(mission.revision);
         const filename = String(mission.filename || '');
         const missionName = String(
             mission.display_name
             || filename.replace(/\.(bms|npj|npz)$/i, '')
         );
-        if (
-            !Number.isInteger(queueIndex)
-            || !Number.isInteger(revision)
-            || !filename
-        ) return '';
+        if (!Number.isInteger(queueIndex) || !filename) return '';
         return `<div class="map-item ${mission.is_current ? 'current' : ''}"
             data-queue-index="${queueIndex}"
             data-filename="${esc(filename)}"
-            data-mission-revision="${revision}"
             onclick="switchMapFromElement(this)">
             <span class="map-index">${queueIndex}</span>${esc(missionName)}
         </div>`;
@@ -403,15 +429,14 @@ function switchMapFromElement(element) {
     return switchMap(
         Number(element.dataset.queueIndex),
         element.dataset.filename,
-        Number(element.dataset.missionRevision),
     );
 }
 
-function switchMap(queueIndex, filename, revision) {
+function switchMap(queueIndex, filename) {
     if (!confirm('Switch to ' + filename + '?')) return;
     return submitHttpOperation(
         '/api/map/switch',
-        { index: queueIndex, map: filename, revision },
+        { index: queueIndex, map: filename },
         { label: `Switch to ${filename}` },
     );
 }
@@ -421,12 +446,11 @@ function openActionSheetFromElement(element) {
     return openActionSheet(
         element.dataset.playerId,
         element.dataset.playerName,
-        Number(element.dataset.playerRevision),
     );
 }
 
-function openActionSheet(pid, name, revision) {
-    selectedPlayer = { pid, name, revision };
+function openActionSheet(pid, name) {
+    selectedPlayer = { pid, name };
     document.getElementById('action-player-name').textContent = name;
     document.getElementById('action-sheet').classList.remove('hidden');
 }
@@ -448,7 +472,6 @@ function playerAction(action) {
         {
             pid: target.pid,
             name: target.name,
-            revision: target.revision,
             action,
         },
         { label: `${action} ${target.name}` },
@@ -458,7 +481,6 @@ function playerAction(action) {
             && selectedPlayer
             && selectedPlayer.pid === target.pid
             && selectedPlayer.name === target.name
-            && selectedPlayer.revision === target.revision
         ) {
             closeActionSheet();
         }
@@ -477,5 +499,3 @@ function esc(str) {
     return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
-// --- Init ---
-connectWS();

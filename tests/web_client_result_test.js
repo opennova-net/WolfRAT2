@@ -59,13 +59,15 @@ for (const id of [
     'map-list',
     'player-list',
     'player-count',
+    'login-overlay',
+    'conn-overlay',
 ]) {
     elements.set(id, new FakeElement(id));
 }
 elements.get('action-sheet').classList.add('hidden');
 
 const storage = {
-    getItem() { return null; },
+    getItem(key) { return key === 'wolfauth' ? 'test-token' : null; },
     setItem() {},
     removeItem() {},
 };
@@ -98,6 +100,7 @@ const context = vm.createContext({
     confirm: () => true,
     alert: () => {},
     setTimeout: () => 0,
+    clearTimeout: () => {},
     clearInterval: () => {},
     setInterval: () => 0,
 });
@@ -134,7 +137,7 @@ async function main() {
     const renderedPlayers = elements.get('player-list').innerHTML;
     assert.match(renderedPlayers, /data-player-id="7"/);
     assert.match(renderedPlayers, /data-player-name="Alice"/);
-    assert.match(renderedPlayers, /data-player-revision="6"/);
+    assert.doesNotMatch(renderedPlayers, /revision/);
 
     context.fetch = async () => ({
         ok: true,
@@ -178,7 +181,6 @@ async function main() {
     assert.deepStrictEqual(rejectedPlayerBody, {
         pid: '7',
         name: 'Alice',
-        revision: 6,
         action: 'kill',
     });
     assert(
@@ -245,7 +247,7 @@ async function main() {
         /data-queue-index="9"/,
         'the second duplicate row must render its own retail queue identity',
     );
-    assert.match(renderedMaps, /data-mission-revision="3"/);
+    assert.doesNotMatch(renderedMaps, /revision/);
     assert.match(renderedMaps, /<span class="map-index">9<\/span>/);
 
     context.fetch = async () => {
@@ -276,7 +278,7 @@ async function main() {
     assert.strictEqual(requestPath, '/api/map/switch');
     assert.deepStrictEqual(
         requestBody,
-        { index: 9, map: 'CP08.BMS', revision: 3 },
+        { index: 9, map: 'CP08.BMS' },
         'map requests must preserve the selected queue identity',
     );
 
@@ -339,7 +341,7 @@ async function main() {
             verification_error: 'readback did not confirm the mutation'
         });
     `, context);
-    assert.strictEqual(result.dataset.outcome, 'rejected');
+    assert.strictEqual(result.dataset.outcome, 'unverified');
     assert.match(result.textContent, /readback did not confirm/);
 
     vm.runInContext(`
@@ -362,8 +364,8 @@ async function main() {
             replies: ['OK']
         });
     `, context);
-    assert.strictEqual(result.dataset.outcome, 'rejected');
-    assert.match(result.textContent, /not independently verified/);
+    assert.strictEqual(result.dataset.outcome, 'unverified');
+    assert.match(result.textContent, /read-back did not confirm/);
 
     context.fetch = async () => ({
         ok: false,

@@ -1,5 +1,5 @@
 """
-WolfRAT 2.6.0 - Modern Joint Operations Server Admin Tool
+WolfRAT 2.6.1 - Modern Joint Operations Server Admin Tool
 Replaces the original WolfRAT v0.95 (2005, MFC70)
 """
 
@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
     QScrollArea, QMessageBox, QFrame, QListWidget, QListWidgetItem,
     QAbstractItemView, QMenu, QSlider, QPlainTextEdit, QTableView,
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QAbstractTableModel, QThread
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QAbstractTableModel, QThread, QEvent
 from PyQt6.QtGui import QColor, QIcon, QTextCursor
 
 from wolfrat.protocol import (
@@ -401,6 +401,9 @@ QScrollBar::handle:horizontal:hover {
 }
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
     width: 0;
+}
+QScrollBar::add-page, QScrollBar::sub-page {
+    background: none;
 }
 """
 
@@ -4840,63 +4843,13 @@ class ModsTab(QWidget):
         quick_layout.addWidget(self.player_combo)
 
         quick_add_btn = SatisfyingButton("+Mod")
-        quick_add_btn.setFixedWidth(60)
+        quick_add_btn.setMinimumWidth(70)
         quick_add_btn.clicked.connect(self._quick_add_mod)
         quick_layout.addWidget(quick_add_btn)
 
         mod_layout.addLayout(quick_layout)
         mod_group.setLayout(mod_layout)
         left_col.addWidget(mod_group)
-
-        # Permissions info
-        perms_group = QGroupBox("Mod Commands")
-        perms_layout = QVBoxLayout()
-        perms_label = QLabel(
-            "Mods can use these commands in game chat:\n\n"
-            "  !warn <player> [reason]  - Warn a player\n"
-            "  !kick <player> [reason]  - Kick a player\n"
-            "  !ban <player>            - Ban a player\n"
-            "  !swap <player>           - Swap to other team\n"
-            "  !kill <player>           - Kill a player\n"
-            "  !map <name>              - Switch to a map\n"
-            "  !add <name>              - Add map to rotation\n"
-            "  !remove <name>           - Remove map from rotation\n"
-            "  !next                    - Skip to next map\n"
-            "  !startvote               - Force early end-of-map vote\n"
-            "  !mixteams                - Randomly shuffle all players\n"
-            "  !balanceteams            - Balance teams from bigger team\n"
-            "  !time <0000-2300>        - Set time of day (fuzzy: !time 930 -> 1000)\n"
-            "  !gametime <1-240>        - Set game time in minutes\n\n"
-            "Map names can be partial/fuzzy: !map treasure"
-        )
-        perms_label.setStyleSheet("font-size: 9pt; color: #a89830; line-height: 1.4;")
-        perms_label.setWordWrap(True)
-        perms_layout.addWidget(perms_label)
-        perms_group.setLayout(perms_layout)
-        left_col.addWidget(perms_group)
-
-        player_cmds_group = QGroupBox("Player Commands")
-        player_cmds_layout = QVBoxLayout()
-        player_cmds_label = QLabel(
-            "Any player can use these commands in game chat:\n\n"
-            "  !kd [player]             - Check KD stats\n"
-            "  !list                    - Show current map rotation\n"
-            "  !vote <name>             - Start a map vote\n"
-            "  !skip                    - Vote to skip current map\n"
-            "  !yes                     - Vote yes on current vote\n"
-            "  !switch                  - Switch own team"
-        )
-        player_cmds_label.setStyleSheet("font-size: 9pt; color: #a89830; line-height: 1.4;")
-        player_cmds_label.setWordWrap(True)
-        player_cmds_layout.addWidget(player_cmds_label)
-        player_cmds_group.setLayout(player_cmds_layout)
-        left_col.addWidget(player_cmds_group)
-
-        left_col.addStretch()
-        layout.addLayout(left_col, 1)
-
-        # RIGHT: Map database + Mod activity log
-        right_col = QVBoxLayout()
 
         # Map database info
         maps_group = QGroupBox("Map Database")
@@ -4913,11 +4866,66 @@ class ModsTab(QWidget):
         maps_layout.addWidget(refresh_maps_btn)
 
         maps_group.setLayout(maps_layout)
-        right_col.addWidget(maps_group)
+        left_col.addWidget(maps_group)
 
-        # Mod activity log
-        log_group = QGroupBox("Mod Activity")
-        log_layout = QVBoxLayout()
+        layout.addLayout(left_col, 1)
+
+        # RIGHT: command reference + mod activity, one tab each so neither
+        # is squeezed off-screen when the window is small.
+        right_tabs = QTabWidget()
+
+        ref_page = QWidget()
+        ref_layout = QVBoxLayout(ref_page)
+
+        ref_top = QHBoxLayout()
+        self.cmd_filter = QLineEdit()
+        self.cmd_filter.setPlaceholderText("Filter... e.g. vote, map, team")
+        self.cmd_filter.setClearButtonEnabled(True)
+        self.cmd_filter.textChanged.connect(self._filter_commands)
+        ref_top.addWidget(self.cmd_filter)
+        copy_btn = SatisfyingButton("Copy cheat sheet")
+        copy_btn.clicked.connect(self._copy_cheat_sheet)
+        ref_top.addWidget(copy_btn)
+        ref_layout.addLayout(ref_top)
+
+        self.cmd_table = QTableWidget(0, 2)
+        self.cmd_table.setHorizontalHeaderLabels(["Command", "What it does"])
+        self.cmd_table.verticalHeader().setVisible(False)
+        self.cmd_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.cmd_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.cmd_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.cmd_table.setWordWrap(True)
+        self.cmd_table.setShowGrid(False)
+        header = self.cmd_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        # Row heights depend on the wrapped description, so on the final
+        # column width. Measuring during a resize (or while the tab is still
+        # hidden at startup) used a stale width and left rows far too tall.
+        self._cmd_rows_timer = QTimer(self)
+        self._cmd_rows_timer.setSingleShot(True)
+        self._cmd_rows_timer.setInterval(0)
+        self._cmd_rows_timer.timeout.connect(self.cmd_table.resizeRowsToContents)
+        header.sectionResized.connect(lambda *_: self._cmd_rows_timer.start())
+        self.cmd_table.installEventFilter(self)
+        self.cmd_table.setStyleSheet("""
+            QTableWidget {
+                background-color: #0a0a00;
+                color: #c8b040;
+                border: 1px solid #3a3a00;
+                font-size: 10pt;
+            }
+        """)
+        self._fill_command_table()
+        ref_layout.addWidget(self.cmd_table)
+
+        ref_hint = QLabel("Map names can be partial: !map treasure")
+        ref_hint.setStyleSheet("font-size: 9pt; color: #a89830;")
+        ref_layout.addWidget(ref_hint)
+        right_tabs.addTab(ref_page, "Command reference")
+
+        log_page = QWidget()
+        log_layout = QVBoxLayout(log_page)
         self.mod_log = QListWidget()
         self.mod_log.setStyleSheet("""
             QListWidget {
@@ -4932,11 +4940,112 @@ class ModsTab(QWidget):
         clear_btn = QPushButton("Clear Log")
         clear_btn.clicked.connect(self.mod_log.clear)
         log_layout.addWidget(clear_btn)
+        right_tabs.addTab(log_page, "Mod activity")
 
-        log_group.setLayout(log_layout)
-        right_col.addWidget(log_group)
+        layout.addWidget(right_tabs, 2)
 
-        layout.addLayout(right_col, 1)
+    def eventFilter(self, watched, event):
+        if watched is self.cmd_table and event.type() in (
+            QEvent.Type.Resize, QEvent.Type.Show
+        ):
+            self._cmd_rows_timer.start()
+        return super().eventFilter(watched, event)
+
+    # (section, [(command, description, highlighted)])
+    COMMAND_REFERENCE = (
+        ("Match control (mods)", (
+            ("!startvote", "Start the map vote NOW. Use it when a team is about "
+             "to hit the kill or score limit before the timer would start the vote.", True),
+            ("!next", "Skip to the next map", False),
+            ("!map <name>", "Switch to a map", False),
+            ("!gametime <1-240>", "Set the game time in minutes", False),
+            ("!time <0000-2300>", "Set time of day (!time 930 becomes 1000)", False),
+        )),
+        ("Teams (mods)", (
+            ("!swap <player>", "Move a player to the other team (swaps, then kills)", False),
+            ("!mixteams", "Randomly shuffle everyone", False),
+            ("!balanceteams", "Move players off the bigger team", False),
+        )),
+        ("Players (mods)", (
+            ("!warn <player> [reason]", "Warn a player in chat", False),
+            ("!kill <player>", "Kill a player", False),
+            ("!kick <player> [reason]", "Kick a player", False),
+            ("!ban <player>", "Ban a player", False),
+        )),
+        ("Rotation (mods)", (
+            ("!add <name>", "Add a map to the rotation", False),
+            ("!remove <name>", "Remove a map from the rotation", False),
+        )),
+        ("Everyone", (
+            ("!1  !2  !3", "Vote in the end-of-map vote", False),
+            ("!vote <name>", "Start a vote for a map", False),
+            ("!skip", "Vote to skip the current map", False),
+            ("!yes", "Vote yes on the current vote", False),
+            ("!switch", "Switch your own team", False),
+            ("!kd [player]", "Kill/death stats", False),
+            ("!list", "Show the map rotation", False),
+            ("!ping", "Show your own ping", False),
+        )),
+    )
+
+    def _fill_command_table(self):
+        table = self.cmd_table
+        table.setRowCount(0)
+        self._cmd_section_rows = []
+        for section, commands in self.COMMAND_REFERENCE:
+            row = table.rowCount()
+            table.insertRow(row)
+            heading = QTableWidgetItem(section)
+            heading.setBackground(QColor("#1a1a05"))
+            heading.setForeground(QColor("#e8c840"))
+            font = heading.font()
+            font.setBold(True)
+            heading.setFont(font)
+            table.setItem(row, 0, heading)
+            table.setSpan(row, 0, 1, 2)
+            self._cmd_section_rows.append(row)
+            for command, description, highlighted in commands:
+                row = table.rowCount()
+                table.insertRow(row)
+                command_item = QTableWidgetItem(command)
+                mono = command_item.font()
+                mono.setFamily("Consolas")
+                command_item.setFont(mono)
+                command_item.setForeground(QColor("#ffe060"))
+                description_item = QTableWidgetItem(description)
+                if highlighted:
+                    for item in (command_item, description_item):
+                        item.setBackground(QColor("#2a2405"))
+                table.setItem(row, 0, command_item)
+                table.setItem(row, 1, description_item)
+        table.resizeRowsToContents()
+
+    def _filter_commands(self, text):
+        needle = text.strip().casefold()
+        table = self.cmd_table
+        for row in range(table.rowCount()):
+            if row in self._cmd_section_rows:
+                # Section headings only make sense for the full list.
+                table.setRowHidden(row, bool(needle))
+                continue
+            haystack = " ".join(
+                table.item(row, column).text() for column in range(2)
+            ).casefold()
+            table.setRowHidden(row, needle not in haystack)
+
+    def _copy_cheat_sheet(self):
+        """Plain text for pasting into Discord."""
+        lines = ["WolfRAT chat commands", ""]
+        for section, commands in self.COMMAND_REFERENCE:
+            lines.append(section)
+            width = max(len(command) for command, _, _ in commands)
+            for command, description, _ in commands:
+                lines.append(f"  {command.ljust(width)}  {description}")
+            lines.append("")
+        QApplication.clipboard().setText("```\n" + "\n".join(lines).rstrip() + "\n```")
+        self.mod_log.addItem(
+            f"[{time.strftime('%H:%M:%S')}] Command cheat sheet copied to clipboard"
+        )
 
     def _add_mod(self):
         name = self.mod_input.text().strip()
@@ -6976,7 +7085,7 @@ class DownloadWorker(QThread):
 
 
 class MainWindow(QMainWindow):
-    """WolfRAT 2.6.0 Main Window."""
+    """WolfRAT 2.6.1 Main Window."""
 
     def __init__(self, runtime: DesktopRuntime | None = None):
         super().__init__()
@@ -6995,7 +7104,7 @@ class MainWindow(QMainWindow):
         self._sync_led_timer = QTimer(self)
         self._sync_led_timer.setSingleShot(True)
         self._sync_led_timer.timeout.connect(self._clear_sync_led)
-        self.setWindowTitle("WolfRAT 2.6.0 - Joint Operations Server Admin")
+        self.setWindowTitle("WolfRAT 2.6.1 - Joint Operations Server Admin")
 
         # Set Window Icon
         icon_path = os.path.join(os.path.dirname(__file__), 'icon.ico')
@@ -7069,7 +7178,7 @@ class MainWindow(QMainWindow):
         self.signals.connected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.connected_signal.connect(lambda: sounds.play("connect"))
         self.signals.disconnected_signal.connect(lambda: self.set_connected(False, 'Disconnected'))
-        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.6.0 - Joint Operations Server Admin"))
+        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.6.1 - Joint Operations Server Admin"))
         self.signals.disconnected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.disconnected_signal.connect(lambda: self.server_tab.handle_disconnect_ui())
         self.signals.reconnecting_signal.connect(lambda attempt: self.set_connected(False, f'Reconnecting (Attempt {attempt})...'))
@@ -7080,9 +7189,9 @@ class MainWindow(QMainWindow):
     def _update_title(self, server_name=""):
         """Update window title with server name when connected."""
         if server_name:
-            self.setWindowTitle(f"WolfRAT 2.6.0 \u2014 {server_name}")
+            self.setWindowTitle(f"WolfRAT 2.6.1 \u2014 {server_name}")
         else:
-            self.setWindowTitle("WolfRAT 2.6.0 - Joint Operations Server Admin")
+            self.setWindowTitle("WolfRAT 2.6.1 - Joint Operations Server Admin")
 
     def _build_ui(self):
         central = QWidget()
@@ -7090,7 +7199,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(central)
 
         # Header
-        header = QLabel("WolfRAT 2.6.0")
+        header = QLabel("WolfRAT 2.6.1")
         header.setStyleSheet("font-size: 22pt; font-weight: bold; color: #e8c840; padding: 12px; letter-spacing: 4px;")
         header.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(header)
@@ -7219,7 +7328,7 @@ class MainWindow(QMainWindow):
 
         status_bar.addSpacing(10)
 
-        ver_label = QLabel("v2.6.0 · Built by BadgerLove · FMJ Squad")
+        ver_label = QLabel("v2.6.1 · Built by BadgerLove · FMJ Squad")
         ver_label.setStyleSheet("font-size: 9pt; color: #444;")
         status_bar.addWidget(ver_label)
 
@@ -7275,7 +7384,7 @@ class MainWindow(QMainWindow):
     # ---- Auto-updater ---------------------------------------------------
 
     _VERSION_URL = "https://fmj-squad.com/version.json"
-    _CURRENT_VERSION = "2.6.0"
+    _CURRENT_VERSION = "2.6.1"
 
     @staticmethod
     def _is_newer(latest: str, current: str) -> bool:
@@ -7534,7 +7643,7 @@ def start_desktop(
 
     runtime = runtime or DesktopRuntime.production()
     app.setStyleSheet(DARK_STYLE)
-    app.setApplicationName("WolfRAT 2.6.0")
+    app.setApplicationName("WolfRAT 2.6.1")
     sounds.set_enabled(runtime.audio_enabled)
     if runtime.audio_enabled:
         sounds.initialize()
@@ -7643,7 +7752,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
         print(f"WolfRAT startup error: {error}")
         return 2
     runtime = runtime or launch.runtime
-    wire_log("=== WolfRAT 2.6.0 STARTED ===")
+    wire_log("=== WolfRAT 2.6.1 STARTED ===")
 
     # Catch-all exception handler for debugging
     import traceback
@@ -7696,7 +7805,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
 
             bstats.bstats_start(
                 "wolfrat",
-                "2.6.0",
+                "2.6.1",
                 data_dir=runtime.data_dir,
             )
         except Exception:

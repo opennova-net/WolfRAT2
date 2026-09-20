@@ -75,6 +75,9 @@ class FakeServerManager:
     def swap_player(self, player):
         return self._accept(("swap", player))
 
+    def swap_and_kill(self, player, name=""):
+        return self._accept(("swap_and_kill", player))
+
     def zero_player(self, player):
         return self._accept(("zero", player))
 
@@ -202,21 +205,55 @@ class WebStateTests(unittest.TestCase):
         self.assertIn("ambiguous", response["payload"]["error"])
         self.assertEqual([], manager.semantic_actions)
 
-    def test_map_switch_rejects_a_stale_revision_before_manager_call(self):
+    def test_map_switch_ignores_the_poll_revision(self):
+        # The session bumps the revision on every 5 s poll; a tap made against
+        # the previous poll's list must still switch the map.
+        manager = FakeServerManager()
+        mission = MissionEntry(queue_index=9, filename="CP08.BMS", revision=4)
+        manager.mission_entries = (mission,)
+        server = WolfWebServer(manager, host="127.0.0.1", port=0)
+        server._check_auth = lambda _request: True
+
+        for body in (
+            {"map": "CP08.BMS", "index": 9, "revision": 3},
+            {"map": "CP08.BMS", "index": 9},
+        ):
+            with patch.object(web_server_module, "web", FakeWeb, create=True):
+                response = asyncio.run(
+                    server._handle_map_switch(FakeRequest(body))
+                )
+            self.assertEqual(200, response["status"], response["payload"])
+
+        self.assertEqual(
+            [("switch_mission", mission), ("switch_mission", mission)],
+            manager.semantic_actions,
+        )
+
+    def test_map_switch_follows_a_unique_file_when_the_queue_shifted(self):
+        manager = FakeServerManager()
+        mission = MissionEntry(queue_index=5, filename="CP08.BMS", revision=4)
+        manager.mission_entries = (
+            MissionEntry(queue_index=4, filename="CP01.BMS", revision=4),
+            mission,
+        )
+        server = WolfWebServer(manager, host="127.0.0.1", port=0)
+
+        self.assertIs(
+            mission, server._find_mission_entry("cp08.bms", queue_index=4)
+        )
+        self.assertIs(mission, server._find_mission_entry("cp08.bms"))
+
+    def test_map_switch_rejects_a_file_that_left_the_queue(self):
         manager = FakeServerManager()
         manager.mission_entries = (
-            MissionEntry(queue_index=9, filename="CP08.BMS", revision=4),
+            MissionEntry(queue_index=4, filename="CP01.BMS", revision=4),
         )
         server = WolfWebServer(manager, host="127.0.0.1", port=0)
         server._check_auth = lambda _request: True
 
         with patch.object(web_server_module, "web", FakeWeb, create=True):
             response = asyncio.run(server._handle_map_switch(
-                FakeRequest({
-                    "map": "CP08.BMS",
-                    "index": 9,
-                    "revision": 3,
-                })
+                FakeRequest({"map": "CP08.BMS", "index": 4})
             ))
 
         self.assertEqual(409, response["status"])
@@ -399,27 +436,31 @@ class WebStateTests(unittest.TestCase):
         self.assertIn("stale", response["payload"]["error"])
         self.assertEqual([], manager.semantic_actions)
 
-    def test_player_action_rejects_a_stale_player_revision(self):
+    def test_player_action_ignores_the_poll_revision(self):
+        # 2026-09-20: "revision changed from 35385 to 35386" rejected a team
+        # swap from the phone. Same id, same name = same player.
         manager = FakeServerManager()
-        manager.player_entries = (
-            PlayerEntry(server_id=7, name="Alice", team=1, revision=8),
-        )
+        player = PlayerEntry(server_id=7, name="Alice", team=1, revision=8)
+        manager.player_entries = (player,)
         server = WolfWebServer(manager, host="127.0.0.1", port=0)
         server._check_auth = lambda _request: True
 
-        with patch.object(web_server_module, "web", FakeWeb, create=True):
-            response = asyncio.run(server._handle_player_action(
-                FakeRequest({
-                    "pid": 7,
-                    "name": "Alice",
-                    "revision": 6,
-                    "action": "zero",
-                })
-            ))
+        for body in (
+            {"pid": 7, "name": "Alice", "revision": 6, "action": "swap"},
+            {"pid": 7, "name": "Alice", "action": "swap"},
+        ):
+            with patch.object(web_server_module, "web", FakeWeb, create=True):
+                response = asyncio.run(
+                    server._handle_player_action(FakeRequest(body))
+                )
+            self.assertEqual(200, response["status"], response["payload"])
 
-        self.assertEqual(409, response["status"])
-        self.assertIn("revision", response["payload"]["error"])
-        self.assertEqual([], manager.semantic_actions)
+        self.assertEqual(
+            # The web swap must kill too: a bare SWAPTEAM leaves the player
+            # alive in the middle of the team they just left.
+            [("swap_and_kill", player), ("swap_and_kill", player)],
+            manager.semantic_actions,
+        )
 
     def test_player_action_still_rejects_the_host_before_identity_lookup(self):
         manager = FakeServerManager()
