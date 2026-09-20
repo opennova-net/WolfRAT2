@@ -1,5 +1,5 @@
 """
-WolfRAT 2.5.10 - Modern Joint Operations Server Admin Tool
+WolfRAT 2.6.0 - Modern Joint Operations Server Admin Tool
 Replaces the original WolfRAT v0.95 (2005, MFC70)
 """
 
@@ -6976,7 +6976,7 @@ class DownloadWorker(QThread):
 
 
 class MainWindow(QMainWindow):
-    """WolfRAT 2.5.10 Main Window."""
+    """WolfRAT 2.6.0 Main Window."""
 
     def __init__(self, runtime: DesktopRuntime | None = None):
         super().__init__()
@@ -6995,7 +6995,7 @@ class MainWindow(QMainWindow):
         self._sync_led_timer = QTimer(self)
         self._sync_led_timer.setSingleShot(True)
         self._sync_led_timer.timeout.connect(self._clear_sync_led)
-        self.setWindowTitle("WolfRAT 2.5.10 - Joint Operations Server Admin")
+        self.setWindowTitle("WolfRAT 2.6.0 - Joint Operations Server Admin")
 
         # Set Window Icon
         icon_path = os.path.join(os.path.dirname(__file__), 'icon.ico')
@@ -7069,7 +7069,7 @@ class MainWindow(QMainWindow):
         self.signals.connected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.connected_signal.connect(lambda: sounds.play("connect"))
         self.signals.disconnected_signal.connect(lambda: self.set_connected(False, 'Disconnected'))
-        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.5.10 - Joint Operations Server Admin"))
+        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.6.0 - Joint Operations Server Admin"))
         self.signals.disconnected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.disconnected_signal.connect(lambda: self.server_tab.handle_disconnect_ui())
         self.signals.reconnecting_signal.connect(lambda attempt: self.set_connected(False, f'Reconnecting (Attempt {attempt})...'))
@@ -7080,9 +7080,9 @@ class MainWindow(QMainWindow):
     def _update_title(self, server_name=""):
         """Update window title with server name when connected."""
         if server_name:
-            self.setWindowTitle(f"WolfRAT 2.5.10 \u2014 {server_name}")
+            self.setWindowTitle(f"WolfRAT 2.6.0 \u2014 {server_name}")
         else:
-            self.setWindowTitle("WolfRAT 2.5.10 - Joint Operations Server Admin")
+            self.setWindowTitle("WolfRAT 2.6.0 - Joint Operations Server Admin")
 
     def _build_ui(self):
         central = QWidget()
@@ -7090,7 +7090,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(central)
 
         # Header
-        header = QLabel("WolfRAT 2.5.10")
+        header = QLabel("WolfRAT 2.6.0")
         header.setStyleSheet("font-size: 22pt; font-weight: bold; color: #e8c840; padding: 12px; letter-spacing: 4px;")
         header.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(header)
@@ -7219,7 +7219,7 @@ class MainWindow(QMainWindow):
 
         status_bar.addSpacing(10)
 
-        ver_label = QLabel("v2.5.10 · Built by BadgerLove · FMJ Squad")
+        ver_label = QLabel("v2.6.0 · Built by BadgerLove · FMJ Squad")
         ver_label.setStyleSheet("font-size: 9pt; color: #444;")
         status_bar.addWidget(ver_label)
 
@@ -7275,7 +7275,16 @@ class MainWindow(QMainWindow):
     # ---- Auto-updater ---------------------------------------------------
 
     _VERSION_URL = "https://fmj-squad.com/version.json"
-    _CURRENT_VERSION = "2.5.10"
+    _CURRENT_VERSION = "2.6.0"
+
+    @staticmethod
+    def _is_newer(latest: str, current: str) -> bool:
+        """Numeric compare. As text, '2.5.10' sorts below '2.5.9', which hid v2.5.10."""
+        import re
+
+        def parts(version):
+            return tuple(int(n) for n in re.findall(r'\d+', str(version)))
+        return parts(latest) > parts(current)
 
     def _auto_check_updates(self):
         """Silent startup check — only pop up if update available."""
@@ -7286,7 +7295,7 @@ class MainWindow(QMainWindow):
             data = json.loads(resp.read())
             wolfrat_data = data.get('wolfrat', {})
             latest_version = wolfrat_data.get('version', self._CURRENT_VERSION)
-            if latest_version > self._CURRENT_VERSION:
+            if self._is_newer(latest_version, self._CURRENT_VERSION):
                 self._show_update_dialog(wolfrat_data, latest_version)
         except Exception:
             pass  # Silent on failure
@@ -7305,7 +7314,7 @@ class MainWindow(QMainWindow):
             wolfrat_data = data.get('wolfrat', {})
             latest_version = wolfrat_data.get('version', self._CURRENT_VERSION)
 
-            if latest_version > self._CURRENT_VERSION:
+            if self._is_newer(latest_version, self._CURRENT_VERSION):
                 self._show_update_dialog(wolfrat_data, latest_version)
             else:
                 QMessageBox.information(self, 'Up to Date', 'You are running the latest version of WolfRAT.')
@@ -7525,7 +7534,7 @@ def start_desktop(
 
     runtime = runtime or DesktopRuntime.production()
     app.setStyleSheet(DARK_STYLE)
-    app.setApplicationName("WolfRAT 2.5.10")
+    app.setApplicationName("WolfRAT 2.6.0")
     sounds.set_enabled(runtime.audio_enabled)
     if runtime.audio_enabled:
         sounds.initialize()
@@ -7634,7 +7643,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
         print(f"WolfRAT startup error: {error}")
         return 2
     runtime = runtime or launch.runtime
-    wire_log("=== WolfRAT 2.5.10 STARTED ===")
+    wire_log("=== WolfRAT 2.6.0 STARTED ===")
 
     # Catch-all exception handler for debugging
     import traceback
@@ -7687,7 +7696,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
 
             bstats.bstats_start(
                 "wolfrat",
-                "2.5.10",
+                "2.6.0",
                 data_dir=runtime.data_dir,
             )
         except Exception:
