@@ -1,5 +1,5 @@
 """
-WolfRAT 2.5.9 - Modern Joint Operations Server Admin Tool
+WolfRAT 2.5.10 - Modern Joint Operations Server Admin Tool
 Replaces the original WolfRAT v0.95 (2005, MFC70)
 """
 
@@ -721,18 +721,29 @@ class ServerTab(QWidget):
             self._handle_connect_failure()
 
     def _reconnect_delay_ms(self) -> int:
-        """Exponential backoff: 30s, 60s, 120s (cap)."""
-        delay = min(30 * (2 ** (self._reconnect_attempts - 1)), 120)
-        return delay * 1000
+        """Flat 30s retry.
+
+        The old 30/60/120s backoff never delivered its 30s step: one drop
+        raises several disconnect signals, each bumped the attempt count and
+        restarted the timer, so every reconnect waited the 120s cap. The
+        server's 30s start delay means a 30s retry lands as the game begins.
+        """
+        return 30 * 1000
+
+    def _arm_reconnect(self, reason: str) -> None:
+        """Schedule one reconnect; repeat signals for the same drop are no-ops."""
+        if self.reconnect_timer.isActive():
+            return
+        self._reconnect_attempts += 1
+        delay_ms = self._reconnect_delay_ms()
+        delay_s = delay_ms // 1000
+        self.log(f"{reason} in {delay_s}s... (Attempt {self._reconnect_attempts})")
+        self.reconnect_timer.start(delay_ms)
+        self.signals.reconnecting_signal.emit(self._reconnect_attempts)
 
     def _handle_connect_failure(self):
         if not self._manual_disconnect and self.auto_reconnect_cb.isChecked():
-            self._reconnect_attempts += 1
-            delay_ms = self._reconnect_delay_ms()
-            delay_s = delay_ms // 1000
-            self.log(f"Connection failed. Retrying in {delay_s}s... (Attempt {self._reconnect_attempts})")
-            self.reconnect_timer.start(delay_ms)
-            self.signals.reconnecting_signal.emit(self._reconnect_attempts)
+            self._arm_reconnect("Connection failed. Retrying")
 
     def handle_disconnect_ui(self):
         self.status_label.setText("Disconnected")
@@ -742,12 +753,9 @@ class ServerTab(QWidget):
         self.refresh_btn.setEnabled(False)
 
         if not self._manual_disconnect and self.auto_reconnect_cb.isChecked():
-            self._reconnect_attempts += 1
-            delay_ms = self._reconnect_delay_ms()
-            delay_s = delay_ms // 1000
-            self.log(f"Connection lost. Auto-reconnecting in {delay_s}s... (Attempt {self._reconnect_attempts})")
-            self.reconnect_timer.start(delay_ms)
-            self.signals.reconnecting_signal.emit(self._reconnect_attempts)
+            # A connect already in flight re-arms itself if it fails.
+            if self._pending_connect is None:
+                self._arm_reconnect("Connection lost. Auto-reconnecting")
 
     def _auto_reconnect_tick(self):
         self.reconnect_timer.stop()
@@ -815,7 +823,8 @@ class ServerTab(QWidget):
                 break
 
     def log(self, msg: str):
-        pass  # Console tab handles logging now
+        # Reconnect lifecycle lines; without them a drop reads as dead air.
+        wire_log(msg)
 
     def _save_server(self):
         host = self.host_input.text().strip()
@@ -6967,7 +6976,7 @@ class DownloadWorker(QThread):
 
 
 class MainWindow(QMainWindow):
-    """WolfRAT 2.5.9 Main Window."""
+    """WolfRAT 2.5.10 Main Window."""
 
     def __init__(self, runtime: DesktopRuntime | None = None):
         super().__init__()
@@ -6986,7 +6995,7 @@ class MainWindow(QMainWindow):
         self._sync_led_timer = QTimer(self)
         self._sync_led_timer.setSingleShot(True)
         self._sync_led_timer.timeout.connect(self._clear_sync_led)
-        self.setWindowTitle("WolfRAT 2.5.9 - Joint Operations Server Admin")
+        self.setWindowTitle("WolfRAT 2.5.10 - Joint Operations Server Admin")
 
         # Set Window Icon
         icon_path = os.path.join(os.path.dirname(__file__), 'icon.ico')
@@ -7060,7 +7069,7 @@ class MainWindow(QMainWindow):
         self.signals.connected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.connected_signal.connect(lambda: sounds.play("connect"))
         self.signals.disconnected_signal.connect(lambda: self.set_connected(False, 'Disconnected'))
-        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.5.9 - Joint Operations Server Admin"))
+        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.5.10 - Joint Operations Server Admin"))
         self.signals.disconnected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.disconnected_signal.connect(lambda: self.server_tab.handle_disconnect_ui())
         self.signals.reconnecting_signal.connect(lambda attempt: self.set_connected(False, f'Reconnecting (Attempt {attempt})...'))
@@ -7071,9 +7080,9 @@ class MainWindow(QMainWindow):
     def _update_title(self, server_name=""):
         """Update window title with server name when connected."""
         if server_name:
-            self.setWindowTitle(f"WolfRAT 2.5.9 \u2014 {server_name}")
+            self.setWindowTitle(f"WolfRAT 2.5.10 \u2014 {server_name}")
         else:
-            self.setWindowTitle("WolfRAT 2.5.9 - Joint Operations Server Admin")
+            self.setWindowTitle("WolfRAT 2.5.10 - Joint Operations Server Admin")
 
     def _build_ui(self):
         central = QWidget()
@@ -7081,7 +7090,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(central)
 
         # Header
-        header = QLabel("WolfRAT 2.5.9")
+        header = QLabel("WolfRAT 2.5.10")
         header.setStyleSheet("font-size: 22pt; font-weight: bold; color: #e8c840; padding: 12px; letter-spacing: 4px;")
         header.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(header)
@@ -7210,7 +7219,7 @@ class MainWindow(QMainWindow):
 
         status_bar.addSpacing(10)
 
-        ver_label = QLabel("v2.5.9 · Built by BadgerLove · FMJ Squad")
+        ver_label = QLabel("v2.5.10 · Built by BadgerLove · FMJ Squad")
         ver_label.setStyleSheet("font-size: 9pt; color: #444;")
         status_bar.addWidget(ver_label)
 
@@ -7266,7 +7275,7 @@ class MainWindow(QMainWindow):
     # ---- Auto-updater ---------------------------------------------------
 
     _VERSION_URL = "https://fmj-squad.com/version.json"
-    _CURRENT_VERSION = "2.5.9"
+    _CURRENT_VERSION = "2.5.10"
 
     def _auto_check_updates(self):
         """Silent startup check — only pop up if update available."""
@@ -7516,7 +7525,7 @@ def start_desktop(
 
     runtime = runtime or DesktopRuntime.production()
     app.setStyleSheet(DARK_STYLE)
-    app.setApplicationName("WolfRAT 2.5.9")
+    app.setApplicationName("WolfRAT 2.5.10")
     sounds.set_enabled(runtime.audio_enabled)
     if runtime.audio_enabled:
         sounds.initialize()
@@ -7625,7 +7634,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
         print(f"WolfRAT startup error: {error}")
         return 2
     runtime = runtime or launch.runtime
-    wire_log("=== WolfRAT 2.5.9 STARTED ===")
+    wire_log("=== WolfRAT 2.5.10 STARTED ===")
 
     # Catch-all exception handler for debugging
     import traceback
@@ -7678,7 +7687,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
 
             bstats.bstats_start(
                 "wolfrat",
-                "2.5.9",
+                "2.5.10",
                 data_dir=runtime.data_dir,
             )
         except Exception:

@@ -12,6 +12,9 @@ import uuid
 BSTATS_URL = "http://fmj-squad.com/bstats/ping"
 HEARTBEAT_INTERVAL = 30 * 60
 TIMEOUT = 5
+# Must be set explicitly. Cloudflare 403s urllib's default "Python-urllib/3.x"
+# with error 1010, which silently killed every ping after the 2026-09-16 migration.
+USER_AGENT = "FMJ-BStats/1.0"
 
 _version = "0.0"
 _tool = "unknown"
@@ -64,7 +67,10 @@ def _ping(ping_type="heartbeat"):
         request = urllib.request.Request(
             BSTATS_URL,
             data=data,
-            headers={"Content-Type": "application/json"},
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": USER_AGENT,
+            },
             method="POST",
         )
         with urllib.request.urlopen(request, timeout=TIMEOUT):
