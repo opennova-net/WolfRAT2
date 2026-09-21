@@ -1,0 +1,107 @@
+"""The real Weather tab, driven through its widgets against the fake server."""
+
+import json
+
+import pytest
+
+from tests.test_weather import FakeServer
+from wolfrat import weather as w
+from wolfrat.runtime import DesktopRuntime
+from wolfrat.weather import Addr
+from wolfrat.weather_tab import WeatherTab
+
+
+class FakeHandle:
+    pid = 4242
+
+    def close(self):
+        pass
+
+
+def make(qtbot, tmp_path, server=None, fail=None):
+    attaches = []
+
+    def attach(writable=True):
+        attaches.append(writable)
+        if fail:
+            raise w.WeatherError(fail)
+        controller = w.WeatherController(server)
+        controller.verify()
+        return controller, FakeHandle()
+
+    said = []
+    tab = WeatherTab(DesktopRuntime.isolated(tmp_path), send_chat=said.append, attach=attach)
+    qtbot.addWidget(tab)
+    tab._timer.stop()
+    tab._poll()
+    return tab, said, attaches
+
+
+def test_no_server_greys_everything_and_says_why(qtbot, tmp_path):
+    tab, _, _ = make(qtbot, tmp_path, fail="No jointops.exe is running on this PC.")
+    assert "No jointops.exe" in tab.status_lbl.text()
+    assert not any(widget.isEnabled() for widget in tab._action_widgets)
+    assert tab.on_mod_command("Dale", "!storm", ["10"]) == "Weather commands are switched off in WolfRAT."
+    tab.mods_cb.setChecked(True)
+    assert "must run on the server PC" in tab.on_mod_command("Dale", "!storm", ["10"])
+
+
+def test_looking_never_takes_a_writable_handle(qtbot, tmp_path):
+    server = FakeServer()
+    tab, _, attaches = make(qtbot, tmp_path, server)
+    tab._poll(), tab._poll()
+    assert attaches == [False] and server.writes == []
+    assert "rain 0%" in tab.sky_lbl.text() and "1000 m" in tab.sky_lbl.text()
+
+
+def test_storm_button_then_clear(qtbot, tmp_path):
+    server = FakeServer()
+    tab, said, attaches = make(qtbot, tmp_path, server)
+    tab.minutes_spin.setValue(10)
+    tab._start_preset("storm")
+    assert attaches == [False, True]
+    server.tick(40)
+    tab._poll()
+    assert server.client_sees()["precip"] == 255
+    assert "rain 100%" in tab.sky_lbl.text() and "left" in tab.active_lbl.text()
+    assert said == ["Weather: storm rolling in for 10 min."]
+
+    tab._clear()
+    server.tick(40)
+    assert server.client_sees() == {"fog_m": 1000, "precip": 0, "overcast": 0, "snow": 0, "quake": 0}
+    assert said[-1] == "The weather is clearing."
+
+
+def test_custom_dials(qtbot, tmp_path):
+    server = FakeServer()
+    tab, _, _ = make(qtbot, tmp_path, server)
+    tab.minutes_spin.setValue(0)
+    tab.precip_slider.setValue(40), tab.snow_cb.setChecked(True)
+    tab.overcast_slider.setValue(30), tab.fog_cb.setChecked(True), tab.fog_slider.setValue(250)
+    tab.fade_slider.setValue(5)
+    tab._start_custom()
+    server.tick(10)
+    seen = server.client_sees()
+    assert seen["snow"] == 1 and seen["fog_m"] == 250
+    assert abs(seen["precip"] - 102) <= 1 and abs(seen["overcast"] - 76) <= 1
+    assert "until cleared" in tab.active_lbl.text()
+    saved = json.loads((tmp_path / "wolfrat_weather.json").read_text())
+    assert saved["precip"] == 40 and saved["snow"] is True and saved["fog_metres"] == 250
+
+
+def test_mod_chat_and_server_restart(qtbot, tmp_path):
+    server = FakeServer()
+    tab, said, attaches = make(qtbot, tmp_path, server)
+    tab.mods_cb.setChecked(True)
+    assert tab.on_mod_command("Dale", "!storm", ["soon"]).startswith("Usage")
+    assert tab.on_mod_command("Dale", "!storm", ["10"]) is None
+    assert tab.on_mod_command("Dale", "!quake", []) is None
+    assert server.peek(Addr.QUAKE_TICKS) == 30
+    assert "Dale set storm for 10 min" in tab.log_list.item(0).text()
+
+    # the server process goes away and comes back: the storm is put back
+    tab._detach()
+    server.poke(Addr.PRECIP_TARGET, 0)
+    tab._poll()
+    assert attaches[-1] is True
+    assert server.peek(Addr.PRECIP_TARGET) == 0x10000

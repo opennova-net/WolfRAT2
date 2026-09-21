@@ -94,7 +94,7 @@ def test_isolated_desktop_constructs_real_tabs_without_external_startup(
     qtbot.addWidget(window)
 
     assert window.runtime is runtime
-    assert window.tabs.count() == 12
+    assert window.tabs.count() == 13
 
     qtbot.wait(750)
 
@@ -181,7 +181,7 @@ def test_desktop_smoke_writes_machine_readable_result(qapp, qtbot, tmp_path):
 
     result = json.loads(result_path.read_text(encoding="utf-8"))
     assert result["ok"] is True
-    assert result["tab_count"] == 12
+    assert result["tab_count"] == 13
     assert result["resources"] == {
         "icon": True,
         "web_templates": True,

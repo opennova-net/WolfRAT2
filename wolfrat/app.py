@@ -1,5 +1,5 @@
 """
-WolfRAT 2.6.1 - Modern Joint Operations Server Admin Tool
+WolfRAT 2.6.2 - Modern Joint Operations Server Admin Tool
 Replaces the original WolfRAT v0.95 (2005, MFC70)
 """
 
@@ -14,11 +14,14 @@ from PyQt6.QtWidgets import (
     QGridLayout, QLabel, QLineEdit, QPushButton, QTextEdit, QTableWidget,
     QTableWidgetItem, QHeaderView, QComboBox, QSpinBox, QCheckBox, QGroupBox, QRadioButton, QButtonGroup,
     QScrollArea, QMessageBox, QFrame, QListWidget, QListWidgetItem,
-    QAbstractItemView, QMenu, QSlider, QPlainTextEdit, QTableView,
+    QAbstractItemView, QMenu, QSlider, QPlainTextEdit, QTableView, QSizePolicy,
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QAbstractTableModel, QThread, QEvent
 from PyQt6.QtGui import QColor, QIcon, QTextCursor
 
+from wolfrat import vote_rules
+from wolfrat import weather
+from wolfrat.weather_tab import WeatherTab
 from wolfrat.protocol import (
     CHAT_MAX_LEN,
     ServerManager,
@@ -4961,6 +4964,12 @@ class ModsTab(QWidget):
             ("!gametime <1-240>", "Set the game time in minutes", False),
             ("!time <0000-2300>", "Set time of day (!time 930 becomes 1000)", False),
         )),
+        ("Weather (mods - switch on in the Weather tab)", (
+            ("!storm [minutes]", "Rain, dark cloud and fog. !storm 10 lasts ten minutes", False),
+            ("!rain  !drizzle  !snow  !blizzard  !fog  !overcast", "Other skies, same optional minutes", False),
+            ("!clear", "Back to the map's own weather", False),
+            ("!quake [seconds]", "Earthquake, 1-40 seconds", False),
+        )),
         ("Teams (mods)", (
             ("!swap <player>", "Move a player to the other team (swaps, then kills)", False),
             ("!mixteams", "Randomly shuffle everyone", False),
@@ -5457,7 +5466,7 @@ class ModsTab(QWidget):
             return
 
         # If it's a ! command but not recognized, tell them
-        valid_commands = {'!warn', '!kick', '!ban', '!swap', '!kill', '!next', '!map', '!add', '!remove', '!1', '!2', '!3', '!startvote', '!mixteams', '!balanceteams', '!time', '!gametime'}
+        valid_commands = {'!warn', '!kick', '!ban', '!swap', '!kill', '!next', '!map', '!add', '!remove', '!1', '!2', '!3', '!startvote', '!mixteams', '!balanceteams', '!time', '!gametime', *weather.CHAT_COMMANDS}
         if cmd not in valid_commands:
             self._send_mod_chat(
                 f"Unknown command: {cmd}", "Send unknown command response"
@@ -5667,6 +5676,16 @@ class ModsTab(QWidget):
                 ),
                 policy=CompletionPolicy.ACCEPTED,
             )
+
+        elif cmd in weather.CHAT_COMMANDS:
+            weather_tab = getattr(self.server, '_weather_tab', None)
+            reply = (
+                weather_tab.on_mod_command(display_name, cmd, args)
+                if weather_tab else "Weather is not available."
+            )
+            self.mod_log.addItem(f"[{now}] {sender} used {cmd} {' '.join(args)}".rstrip())
+            if reply:
+                self._send_mod_chat(reply, "Send weather reply")
 
         elif cmd == '!gametime':
             if sender not in self.mods and sender != 'web_admin':
@@ -5923,6 +5942,9 @@ class MapVotingTab(QWidget):
         self._server_game_time_total = 0  # total minutes from server
         self._server_game_time_remaining = 0  # remaining minutes from server
         self._server_time_updated = 0  # timestamp of last server update
+        # Optional early-vote rules, all off unless the saved file says otherwise.
+        self._mode_rules = vote_rules.rules_from_json(None)
+        self._kill_watch = vote_rules.KillWatch()
 
         self._recently_played_file = str(
             self.runtime.path("wolfrat_recently_played.json")
@@ -5941,6 +5963,9 @@ class MapVotingTab(QWidget):
                         self._match_duration = data.get('match_duration', 30)
                         self._trigger_mins = data.get('trigger_mins', 3)
                         self._vote_duration = data.get('vote_duration', 2)
+                        self._mode_rules = vote_rules.rules_from_json(
+                            data.get('mode_rules')
+                        )
                     elif isinstance(data, list):
                         self._recently_played = data
                         self._current_map = None
@@ -5986,40 +6011,64 @@ class MapVotingTab(QWidget):
         )
 
     def _build_ui(self):
-        layout = QVBoxLayout(self)
+        # Settings + log on the left, the optional early-vote rules on the
+        # right, all inside a scroll area: at small window sizes the tab
+        # scrolls instead of crushing rows on top of each other.
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        content = QWidget()
+        columns = QHBoxLayout(content)
+        layout = QVBoxLayout()
+        columns.addLayout(layout, 2)
+        scroll.setWidget(content)
+        root.addWidget(scroll)
+
+        def small(spin):
+            spin.setMaximumWidth(70)
+            return spin
 
         config_group = QGroupBox("Map Voting Configuration")
         config_layout = QGridLayout()
+        config_layout.setHorizontalSpacing(12)
 
         self.enable_cb = QCheckBox("Enable End-of-Match Auto Voting")
         self.enable_cb.setChecked(self._voting_enabled)
-        config_layout.addWidget(self.enable_cb, 0, 0, 1, 2)
+        config_layout.addWidget(self.enable_cb, 0, 0, 1, 6)
 
         config_layout.addWidget(QLabel("Match Duration (mins):"), 1, 0)
-        self.match_duration_spin = QSpinBox()
+        self.match_duration_spin = small(QSpinBox())
         self.match_duration_spin.setRange(1, 120)
         self.match_duration_spin.setValue(self._match_duration)
         config_layout.addWidget(self.match_duration_spin, 1, 1)
 
         config_layout.addWidget(QLabel("Trigger Vote X mins before end:"), 2, 0)
-        self.trigger_spin = QSpinBox()
+        self.trigger_spin = small(QSpinBox())
         self.trigger_spin.setRange(1, 20)
         self.trigger_spin.setValue(self._trigger_mins)
         config_layout.addWidget(self.trigger_spin, 2, 1)
 
         config_layout.addWidget(QLabel("Vote Duration (mins):"), 3, 0)
-        self.duration_spin = QSpinBox()
+        self.duration_spin = small(QSpinBox())
         self.duration_spin.setRange(1, 10)
         self.duration_spin.setValue(self._vote_duration)
         config_layout.addWidget(self.duration_spin, 3, 1)
 
-        # (Row 1, Cols 2 & 3)
-        config_layout.addWidget(QLabel("Reset Pool At:"), 1, 2)
+        config_layout.addWidget(QLabel("Vote Choices (2-5):"), 1, 2)
+        self.choices_spin = small(QSpinBox())
+        self.choices_spin.setRange(2, 5)
+        self.choices_spin.setValue(self._vote_choices)
+        config_layout.addWidget(self.choices_spin, 1, 3)
+
+        config_layout.addWidget(QLabel("Reset Pool At:"), 2, 2)
         slider_layout = QHBoxLayout()
         self.reset_pool_slider = QSlider(Qt.Orientation.Horizontal)
         self.reset_pool_slider.setRange(20, 100)
         self.reset_pool_slider.setSingleStep(5)
         self.reset_pool_slider.setValue(self._reset_pool_pct)
+        self.reset_pool_slider.setMaximumWidth(220)
         self.reset_pool_slider.setStyleSheet("""
             QSlider::groove:horizontal { background: #1a1a00; height: 8px; border-radius: 4px; }
             QSlider::handle:horizontal { background: #e8c840; width: 16px; height: 16px; margin: -4px 0; border-radius: 8px; }
@@ -6029,16 +6078,9 @@ class MapVotingTab(QWidget):
         self.reset_pool_val_lbl = QLabel(f"{self._reset_pool_pct}%")
         slider_layout.addWidget(self.reset_pool_slider)
         slider_layout.addWidget(self.reset_pool_val_lbl)
-        config_layout.addLayout(slider_layout, 1, 3)
+        slider_layout.addStretch()
+        config_layout.addLayout(slider_layout, 2, 3)
 
-        # (Row 2, Cols 2 & 3)
-        config_layout.addWidget(QLabel("Vote Choices (2-5):"), 2, 2)
-        self.choices_spin = QSpinBox()
-        self.choices_spin.setRange(2, 5)
-        self.choices_spin.setValue(self._vote_choices)
-        config_layout.addWidget(self.choices_spin, 2, 3)
-
-        # (Row 3, Cols 2 & 3)
         blacklist_title = QLabel("Blacklist:")
         blacklist_title.setToolTip("Maps are only blacklisted if players are on the server and actively voting.")
         config_layout.addWidget(blacklist_title, 3, 2)
@@ -6048,6 +6090,11 @@ class MapVotingTab(QWidget):
         self.blacklist_lbl.setToolTip("Maps are only blacklisted if players are on the server and actively voting.")
         config_layout.addWidget(self.blacklist_lbl, 3, 3)
 
+        self.start_btn = SatisfyingButton("Start Vote Now")
+        self.start_btn.clicked.connect(self._start_vote)
+        config_layout.addWidget(self.start_btn, 4, 0, 1, 4)
+        config_layout.setColumnStretch(4, 1)
+
         self.reset_pool_slider.valueChanged.connect(self._on_reset_pool_changed)
         self.choices_spin.valueChanged.connect(self._save_recently_played)
         self.enable_cb.stateChanged.connect(self._save_recently_played)
@@ -6055,21 +6102,160 @@ class MapVotingTab(QWidget):
         self.trigger_spin.valueChanged.connect(self._save_recently_played)
         self.duration_spin.valueChanged.connect(self._save_recently_played)
 
-        self.start_btn = SatisfyingButton("Start Vote Now")
-        self.start_btn.clicked.connect(self._start_vote)
-        config_layout.addWidget(self.start_btn, 4, 0, 1, 4)
-
         config_group.setLayout(config_layout)
         layout.addWidget(config_group)
 
+        columns.addWidget(self._build_early_rules_group(), 3)
+
         self.status_lbl = QLabel("Status: Waiting for map change...")
         self.status_lbl.setStyleSheet("font-size: 11pt; padding: 10px; color: #a89830;")
+        self.status_lbl.setWordWrap(True)
         layout.addWidget(self.status_lbl)
 
         self.log_text = QPlainTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setStyleSheet("font-family: Consolas, monospace; font-size: 9pt;")
-        layout.addWidget(self.log_text)
+        self.log_text.setStyleSheet(
+            "font-family: Consolas, monospace; font-size: 9pt; "
+            "background-color: #0a0a00; color: #a89830; border: 1px solid #3a3a00;"
+        )
+        self.log_text.setMinimumHeight(90)
+        layout.addWidget(self.log_text, 1)
+
+    _EARLY_RULES_HELP = (
+        "<b>Why this is here:</b> the normal vote starts a few minutes before "
+        "the <b>timer</b> runs out. Some modes end on a <b>score</b> instead - a "
+        "team deathmatch hitting its kill limit, a King of the Hill or Capture "
+        "the Flag reaching its score - so the map changes before the vote ever "
+        "starts and nobody gets to vote.<br><br>"
+        "Tick a rule and the vote starts earlier on those maps only. "
+        "<b>Everything here is off by default - leave it off and voting works "
+        "exactly as it always has.</b> The mode is read from the map's file "
+        "name. The first rule reached starts the vote, it runs once per map, "
+        "and the winner only becomes the NEXT map - the match carries on. "
+        "Mods can still type <b>!startvote</b>."
+    )
+
+    _MODE_PREFIX_HINTS = {
+        vote_rules.MODE_TDM: "TD",
+        vote_rules.MODE_DM: "DM",
+        vote_rules.MODE_TKOTH: "TK",
+        vote_rules.MODE_CTF: "CTF",
+        vote_rules.MODE_FB: "FB",
+        vote_rules.MODE_OTHER: "not AS / AAS",
+    }
+
+    def _build_early_rules_group(self):
+        group = QGroupBox("Maps that can end early (optional)")
+        outer = QVBoxLayout()
+
+        help_lbl = QLabel(self._EARLY_RULES_HELP)
+        help_lbl.setWordWrap(True)
+        help_lbl.setTextFormat(Qt.TextFormat.RichText)
+        help_lbl.setStyleSheet("font-size: 9pt; color: #c8b040;")
+        # A wrapped label reports its unwrapped width unless told it may shrink,
+        # which pushed the whole group off the right-hand edge.
+        help_lbl.setMinimumWidth(240)
+        help_lbl.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
+        outer.addWidget(help_lbl)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(6)
+        self._rule_widgets = {}
+        row = -1
+        for mode in vote_rules.SCORE_MODES:
+            row += 1
+            rule = self._mode_rules.get(mode, vote_rules.ModeRule())
+            name = QLabel(
+                f"{vote_rules.MODE_LABELS[mode]}  "
+                f"<span style='color:#807020'>({self._MODE_PREFIX_HINTS[mode]})</span>"
+            )
+            name.setTextFormat(Qt.TextFormat.RichText)
+            grid.addWidget(name, row, 0)
+
+            minutes_cb = QCheckBox("vote")
+            minutes_cb.setChecked(rule.minutes_in_enabled)
+            minutes_spin = QSpinBox()
+            minutes_spin.setRange(1, 240)
+            minutes_spin.setValue(rule.minutes_in)
+            minutes_spin.setMaximumWidth(70)
+            minutes_spin.setEnabled(rule.minutes_in_enabled)
+            minutes_cb.toggled.connect(minutes_spin.setEnabled)
+            grid.addWidget(minutes_cb, row, 1)
+            grid.addWidget(minutes_spin, row, 2)
+            grid.addWidget(QLabel("mins in"), row, 3)
+
+            kills_cb = kills_spin = None
+            if mode in vote_rules.KILL_MODES:
+                kills_cb = QCheckBox("or within")
+                kills_cb.setChecked(rule.kill_watch_enabled)
+                kills_spin = QSpinBox()
+                kills_spin.setRange(1, 500)
+                kills_spin.setValue(rule.kills_before_limit)
+                kills_spin.setMaximumWidth(70)
+                kills_spin.setEnabled(rule.kill_watch_enabled)
+                kills_cb.toggled.connect(kills_spin.setEnabled)
+                kills_cb.setToolTip(
+                    "Kills are read from the player list every 5 seconds. A player "
+                    "who leaves takes their kills with them, so the total can read "
+                    "a little low - keep this margin generous."
+                )
+                kills_row = QHBoxLayout()
+                kills_row.addWidget(kills_cb)
+                kills_row.addWidget(kills_spin)
+                kills_row.addWidget(QLabel("kills of the limit"))
+                kills_row.addStretch()
+                # Its own line under the mode: side by side it ran off the
+                # right-hand edge at ordinary window widths.
+                row += 1
+                grid.addLayout(kills_row, row, 1, 1, 4)
+
+            for widget in (minutes_cb, kills_cb):
+                if widget is not None:
+                    widget.toggled.connect(self._save_recently_played)
+            for widget in (minutes_spin, kills_spin):
+                if widget is not None:
+                    widget.valueChanged.connect(self._save_recently_played)
+            self._rule_widgets[mode] = (minutes_cb, minutes_spin, kills_cb, kills_spin)
+        grid.setColumnStretch(4, 1)
+        outer.addLayout(grid)
+
+        self.current_mode_lbl = QLabel("Current map: -")
+        self.current_mode_lbl.setStyleSheet("font-size: 9pt; color: #a89830;")
+        outer.addWidget(self.current_mode_lbl)
+        outer.addStretch()
+
+        group.setLayout(outer)
+        return group
+
+    def _current_rules(self):
+        """The early-vote rules as the tick boxes stand right now."""
+        widgets = getattr(self, '_rule_widgets', None)
+        if not widgets:
+            return self._mode_rules
+        rules = {}
+        for mode, (minutes_cb, minutes_spin, kills_cb, kills_spin) in widgets.items():
+            rules[mode] = vote_rules.ModeRule(
+                minutes_in_enabled=minutes_cb.isChecked(),
+                minutes_in=minutes_spin.value(),
+                kill_watch_enabled=bool(kills_cb and kills_cb.isChecked()),
+                kills_before_limit=(
+                    kills_spin.value() if kills_spin
+                    else vote_rules.DEFAULT_KILLS_BEFORE_LIMIT
+                ),
+            )
+        return rules
+
+    def _show_current_mode(self, mode):
+        if not self._current_map:
+            self.current_mode_lbl.setText("Current map: -")
+            return
+        self.current_mode_lbl.setText(
+            f"Current map: {self._current_map}  ->  "
+            f"{vote_rules.MODE_LABELS.get(mode, mode)}"
+        )
 
     def _on_reset_pool_changed(self, val):
         self.reset_pool_val_lbl.setText(f"{val}%")
@@ -6108,7 +6294,8 @@ class MapVotingTab(QWidget):
                 'voting_enabled': self.enable_cb.isChecked(),
                 'match_duration': self.match_duration_spin.value(),
                 'trigger_mins': self.trigger_spin.value(),
-                'vote_duration': self.duration_spin.value()
+                'vote_duration': self.duration_spin.value(),
+                'mode_rules': vote_rules.rules_to_json(self._current_rules()),
             }
             with open(self._recently_played_file, 'w', encoding='utf-8') as f:
                 json.dump(data, f)
@@ -6145,6 +6332,7 @@ class MapVotingTab(QWidget):
             self._match_start_time = time.time()
             self._vote_active = False
             self._vote_stage = 'idle'
+            self._kill_watch.reset()
 
             # --- FIX: Clear list if it hits 50% of the total rotation ---
             mtab = getattr(self, 'missions_tab', None)
@@ -6220,16 +6408,27 @@ class MapVotingTab(QWidget):
                 self.status_lbl.setText(f"Status: Server data stale ({self._server_game_time_remaining}m). Waiting for update...")
                 return
 
-            remaining = self._server_game_time_remaining
-            total = self._server_game_time_total
+            mode = vote_rules.game_mode(self._current_map)
+            self._show_current_mode(mode)
+            decision = vote_rules.decide(
+                vote_rules.MatchView(
+                    self._current_map,
+                    self._server_game_time_remaining,
+                    self._server_game_time_total,
+                    vote_rules.leading_kills(mode, self.server.player_entries),
+                    vote_rules.kill_limit(self.server.game_settings),
+                    mode,
+                ),
+                trigger_mins,
+                self._current_rules(),
+                self._kill_watch,
+            )
+            self.status_lbl.setText(decision.status)
 
-            if remaining > trigger_mins:
-                self.status_lbl.setText(f"Status: {remaining}m / {total}m remaining. Auto-vote in {remaining - trigger_mins}m")
-            else:
-                self.status_lbl.setText(f"Status: {remaining}m remaining. Auto-vote pending...")
-
-            if self.enable_cb.isChecked() and remaining <= trigger_mins:
+            if self.enable_cb.isChecked() and decision.fire:
                 if len(self.server.players) > 0:
+                    self.log(f"Auto-vote: {decision.reason}")
+                    wire_log(f"[VOTE] auto-start: {decision.reason}")
                     self._start_vote()
 
     def _start_vote(self):
@@ -7085,7 +7284,7 @@ class DownloadWorker(QThread):
 
 
 class MainWindow(QMainWindow):
-    """WolfRAT 2.6.1 Main Window."""
+    """WolfRAT 2.6.2 Main Window."""
 
     def __init__(self, runtime: DesktopRuntime | None = None):
         super().__init__()
@@ -7104,7 +7303,7 @@ class MainWindow(QMainWindow):
         self._sync_led_timer = QTimer(self)
         self._sync_led_timer.setSingleShot(True)
         self._sync_led_timer.timeout.connect(self._clear_sync_led)
-        self.setWindowTitle("WolfRAT 2.6.1 - Joint Operations Server Admin")
+        self.setWindowTitle("WolfRAT 2.6.2 - Joint Operations Server Admin")
 
         # Set Window Icon
         icon_path = os.path.join(os.path.dirname(__file__), 'icon.ico')
@@ -7178,7 +7377,7 @@ class MainWindow(QMainWindow):
         self.signals.connected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.connected_signal.connect(lambda: sounds.play("connect"))
         self.signals.disconnected_signal.connect(lambda: self.set_connected(False, 'Disconnected'))
-        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.6.1 - Joint Operations Server Admin"))
+        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.6.2 - Joint Operations Server Admin"))
         self.signals.disconnected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.disconnected_signal.connect(lambda: self.server_tab.handle_disconnect_ui())
         self.signals.reconnecting_signal.connect(lambda attempt: self.set_connected(False, f'Reconnecting (Attempt {attempt})...'))
@@ -7189,9 +7388,9 @@ class MainWindow(QMainWindow):
     def _update_title(self, server_name=""):
         """Update window title with server name when connected."""
         if server_name:
-            self.setWindowTitle(f"WolfRAT 2.6.1 \u2014 {server_name}")
+            self.setWindowTitle(f"WolfRAT 2.6.2 \u2014 {server_name}")
         else:
-            self.setWindowTitle("WolfRAT 2.6.1 - Joint Operations Server Admin")
+            self.setWindowTitle("WolfRAT 2.6.2 - Joint Operations Server Admin")
 
     def _build_ui(self):
         central = QWidget()
@@ -7199,7 +7398,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(central)
 
         # Header
-        header = QLabel("WolfRAT 2.6.1")
+        header = QLabel("WolfRAT 2.6.2")
         header.setStyleSheet("font-size: 22pt; font-weight: bold; color: #e8c840; padding: 12px; letter-spacing: 4px;")
         header.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(header)
@@ -7234,6 +7433,25 @@ class MainWindow(QMainWindow):
             self.server, self.missions_tab, self.runtime
         )
         self.web_admin_tab = WebAdminTab(self.web_server, self.runtime)
+        self.weather_tab = WeatherTab(
+            self.runtime,
+            send_chat=lambda message: submit_admin(
+                self.mods_tab,
+                lambda: self.server.send_chat(message),
+                context="Weather announcement",
+            ),
+            button_cls=SatisfyingButton,
+            context=lambda: {
+                "connected": self.server.is_connected,
+                "map": self.weather_tab.current_map,
+                "players": len(self.server.players or ()),
+            },
+            map_list=lambda: [
+                (m.get('file', ''), m.get('name', ''))
+                for m in self.missions_store._data.get('available', [])
+            ],
+        )
+        self.server._weather_tab = self.weather_tab  # mods system forwards !storm etc.
 
         # Wire up cross-tab references
         self.missions_tab._main_window = self
@@ -7247,6 +7465,8 @@ class MainWindow(QMainWindow):
         self.signals.missions_signal.connect(self.map_voting_tab.on_missions_updated)
         self.signals.missions_signal.connect(self.spree_tab.on_missions_updated)
         self.signals.chat_signal.connect(self.map_voting_tab.on_chat)
+        self.signals.missions_signal.connect(self.weather_tab.on_missions_updated)
+        self.signals.available_maps_signal.connect(self.weather_tab.refresh_maps)
 
         self.tabs.addTab(self.server_tab, "🖥️ Server")
         self.tabs.addTab(self.console_tab, "👥 Console")
@@ -7259,6 +7479,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.spree_tab, "🔥 Sprees")
         self.tabs.addTab(self.mods_tab, "🛡️ Mods")
         self.tabs.addTab(self.map_voting_tab, "🌐 Map Voting")
+        self.tabs.addTab(self.weather_tab, "⛈️ Weather")
         self.tabs.addTab(self.web_admin_tab, "🌐 Web Admin")
 
         layout.addWidget(self.tabs)
@@ -7328,7 +7549,7 @@ class MainWindow(QMainWindow):
 
         status_bar.addSpacing(10)
 
-        ver_label = QLabel("v2.6.1 · Built by BadgerLove · FMJ Squad")
+        ver_label = QLabel("v2.6.2 · Built by BadgerLove · FMJ Squad")
         ver_label.setStyleSheet("font-size: 9pt; color: #444;")
         status_bar.addWidget(ver_label)
 
@@ -7384,7 +7605,7 @@ class MainWindow(QMainWindow):
     # ---- Auto-updater ---------------------------------------------------
 
     _VERSION_URL = "https://fmj-squad.com/version.json"
-    _CURRENT_VERSION = "2.6.1"
+    _CURRENT_VERSION = "2.6.2"
 
     @staticmethod
     def _is_newer(latest: str, current: str) -> bool:
@@ -7643,7 +7864,7 @@ def start_desktop(
 
     runtime = runtime or DesktopRuntime.production()
     app.setStyleSheet(DARK_STYLE)
-    app.setApplicationName("WolfRAT 2.6.1")
+    app.setApplicationName("WolfRAT 2.6.2")
     sounds.set_enabled(runtime.audio_enabled)
     if runtime.audio_enabled:
         sounds.initialize()
@@ -7714,7 +7935,7 @@ def schedule_desktop_smoke(
                 "web_application": web_application_available,
             }
             checks = {
-                "tab_count": window.tabs.count() == 12,
+                "tab_count": window.tabs.count() == 13,
                 "web_stopped": not window.web_server.is_running,
                 "retail_disconnected": not window.server.is_connected,
                 **resources,
@@ -7752,7 +7973,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
         print(f"WolfRAT startup error: {error}")
         return 2
     runtime = runtime or launch.runtime
-    wire_log("=== WolfRAT 2.6.1 STARTED ===")
+    wire_log("=== WolfRAT 2.6.2 STARTED ===")
 
     # Catch-all exception handler for debugging
     import traceback
@@ -7805,7 +8026,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
 
             bstats.bstats_start(
                 "wolfrat",
-                "2.6.1",
+                "2.6.2",
                 data_dir=runtime.data_dir,
             )
         except Exception:

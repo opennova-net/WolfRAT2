@@ -1,0 +1,553 @@
+"""The Weather tab.  All the game knowledge lives in ``wolfrat.weather``."""
+
+from __future__ import annotations
+
+import json
+import re
+import time
+from typing import Callable, Optional
+
+from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtWidgets import (
+    QCheckBox, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QListWidget,
+    QPushButton, QSizePolicy, QSlider, QSpinBox, QTabWidget, QVBoxLayout, QWidget,
+)
+
+from wolfrat import weather
+from wolfrat import weather_dynamic
+from wolfrat.weather_dynamic_page import DynamicPage
+from wolfrat.protocol import wire_log
+from wolfrat.runtime import DesktopRuntime
+
+_PRESET_BUTTONS = (
+    ("storm", "⛈️ Storm"), ("rain", "🌧️ Rain"), ("drizzle", "🌦️ Drizzle"),
+    ("fog", "🌫️ Fog"), ("blizzard", "🌨️ Blizzard"), ("snow", "❄️ Snow"),
+    ("overcast", "☁️ Overcast"),
+)
+
+_HELP = (
+    "<b>What this does.</b> Joint Ops maps normally decide their own weather, "
+    "and it plays the same way every time. This tab changes the sky on the "
+    "<b>server</b>, and the server already tells every player what the sky is "
+    "doing - so everybody sees the same rain, snow, fog and cloud, with the "
+    "normal game. Nobody needs to download anything."
+    "<br><br><b>Needs:</b> WolfRAT running on the same PC as the game server "
+    "(it changes the numbers inside the running server). Over a remote "
+    "connection the tab stays greyed out."
+    "<br><br><b>Good to know</b>"
+    "<br>• Weather fades in and out over the fade time - it is not instant."
+    "<br>• A map change resets the sky; WolfRAT puts your weather back within "
+    "a few seconds for as long as it is active."
+    "<br>• Fog can only come closer than the map's own view distance, never "
+    "further."
+    "<br>• Earthquake really does nudge players and vehicles about a little."
+    "<br>• Lightning and thunder are not here yet: the game sends them a "
+    "different way, and the server add-on for that is still being finished."
+)
+
+
+class WeatherTab(QWidget):
+    """Presets, custom dials, timed weather and mod chat commands."""
+
+    POLL_MS = 5000
+    SETTLE_SECONDS = 20      # after a (re)connect or map change, before writing
+
+    def __init__(
+        self,
+        runtime: DesktopRuntime | None = None,
+        send_chat: Optional[Callable[[str], object]] = None,
+        button_cls: type = QPushButton,
+        attach: Callable[..., tuple] = weather.attach_local_server,
+        context: Optional[Callable[[], dict]] = None,
+        map_list: Optional[Callable[[], list]] = None,
+    ):
+        super().__init__()
+        self.runtime = runtime or DesktopRuntime.production()
+        self._send_chat = send_chat
+        self._button_cls = button_cls
+        self._attach = attach
+        # context() -> {"connected": bool, "map": str | None, "players": int}
+        self._context = context
+        self._map_list = map_list
+        self._dynamic = weather_dynamic.DynamicWeather(clock=time.monotonic)
+        self._settled_key = None
+        self._settled_since = 0.0
+        self.current_map = None
+
+        self._controller: Optional[weather.WeatherController] = None
+        self._memory = None
+        self._writable = False
+        self._schedule = weather.WeatherSchedule()
+        self._last_problem = ""
+
+        self._settings_file = self.runtime.path("wolfrat_weather.json")
+        self._settings = {
+            "mods_enabled": False, "announce": True, "minutes": 10,
+            "precip": 60, "snow": False, "overcast": 80, "fog_on": False,
+            "fog_metres": 300, "fade": 25, "dynamic": {}, "seen_maps": {},
+        }
+        try:
+            if self._settings_file.exists():
+                saved = json.loads(self._settings_file.read_text(encoding="utf-8"))
+                if isinstance(saved, dict):
+                    self._settings.update(
+                        {k: v for k, v in saved.items() if k in self._settings}
+                    )
+        except Exception:
+            pass
+
+        self._build_ui()
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._poll)
+        self._timer.start(self.POLL_MS)
+        QTimer.singleShot(0, self._poll)
+
+    # ------------------------------------------------------------------ UI
+    def _build_ui(self):
+        outer = QVBoxLayout(self)
+        self.status_lbl = QLabel("Looking for a game server on this PC...")
+        self.status_lbl.setWordWrap(True)
+        self.status_lbl.setStyleSheet("font-size: 10pt; color: #c8b040; padding: 4px;")
+        outer.addWidget(self.status_lbl)
+
+        self.sky_lbl = QLabel("")
+        self.sky_lbl.setStyleSheet("font-size: 9pt; color: #a89830; padding: 0 4px 6px 4px;")
+        outer.addWidget(self.sky_lbl)
+
+        self.pages = QTabWidget()
+        outer.addWidget(self.pages, 1)
+        manual_page = QWidget()
+        self.pages.addTab(manual_page, "Manual")
+        self.dynamic_page = DynamicPage(
+            weather_dynamic.DynamicConfig.from_json(self._settings.get("dynamic")),
+            button_cls=self._button_cls,
+            map_list=self._map_list,
+        )
+        self.dynamic_page.load_seen(self._settings.get("seen_maps"))
+        self.dynamic_page.changed.connect(self._dynamic_changed)
+        self.pages.addTab(self.dynamic_page, "Dynamic")
+        self._dynamic_was_on = self.dynamic_page.config().enabled
+
+        root = QHBoxLayout(manual_page)
+        left, right = QVBoxLayout(), QVBoxLayout()
+        root.addLayout(left, 3)
+        root.addLayout(right, 2)
+
+        # -- presets
+        preset_group = QGroupBox("Weather now")
+        preset_box = QVBoxLayout()
+        grid = QGridLayout()
+        self._action_widgets = []
+        for index, (name, label) in enumerate(_PRESET_BUTTONS):
+            button = self._button_cls(label)
+            button.setToolTip(weather.PRESETS[name].describe())
+            button.clicked.connect(lambda _=False, n=name: self._start_preset(n))
+            grid.addWidget(button, index // 4, index % 4)
+            self._action_widgets.append(button)
+        preset_box.addLayout(grid)
+
+        time_row = QHBoxLayout()
+        time_row.addWidget(QLabel("Keep it for"))
+        self.minutes_spin = QSpinBox()
+        self.minutes_spin.setRange(0, weather.MAX_MINUTES)
+        self.minutes_spin.setValue(int(self._settings["minutes"]))
+        self.minutes_spin.setSpecialValueText("until I clear it")
+        self.minutes_spin.setSuffix(" min")
+        self.minutes_spin.setMinimumWidth(120)
+        self.minutes_spin.valueChanged.connect(self._save)
+        time_row.addWidget(self.minutes_spin)
+        time_row.addStretch()
+        self.clear_btn = self._button_cls("☀️ Clear the weather")
+        self.clear_btn.clicked.connect(self._clear)
+        time_row.addWidget(self.clear_btn)
+        self._action_widgets.append(self.clear_btn)
+        preset_box.addLayout(time_row)
+
+        self.active_lbl = QLabel("No weather set by WolfRAT.")
+        self.active_lbl.setStyleSheet("font-size: 9pt; color: #a89830;")
+        preset_box.addWidget(self.active_lbl)
+        preset_group.setLayout(preset_box)
+        left.addWidget(preset_group)
+
+        # -- custom
+        custom_group = QGroupBox("Make your own")
+        custom = QGridLayout()
+        self.precip_slider, self.precip_val = self._slider(0, 100, self._settings["precip"], "%")
+        self.overcast_slider, self.overcast_val = self._slider(0, 100, self._settings["overcast"], "%")
+        self.fog_slider, self.fog_val = self._slider(50, 1500, self._settings["fog_metres"], " m")
+        self.fade_slider, self.fade_val = self._slider(1, 120, self._settings["fade"], " s")
+        self.snow_cb = QCheckBox("as snow")
+        self.snow_cb.setChecked(bool(self._settings["snow"]))
+        self.snow_cb.toggled.connect(self._save)
+        self.fog_cb = QCheckBox("Fog at")
+        self.fog_cb.setChecked(bool(self._settings["fog_on"]))
+        self.fog_cb.toggled.connect(self.fog_slider.setEnabled)
+        self.fog_cb.toggled.connect(self._save)
+        self.fog_slider.setEnabled(self.fog_cb.isChecked())
+
+        custom.addWidget(QLabel("Rain / snow"), 0, 0)
+        custom.addWidget(self.precip_slider, 0, 1)
+        custom.addWidget(self.precip_val, 0, 2)
+        custom.addWidget(self.snow_cb, 0, 3)
+        custom.addWidget(QLabel("Overcast"), 1, 0)
+        custom.addWidget(self.overcast_slider, 1, 1)
+        custom.addWidget(self.overcast_val, 1, 2)
+        custom.addWidget(self.fog_cb, 2, 0)
+        custom.addWidget(self.fog_slider, 2, 1)
+        custom.addWidget(self.fog_val, 2, 2)
+        custom.addWidget(QLabel("Fade over"), 3, 0)
+        custom.addWidget(self.fade_slider, 3, 1)
+        custom.addWidget(self.fade_val, 3, 2)
+        self.apply_btn = self._button_cls("Apply")
+        self.apply_btn.clicked.connect(self._start_custom)
+        custom.addWidget(self.apply_btn, 3, 3)
+        self._action_widgets.append(self.apply_btn)
+        custom.setColumnStretch(1, 1)
+        custom_group.setLayout(custom)
+        left.addWidget(custom_group)
+
+        # -- quake
+        quake_group = QGroupBox("Earthquake")
+        quake_row = QHBoxLayout()
+        self.quake_spin = QSpinBox()
+        self.quake_spin.setRange(1, weather.QUAKE_MAX_SECONDS)
+        self.quake_spin.setValue(5)
+        self.quake_spin.setSuffix(" s")
+        quake_row.addWidget(self.quake_spin)
+        self.quake_btn = self._button_cls("🌋 Shake")
+        self.quake_btn.clicked.connect(lambda: self._quake(self.quake_spin.value(), "WolfRAT"))
+        quake_row.addWidget(self.quake_btn)
+        self._action_widgets.append(self.quake_btn)
+        quake_row.addStretch()
+        quake_group.setLayout(quake_row)
+        left.addWidget(quake_group)
+        left.addStretch()
+
+        # -- right column
+        help_group = QGroupBox("How it works")
+        help_box = QVBoxLayout()
+        help_lbl = QLabel(_HELP)
+        help_lbl.setWordWrap(True)
+        help_lbl.setTextFormat(Qt.TextFormat.RichText)
+        help_lbl.setStyleSheet("font-size: 9pt; color: #c8b040;")
+        help_lbl.setMinimumWidth(240)
+        help_lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        help_box.addWidget(help_lbl)
+        help_group.setLayout(help_box)
+        right.addWidget(help_group)
+
+        chat_group = QGroupBox("In-game commands")
+        chat_box = QVBoxLayout()
+        self.mods_cb = QCheckBox("Let mods change the weather from chat")
+        self.mods_cb.setChecked(bool(self._settings["mods_enabled"]))
+        self.mods_cb.setToolTip(
+            "!storm 10   !rain   !snow   !blizzard   !fog   !drizzle   !overcast\n"
+            "!clear   !quake 5   !weather <name> [minutes]"
+        )
+        self.mods_cb.toggled.connect(self._save)
+        chat_box.addWidget(self.mods_cb)
+        self.announce_cb = QCheckBox("Announce weather changes in chat")
+        self.announce_cb.setChecked(bool(self._settings["announce"]))
+        self.announce_cb.toggled.connect(self._save)
+        chat_box.addWidget(self.announce_cb)
+        cmds = QLabel("!storm 10 &nbsp; !rain &nbsp; !drizzle &nbsp; !fog &nbsp; !overcast<br>"
+                      "!snow &nbsp; !blizzard &nbsp; !clear &nbsp; !quake 5")
+        cmds.setTextFormat(Qt.TextFormat.RichText)
+        cmds.setWordWrap(True)
+        cmds.setStyleSheet("font-size: 9pt; color: #a89830;")
+        cmds.setMinimumWidth(240)
+        cmds.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        chat_box.addWidget(cmds)
+        chat_group.setLayout(chat_box)
+        right.addWidget(chat_group)
+
+        log_group = QGroupBox("Weather log")
+        log_box = QVBoxLayout()
+        self.log_list = QListWidget()
+        log_box.addWidget(self.log_list)
+        log_group.setLayout(log_box)
+        right.addWidget(log_group, 1)
+
+        self._set_available(False)
+
+    def _slider(self, low, high, value, suffix):
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(low, high)
+        slider.setValue(max(low, min(high, int(value))))
+        label = QLabel(f"{slider.value()}{suffix}")
+        label.setMinimumWidth(56)
+        slider.valueChanged.connect(lambda v, l=label, s=suffix: l.setText(f"{v}{s}"))
+        slider.sliderReleased.connect(self._save)
+        return slider, label
+
+    def _set_available(self, available: bool):
+        for widget in self._action_widgets:
+            widget.setEnabled(available)
+
+    # ------------------------------------------------------------ plumbing
+    def log(self, message: str):
+        self.log_list.addItem(f"[{time.strftime('%H:%M:%S')}] {message}")
+        self.log_list.scrollToBottom()
+        while self.log_list.count() > 200:
+            self.log_list.takeItem(0)
+        wire_log(f"[WEATHER] {message}")
+
+    def _save(self, *_):
+        self._settings.update({
+            "mods_enabled": self.mods_cb.isChecked(),
+            "announce": self.announce_cb.isChecked(),
+            "minutes": self.minutes_spin.value(),
+            "precip": self.precip_slider.value(),
+            "snow": self.snow_cb.isChecked(),
+            "overcast": self.overcast_slider.value(),
+            "fog_on": self.fog_cb.isChecked(),
+            "fog_metres": self.fog_slider.value(),
+            "fade": self.fade_slider.value(),
+            "dynamic": self.dynamic_page.config().to_json(),
+            "seen_maps": self.dynamic_page.seen(),
+        })
+        try:
+            self._settings_file.write_text(json.dumps(self._settings, indent=2), encoding="utf-8")
+        except Exception as exc:
+            wire_log(f"[WEATHER] could not save settings: {exc}")
+
+    def _detach(self):
+        if self._memory is not None:
+            try:
+                self._memory.close()
+            except Exception:
+                pass
+        self._controller = self._memory = None
+        self._writable = False
+
+    def _ensure(self, writable: bool) -> Optional[weather.WeatherController]:
+        """Status polling only ever holds a read-only handle; the first real
+        action swaps it for one that can write."""
+        if self._controller is not None and (self._writable or not writable):
+            return self._controller
+        self._detach()
+        try:
+            self._controller, self._memory = self._attach(writable=writable)
+            self._writable = writable
+            self._last_problem = ""
+        except weather.WeatherError as exc:
+            self._problem(str(exc))
+        return self._controller
+
+    def _problem(self, text: str):
+        self._detach()
+        self._set_available(False)
+        self.status_lbl.setText("⚪ " + text)
+        self.sky_lbl.setText("")
+        if text != self._last_problem:
+            self._last_problem = text
+            wire_log(f"[WEATHER] unavailable: {text}")
+
+    def _poll(self):
+        # A held weather must keep being re-asserted even after the server
+        # restarted under us, so it asks for the writable handle back.
+        controller = self._ensure(
+            writable=(self._writable or self._schedule.active is not None
+                      or self.dynamic_page.config().enabled)
+        )
+        if controller is None:
+            return
+        try:
+            outcome = self._schedule.tick(controller) if self._writable else None
+            reading = controller.read()
+        except weather.WeatherError as exc:
+            self._problem(str(exc))
+            return
+        if outcome == "ended":
+            self.log("Timed weather finished - clearing.")
+            self._announce("The weather is clearing.")
+        self._set_available(True)
+        self.status_lbl.setText(f"🟢 Game server found on this PC (process {self._memory.pid}).")
+        kind = "snow" if reading.snow else "rain"
+        self.sky_lbl.setText(
+            f"Sky right now:  {kind} {reading.precip_percent}%   ·   overcast "
+            f"{reading.overcast_percent}%   ·   you can see {reading.fog_metres} m "
+            f"(map allows {reading.map_fog_metres} m)   ·   game clock {reading.clock}"
+        )
+        self.fog_slider.setMaximum(max(100, reading.map_fog_metres))
+        active = self._schedule.active
+        if active is None:
+            self.active_lbl.setText("No weather set by WolfRAT.")
+        else:
+            left = self._schedule.seconds_left()
+            tail = "until cleared" if left is None else f"{left // 60}:{left % 60:02d} left"
+            self.active_lbl.setText(f"Holding: {active.describe()}  -  {tail}")
+        self._dynamic_tick(controller, reading)
+
+    # ------------------------------------------------------------- dynamic
+    def _server_context(self) -> tuple[Optional[str], int, bool]:
+        """(map, players, settled).  Settled = connected, and neither the
+        connection nor the map has changed for SETTLE_SECONDS - a map load drops
+        the admin connection, so this keeps us from writing into a loading server."""
+        if self._context is None:
+            return self.current_map, 1, True
+        try:
+            info = self._context() or {}
+        except Exception:
+            info = {}
+        connected = bool(info.get("connected"))
+        key = (connected, info.get("map"))
+        now = time.monotonic()
+        if key != self._settled_key:
+            self._settled_key, self._settled_since = key, now
+        settled = connected and now - self._settled_since >= self.SETTLE_SECONDS
+        return info.get("map"), int(info.get("players") or 0), settled
+
+    def _dynamic_tick(self, controller, reading):
+        config = self.dynamic_page.config()
+        try:
+            self.dynamic_page.set_lightning_status(
+                controller.lightning_available() if config.lightning else None
+            )
+            map_name, players, settled = self._server_context()
+            info = controller.map_info()
+            snow = weather_dynamic.is_snow_map(info.terrain, info.says_snow, config.snow_terrains)
+            rule = weather_dynamic.map_rule_for(map_name, config.map_rules)
+            if self.dynamic_page.show_current_map(map_name, info, snow, rule):
+                self._save()
+            decision = self._dynamic.tick(
+                config, map_name=map_name, players=players, in_game=settled,
+                manual_active=self._schedule.active is not None,
+                sky_is_dry=reading.precip_percent < 2, sky_is_snow=reading.snow,
+                map_is_snow=snow if info.terrain else None,
+            )
+            self.dynamic_page.set_status(decision.status)
+            if not self._writable:
+                return
+            if decision.sky is not None:
+                controller.apply(decision.sky)
+            if decision.quake_seconds:
+                used = controller.quake(decision.quake_seconds)
+                self.log(f"Dynamic weather: {used} s earthquake.")
+                if config.announce and self._send_chat:
+                    self._send_chat("Earthquake!")
+            if decision.lightning:
+                controller.flash()
+        except weather.WeatherError as exc:
+            self._problem(str(exc))
+            return
+        if decision.announce:
+            self.log(f"Dynamic weather: {decision.announce}")
+            if self._send_chat:
+                try:
+                    self._send_chat(decision.announce)
+                except Exception as exc:
+                    wire_log(f"[WEATHER] announce failed: {exc}")
+
+    def _dynamic_changed(self):
+        self._save()
+        enabled = self.dynamic_page.config().enabled
+        if enabled != self._dynamic_was_on:
+            self._dynamic_was_on = enabled
+            self.log("Dynamic weather switched " + ("on." if enabled else "off."))
+            if not enabled and self._dynamic.front is not None and self._schedule.active is None:
+                controller = self._ensure(writable=True)
+                if controller is not None:
+                    try:
+                        controller.apply(weather.CLEAR)
+                    except weather.WeatherError as exc:
+                        self._problem(str(exc))
+            if not enabled:
+                self._dynamic.reset()
+        self._poll()
+
+    def _announce(self, message: str):
+        if self._send_chat and self.announce_cb.isChecked():
+            try:
+                self._send_chat(message)
+            except Exception as exc:
+                wire_log(f"[WEATHER] announce failed: {exc}")
+
+    # ------------------------------------------------------------- actions
+    def _start(self, sky: weather.Weather, label: str, minutes: Optional[int], who: str) -> bool:
+        controller = self._ensure(writable=True)
+        if controller is None:
+            return False
+        try:
+            if sky == weather.CLEAR:
+                self._schedule.clear(controller)
+            else:
+                self._schedule.start(controller, sky, minutes)
+        except weather.WeatherError as exc:
+            self._problem(str(exc))
+            return False
+        if sky == weather.CLEAR:
+            self.log(f"{who} cleared the weather.")
+            self._announce("The weather is clearing.")
+        else:
+            span = f" for {minutes} min" if minutes else ""
+            self.log(f"{who} set {label}{span} ({sky.describe()}).")
+            self._announce(f"Weather: {label} rolling in{span}.")
+        self._poll()
+        return True
+
+    def _start_preset(self, name: str):
+        self._start(weather.PRESETS[name], name, self.minutes_spin.value() or None, "WolfRAT")
+
+    def _start_custom(self):
+        self._save()
+        sky = weather.Weather(
+            precip_percent=self.precip_slider.value(),
+            snow=self.snow_cb.isChecked(),
+            overcast_percent=self.overcast_slider.value(),
+            fog_metres=self.fog_slider.value() if self.fog_cb.isChecked() else None,
+            fade_seconds=self.fade_slider.value(),
+        )
+        self._start(sky, "custom weather", self.minutes_spin.value() or None, "WolfRAT")
+
+    def _clear(self):
+        self._dynamic.end_front_now()
+        self._start(weather.CLEAR, "clear", None, "WolfRAT")
+
+    def refresh_maps(self, *_):
+        self.dynamic_page.refresh_maps()
+
+    def on_missions_updated(self, missions):
+        """Same <CURRENT MISSION> parse the Sprees tab uses."""
+        for line in missions or ():
+            if '<CURRENT MISSION>' in line:
+                current = line.split(' - ')[0].strip()
+                if ':' in current[:5]:
+                    current = current.split(':', 1)[1].strip()
+                current = re.sub(r'<[^>]*>', '', current).strip()
+                if current and current != self.current_map:
+                    self.current_map = current
+                    wire_log(f"[WEATHER] map is now {current}")
+                return
+
+    def _quake(self, seconds: int, who: str) -> bool:
+        controller = self._ensure(writable=True)
+        if controller is None:
+            return False
+        try:
+            used = controller.quake(seconds)
+        except weather.WeatherError as exc:
+            self._problem(str(exc))
+            return False
+        self.log(f"{who} started a {used} s earthquake.")
+        self._announce("Earthquake!")
+        return True
+
+    # ----------------------------------------------------------- mod chat
+    def on_mod_command(self, sender: str, cmd: str, args: list[str]) -> Optional[str]:
+        """Called by the Mods tab for an authorised mod.  Returns a chat reply
+        for the mod, or None when the public announcement already says it."""
+        if not self.mods_cb.isChecked():
+            return "Weather commands are switched off in WolfRAT."
+        request = weather.parse_chat_command(cmd, args)
+        if request.kind == "usage":
+            return request.message
+        if request.kind == "quake":
+            ok = self._quake(request.seconds, sender)
+        else:
+            if request.weather == weather.CLEAR:
+                self._dynamic.end_front_now()
+            ok = self._start(request.weather, request.name, request.minutes, sender)
+        if not ok:
+            return "Weather is not available: WolfRAT must run on the server PC."
+        return None if self.announce_cb.isChecked() else "Weather changed."
