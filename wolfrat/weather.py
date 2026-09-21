@@ -30,6 +30,7 @@ against the ``Memory`` protocol so tests use a fake.
 from __future__ import annotations
 
 import ctypes
+import os
 import struct
 import sys
 import time
@@ -91,6 +92,33 @@ class Addr:
 
 LIGHTNING_MAGIC = 0x544C5257           # "WRLT"
 
+# The server.wac add-on.  WAC script variables are plain memory (G# lives at
+# 0xC6BA40 + 4n) and script actions flagged 0x08 - `flash`, `farflash` - are
+# broadcast to every client by the engine itself (net msg 0x23).  The add-on
+# watches G250: 1 = flash, 2 = farflash, 3 = "are you there?" -> it answers 4.
+ADDON_REQUEST = 0x00C6BA40 + 4 * 250
+ADDON_FLASH, ADDON_FARFLASH, ADDON_PING, ADDON_PONG = 1, 2, 3, 4
+
+ADDON_SCRIPT = """\
+// WolfRAT weather add-on (lightning + thunder). Safe to leave in place:
+// it does nothing unless WolfRAT asks. G250 is the request slot.
+//   1 = lightning flash overhead   2 = distant lightning   3 = "are you there?"
+
+if eq(G250, 1) then
+flash
+set(G250, 0)
+endif
+
+if eq(G250, 2) then
+farflash
+set(G250, 0)
+endif
+
+if eq(G250, 3) then
+set(G250, 4)
+endif
+"""
+
 
 # Proof that the process is the build this address map was traced from: the
 # first bytes of the engine's own `rain` setter, which end in the very write
@@ -101,6 +129,53 @@ FINGERPRINT = (
     (0x004EDFB0, bytes.fromhex("893584686c02")),    # mov [PRECIP_TARGET], esi
     (0x0082E2E5, b"rain\x00"),
 )
+
+
+ADDON_FILENAME = "server.wac"
+ADDON_MARK = "WolfRAT weather add-on"
+
+
+def addon_installed(server_dir) -> bool:
+    """Is our block in the server's server.wac?"""
+    try:
+        path = os.path.join(str(server_dir), ADDON_FILENAME)
+        with open(path, "rb") as handle:
+            return ADDON_MARK.encode("ascii") in handle.read()
+    except OSError:
+        return False
+
+
+def install_addon(server_dir) -> str:
+    """Put the lightning add-on in the server folder.  Appends to an existing
+    server.wac instead of replacing it.  The game's script compiler is from
+    2004: it needs Windows line endings, or the whole file reads as one long
+    comment and silently does nothing."""
+    path = os.path.join(str(server_dir), ADDON_FILENAME)
+    block = ADDON_SCRIPT.replace("\r\n", "\n").replace("\n", "\r\n").encode("ascii")
+    existing = b""
+    if os.path.exists(path):
+        with open(path, "rb") as handle:
+            existing = handle.read()
+        if ADDON_MARK.encode("ascii") in existing:
+            return "already"
+        existing = existing.replace(b"\r\n", b"\n").replace(b"\r", b"\n").replace(b"\n", b"\r\n")
+        if existing and not existing.endswith(b"\r\n"):
+            existing += b"\r\n"
+        existing += b"\r\n"
+    temp = path + ".wolfrat-new"
+    try:
+        with open(temp, "wb") as handle:
+            handle.write(existing + block)
+        with open(temp, "rb") as handle:
+            if handle.read() != existing + block:
+                raise OSError("read-back mismatch")
+        os.replace(temp, path)
+    except OSError as exc:
+        raise WeatherError(
+            "WolfRAT could not write server.wac into the server folder "
+            f"({exc}). Run WolfRAT as administrator, or copy the file in by hand."
+        ) from exc
+    return "installed"
 
 
 class WeatherError(Exception):
@@ -243,6 +318,8 @@ class WeatherController:
     def __init__(self, memory: Memory):
         self._mem = memory
         self._verified = False
+        self._addon: Optional[bool] = None     # None = not asked yet
+        self._ping_pending = False
 
     # -- plumbing ----------------------------------------------------------
     def _get(self, address: int) -> int:
@@ -330,6 +407,36 @@ class WeatherController:
         if weather.cloud_speed is not None:
             self._put(Addr.CLOUD_SPEED_TARGET, max(0, min(255, weather.cloud_speed)) << 10)
 
+    def snapshot(self) -> dict:
+        """Where the sky is HEADING right now - taken before our first write so the
+        sky can be put back as we found it (a map's own script may have set it)."""
+        if not self._verified:
+            self.verify()
+        return {
+            "precip": self._get(Addr.PRECIP_TARGET),
+            "snow": self._get(Addr.PRECIP_IS_SNOW),
+            "overcast": self._get(Addr.OVERCAST_TARGET),
+            "fog": self._get(Addr.FOG_TARGET),
+            "cloud": self._get(Addr.CLOUD_SPEED_TARGET),
+        }
+
+    def restore(self, saved: dict, fade_seconds: int = 90) -> None:
+        """Fade back to a `snapshot`."""
+        if not self._verified:
+            self.verify()
+        seconds = max(0, fade_seconds)
+        precip = max(0, min(FIXED_ONE, int(saved["precip"])))
+        if self._get(Addr.PRECIP_CURRENT) < FIXED_ONE // 50:
+            self._put(Addr.PRECIP_IS_SNOW, 1 if saved.get("snow") else 0)
+        self._ramp(Addr.PRECIP_CURRENT, Addr.PRECIP_TARGET, Addr.PRECIP_STEP, precip, seconds)
+        self._ramp(Addr.OVERCAST_CURRENT, Addr.OVERCAST_TARGET, Addr.OVERCAST_STEP,
+                   max(0, min(FIXED_ONE, int(saved["overcast"]))), seconds)
+        reference = self._get(Addr.FOG_REFERENCE)
+        if reference >= FOG_MIN:
+            fog = max(FOG_MIN, min(int(saved["fog"]), reference))
+            self._ramp(Addr.FOG_CURRENT, Addr.FOG_TARGET, Addr.FOG_STEP, fog, seconds)
+        self._put(Addr.CLOUD_SPEED_TARGET, int(saved["cloud"]))
+
     def map_info(self) -> MapInfo:
         if not self._verified:
             self.verify()
@@ -349,23 +456,48 @@ class WeatherController:
             weather_type=struct.unpack_from("<i", header, 0xB8)[0],
         )
 
-    def lightning_available(self) -> bool:
-        """True only when the patched server is running its lightning cave."""
-        if not self._verified:
-            self.verify()
+    def _cave_running(self) -> bool:
         try:
-            if self._get(Addr.LIGHTNING_MARKER) != LIGHTNING_MAGIC:
-                return False
-            return True
+            return self._get(Addr.LIGHTNING_MARKER) == LIGHTNING_MAGIC
         except WeatherError:
             return False
 
-    def flash(self) -> bool:
-        """One lightning flash + thunder for everyone.  False without the patch."""
-        if not self.lightning_available():
-            return False
-        self._put(Addr.LIGHTNING_MAILBOX, 1)
-        return True
+    def probe_addon(self) -> Optional[bool]:
+        """Ask the server.wac add-on whether it is running.  Needs a writable
+        handle.  Never blocks: the question goes out on one call and the answer
+        is read on the next, so call it once per poll."""
+        if not self._verified:
+            self.verify()
+        value = self._get(ADDON_REQUEST)
+        if self._ping_pending:
+            if value == ADDON_PONG:
+                self._addon = True
+            elif value == ADDON_PING:
+                self._addon = False            # nobody picked it up: not loaded on this map
+            self._ping_pending = False
+        if value in (0, ADDON_PING, ADDON_PONG):   # never stamp on a flash still waiting
+            self._put(ADDON_REQUEST, ADDON_PING)
+            self._ping_pending = True
+        return self._addon
+
+    def lightning_available(self) -> bool:
+        """True when the server can flash: the add-on answered, or a lightning cave is running."""
+        if not self._verified:
+            self.verify()
+        return self._addon is True or self._cave_running()
+
+    def flash(self, far: bool = False) -> bool:
+        """Lightning + thunder for everyone.  False when the server cannot do it."""
+        if not self._verified:
+            self.verify()
+        if self._addon is True:
+            self._put(ADDON_REQUEST, ADDON_FARFLASH if far else ADDON_FLASH)
+            self._ping_pending = False
+            return True
+        if self._cave_running():
+            self._put(Addr.LIGHTNING_MAILBOX, 1)
+            return True
+        return False
 
     def quake(self, seconds: int) -> int:
         """Shake the ground.  Returns the seconds actually used."""
@@ -434,14 +566,14 @@ class WeatherSchedule:
 # ---------------------------------------------------------------------------
 
 CHAT_COMMANDS = ("!weather", "!storm", "!rain", "!snow", "!blizzard", "!fog",
-                 "!drizzle", "!overcast", "!clear", "!quake")
+                 "!drizzle", "!overcast", "!clear", "!quake", "!lightning")
 
 MAX_MINUTES = 240
 
 
 @dataclass(frozen=True)
 class ChatRequest:
-    kind: str                      # 'weather' | 'quake' | 'usage'
+    kind: str                      # 'weather' | 'quake' | 'lightning' | 'usage'
     weather: Optional[Weather] = None
     name: str = ""
     minutes: Optional[int] = None
@@ -458,6 +590,8 @@ def parse_chat_command(cmd: str, args: list[str]) -> ChatRequest:
             return ChatRequest("usage", message="Usage: !weather <" + "|".join(PRESETS) + "> [minutes]")
         cmd = "!" + args.pop(0).lower()
     name = cmd[1:]
+    if name == "lightning":
+        return ChatRequest("lightning")
     if name == "quake":
         seconds = 5
         if args:
@@ -562,6 +696,17 @@ class ProcessMemory:
         if not self._k.WriteProcessMemory(self._handle, ctypes.c_void_p(address), data,
                                           len(data), ctypes.byref(done)) or done.value != len(data):
             raise WeatherError("Could not write to the server's memory (has it closed?).")
+
+    def exe_path(self) -> str:
+        """Full path of the server's exe - its folder is where server.wac goes."""
+        size = ctypes.c_uint32(1024)
+        buffer = ctypes.create_unicode_buffer(size.value)
+        query = self._k.QueryFullProcessImageNameW
+        query.argtypes = (ctypes.c_void_p, ctypes.c_uint32, ctypes.c_wchar_p,
+                          ctypes.POINTER(ctypes.c_uint32))
+        if not query(self._handle, 0, buffer, ctypes.byref(size)):
+            return ""
+        return buffer.value
 
     def close(self) -> None:
         if self._handle:

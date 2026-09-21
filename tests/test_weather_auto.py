@@ -141,3 +141,26 @@ def test_buttons_are_auto_rain_snow_no_weather(qtbot, tmp_path):
     page.map_table.selectRow(0)
     page._set_rule(d.MAP_AUTO)
     assert page.map_table.item(0, 2).text() == "Auto" and page.config().map_rules == {}
+
+
+# ---- the forecast tells the truth (Dale: "forecast for a blizzard on a green deserty map") ----
+
+def test_forecast_and_status_name_what_will_actually_fall():
+    config = on(frequency="normal", weights=only("blizzard"))
+    jungle = run(config, hours=3, map_is_snow=False)
+    texts = " | ".join(dec.status for _, dec, _ in jungle)
+    assert "storm on this map" in texts and "Storm front" in texts
+    assert "blizzard" not in texts.lower()
+
+    config = on(frequency="normal", weights=only("rain"))
+    arctic = " | ".join(dec.status for _, dec, _ in run(config, hours=3, map_is_snow=True))
+    assert "snow on this map" in arctic and "Snow front" in arctic and "rain" not in arctic.lower()
+
+    by_hand = on(frequency="normal", weights=only("blizzard"), map_rules={"adale": d.MAP_NO_SNOW})
+    assert "storm on this map" in " | ".join(dec.status for _, dec, _ in run(by_hand, hours=2, map_is_snow=True))
+
+
+def test_kind_on_map():
+    assert d.kind_on_map("blizzard", d.MAP_NO_SNOW) == "storm" and d.kind_on_map("snow", d.MAP_NO_SNOW) == "rain"
+    assert d.kind_on_map("storm", d.MAP_SNOW) == "blizzard" and d.kind_on_map("drizzle", d.MAP_SNOW) == "snow"
+    assert d.kind_on_map("fog", d.MAP_SNOW) == "fog" and d.kind_on_map("blizzard", d.MAP_AUTO) == "blizzard"

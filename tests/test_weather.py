@@ -11,9 +11,11 @@ from wolfrat.weather import Addr, Weather, WeatherController, WeatherError, Weat
 class FakeServer:
     """Sparse memory plus the ramp from Environment_UpdateWeatherTick @0x57E9B0."""
 
-    def __init__(self, dedicated=1, map_fog_m=1000, fingerprint=True):
+    def __init__(self, dedicated=1, map_fog_m=1000, fingerprint=True, addon=False):
         self.cells = {}
         self.writes = []
+        self.addon = addon          # is server.wac loaded on this map?
+        self.flashes = []           # what the script broadcast: "flash" / "farflash"
         if fingerprint:
             for address, data in w.FINGERPRINT:
                 self.cells[address] = data
@@ -32,6 +34,7 @@ class FakeServer:
         put(Addr.QUAKE_TICKS, 0)
         put(Addr.CLOUD_SPEED_TARGET, 15 << 10)
         put(Addr.TIME_OF_DAY, 9 << 24)
+        put(w.ADDON_REQUEST, 0)
         self.set_map()
 
     def set_map(self, title="AS - Snake River Ruins TAC", terrain="dvxg1.trn", climate=0,
@@ -68,7 +71,20 @@ class FakeServer:
         self.writes.append(address)
         self.cells[address] = bytes(data)
 
+    def run_script(self):
+        """What server.wac does on a game tick."""
+        if not self.addon:
+            return
+        request = self.peek(w.ADDON_REQUEST)
+        if request == w.ADDON_FLASH:
+            self.flashes.append("flash"), self.poke(w.ADDON_REQUEST, 0)
+        elif request == w.ADDON_FARFLASH:
+            self.flashes.append("farflash"), self.poke(w.ADDON_REQUEST, 0)
+        elif request == w.ADDON_PING:
+            self.poke(w.ADDON_REQUEST, w.ADDON_PONG)
+
     def tick(self, seconds):
+        self.run_script()
         for _ in range(int(seconds * 62)):
             for cur, tgt, step in self.RAMPS:
                 c, t, s = self.peek(cur), self.peek(tgt), self.peek(step)

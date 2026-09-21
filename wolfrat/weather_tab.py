@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from typing import Callable, Optional
@@ -41,8 +42,9 @@ _HELP = (
     "<br>• Fog can only come closer than the map's own view distance, never "
     "further."
     "<br>• Earthquake really does nudge players and vehicles about a little."
-    "<br>• Lightning and thunder are not here yet: the game sends them a "
-    "different way, and the server add-on for that is still being finished."
+    "<br>• <b>Lightning and thunder</b> need one tiny script file on the server. Press "
+    "<b>Install lightning add-on</b> below and WolfRAT puts it there; it switches on at the "
+    "next map change. Players still download nothing."
 )
 
 
@@ -73,6 +75,8 @@ class WeatherTab(QWidget):
         self._settled_key = None
         self._settled_since = 0.0
         self.current_map = None
+        self._sky_before = None        # the sky as we found it, before our front
+        self._sky_before_map = None
 
         self._controller: Optional[weather.WeatherController] = None
         self._memory = None
@@ -207,7 +211,7 @@ class WeatherTab(QWidget):
         left.addWidget(custom_group)
 
         # -- quake
-        quake_group = QGroupBox("Earthquake")
+        quake_group = QGroupBox("Earthquake and lightning")
         quake_row = QHBoxLayout()
         self.quake_spin = QSpinBox()
         self.quake_spin.setRange(1, weather.QUAKE_MAX_SECONDS)
@@ -218,8 +222,35 @@ class WeatherTab(QWidget):
         self.quake_btn.clicked.connect(lambda: self._quake(self.quake_spin.value(), "WolfRAT"))
         quake_row.addWidget(self.quake_btn)
         self._action_widgets.append(self.quake_btn)
+        self.flash_btn = self._button_cls("⚡ Lightning")
+        self.flash_btn.setToolTip("One flash and a roll of thunder for everybody.")
+        self.flash_btn.clicked.connect(lambda: self._flash("WolfRAT"))
+        self.flash_btn.setEnabled(False)
+        quake_row.addWidget(self.flash_btn)
+        self.far_flash_btn = self._button_cls("🌩️ Distant")
+        self.far_flash_btn.setToolTip("Lightning on the horizon, thunder a moment later.")
+        self.far_flash_btn.clicked.connect(lambda: self._flash("WolfRAT", far=True))
+        self.far_flash_btn.setEnabled(False)
+        quake_row.addWidget(self.far_flash_btn)
+        self.install_btn = self._button_cls("Install lightning add-on")
+        self.install_btn.setToolTip(
+            "Lightning is the one thing the game will not do on command without a tiny script "
+            "on the server. This puts that script (server.wac) in your server folder for you. "
+            "It does nothing unless WolfRAT asks, and players download nothing."
+        )
+        self.install_btn.clicked.connect(self._install_addon)
+        self.install_btn.setVisible(False)
+        quake_row.addWidget(self.install_btn)
         quake_row.addStretch()
-        quake_group.setLayout(quake_row)
+        quake_box = QVBoxLayout()
+        quake_box.addLayout(quake_row)
+        self.flash_lbl = QLabel("")
+        self.flash_lbl.setWordWrap(True)
+        self.flash_lbl.setStyleSheet("font-size: 9pt; color: #a89830;")
+        self.flash_lbl.setMinimumWidth(240)
+        self.flash_lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        quake_box.addWidget(self.flash_lbl)
+        quake_group.setLayout(quake_box)
         left.addWidget(quake_group)
         left.addStretch()
 
@@ -401,10 +432,16 @@ class WeatherTab(QWidget):
     def _dynamic_tick(self, controller, reading):
         config = self.dynamic_page.config()
         try:
-            self.dynamic_page.set_lightning_status(
-                controller.lightning_available() if config.lightning else None
-            )
             map_name, players, settled = self._server_context()
+            if self._writable and settled:          # never write into a loading server
+                controller.probe_addon()
+            can_flash = controller.lightning_available()
+            for button in (self.flash_btn, self.far_flash_btn):
+                button.setEnabled(can_flash)
+            text, offer_install = self._lightning_state(can_flash, controller._addon is not None)
+            self.flash_lbl.setText(text)
+            self.install_btn.setVisible(offer_install)
+            self.dynamic_page.set_lightning_text(text if config.lightning else "")
             info = controller.map_info()
             snow = weather_dynamic.is_snow_map(info.terrain, info.says_snow, config.snow_terrains)
             rule = weather_dynamic.map_rule_for(map_name, config.map_rules)
@@ -416,18 +453,35 @@ class WeatherTab(QWidget):
                 sky_is_dry=reading.precip_percent < 2, sky_is_snow=reading.snow,
                 map_is_snow=snow if info.terrain else None,
             )
-            self.dynamic_page.set_status(decision.status)
+            status = decision.status
+            if self._dynamic.front is None and config.enabled and (
+                    reading.precip_percent >= 2 or reading.overcast_percent >= 2):
+                kind = "snow" if reading.snow else "rain"
+                parts = ([f"{kind} {reading.precip_percent}%"] if reading.precip_percent >= 2 else []) \
+                    + ([f"overcast {reading.overcast_percent}%"] if reading.overcast_percent >= 2 else [])
+                status += "  -  the map's own sky right now: " + ", ".join(parts) + "."
+            self.dynamic_page.set_status(status)
             if not self._writable:
                 return
+            if self._sky_before is not None and self._sky_before_map != map_name:
+                self._sky_before = None                     # new map: its load reset the sky
             if decision.sky is not None:
-                controller.apply(decision.sky)
+                handing_back = decision.sky.describe() == "clear"
+                if not handing_back and self._sky_before is None:
+                    self._sky_before, self._sky_before_map = controller.snapshot(), map_name
+                if handing_back and self._sky_before is not None:
+                    controller.restore(self._sky_before, decision.sky.fade_seconds)
+                else:
+                    controller.apply(decision.sky)
+                if handing_back:
+                    self._sky_before = None
             if decision.quake_seconds:
                 used = controller.quake(decision.quake_seconds)
                 self.log(f"Dynamic weather: {used} s earthquake.")
                 if config.announce and self._send_chat:
                     self._send_chat("Earthquake!")
             if decision.lightning:
-                controller.flash()
+                controller.flash(far=decision.lightning_far)
         except weather.WeatherError as exc:
             self._problem(str(exc))
             return
@@ -520,6 +574,59 @@ class WeatherTab(QWidget):
                     wire_log(f"[WEATHER] map is now {current}")
                 return
 
+    def _server_dir(self) -> str:
+        try:
+            path = self._memory.exe_path() if self._memory is not None else ""
+        except Exception:
+            path = ""
+        return os.path.dirname(path) if path else ""
+
+    def _lightning_state(self, can_flash: bool, answered: bool = True) -> tuple[str, bool]:
+        """(what to tell the admin, whether to offer the Install button)."""
+        if can_flash:
+            return "Lightning is ready on this map.", False
+        folder = self._server_dir()
+        if not folder:
+            return "Lightning: could not find the server's folder.", False
+        if not weather.addon_installed(folder):
+            return ("Lightning needs a tiny add-on in your server folder. Press "
+                    "'Install lightning add-on' - WolfRAT does it for you."), True
+        if not self._writable:
+            return ("Lightning add-on is installed. WolfRAT checks it the first time you use "
+                    "the weather."), False
+        if not answered:
+            return "Lightning add-on is installed - checking that it is running...", False
+        return ("Lightning add-on is installed, but this map loaded before it was - it switches "
+                "on at the next map change. Nothing else to do."), False
+
+    def _install_addon(self):
+        folder = self._server_dir()
+        if not folder:
+            self.log("Could not find the server's folder to install the lightning add-on.")
+            return
+        try:
+            result = weather.install_addon(folder)
+        except weather.WeatherError as exc:
+            self.flash_lbl.setText(str(exc))
+            self.log(str(exc))
+            return
+        self.log("Lightning add-on already installed." if result == "already"
+                 else f"Lightning add-on installed in {folder}. It switches on at the next map change.")
+        self._poll()
+
+    def _flash(self, who: str, far: bool = False) -> bool:
+        controller = self._ensure(writable=True)
+        if controller is None:
+            return False
+        try:
+            fired = controller.flash(far=far)
+        except weather.WeatherError as exc:
+            self._problem(str(exc))
+            return False
+        if fired:
+            self.log(f"{who} called down {'distant ' if far else ''}lightning.")
+        return fired
+
     def _quake(self, seconds: int, who: str) -> bool:
         controller = self._ensure(writable=True)
         if controller is None:
@@ -542,6 +649,8 @@ class WeatherTab(QWidget):
         request = weather.parse_chat_command(cmd, args)
         if request.kind == "usage":
             return request.message
+        if request.kind == "lightning":
+            return None if self._flash(sender) else "Lightning is not set up on this server."
         if request.kind == "quake":
             ok = self._quake(request.seconds, sender)
         else:

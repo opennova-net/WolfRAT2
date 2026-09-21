@@ -149,7 +149,13 @@ class DynamicPage(QWidget):
             weight = int(config.weights.get(name, 0))
             box = QCheckBox(dyn.TYPE_LABELS[name])
             box.setChecked(weight > 0)
-            box.setToolTip(" -> ".join(dyn.TYPE_LABELS[n] for n in dyn.LADDERS[name]))
+            tip = "Builds up through: " + " -> ".join(dyn.TYPE_LABELS[n] for n in dyn.LADDERS[name])
+            if name in ("snow", "blizzard"):
+                tip += ("\nOn a map that is not a snow map (Auto or Rain) this falls as "
+                        + ("rain" if name == "snow" else "a storm") + " instead.")
+            elif name in ("drizzle", "rain", "storm"):
+                tip += "\nOn a snow map this falls as snow instead."
+            box.setToolTip(tip)
             spin = _spin(1, 100, weight or 10, width=64)
             spin.setEnabled(weight > 0)
             box.toggled.connect(spin.setEnabled)
@@ -317,6 +323,9 @@ class DynamicPage(QWidget):
 
     def set_status(self, text: str):
         self.status_lbl.setText(text)
+
+    def set_lightning_text(self, text: str):
+        self.lightning_lbl.setText(text)
 
     def set_lightning_status(self, available: bool | None):
         if available is None:

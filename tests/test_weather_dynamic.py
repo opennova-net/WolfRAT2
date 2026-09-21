@@ -158,12 +158,52 @@ def test_a_front_carries_across_a_map_change():
 
 # ---- per-map rules ----------------------------------------------------------
 
-def test_no_weather_map_gets_clear_sky_and_no_chat():
+def test_no_weather_map_is_left_completely_alone():
+    """Villa Valley TAC has its own scripted weather: 'No weather' must never write to it."""
     config = on(frequency="constant", map_rules={"kill house": d.MAP_NONE},
                 quake_enabled=True, quake_every=5)
     log = run(config, hours=6, map_name="TD-COD4_KillHouse.bms")
-    assert all(dec.sky.describe() == "clear" and not dec.announce and not dec.quake_seconds
+    assert all(dec.sky is None and not dec.announce and not dec.quake_seconds and not dec.lightning
                for _, dec, _ in log)
+    assert any("leaving its sky alone" in dec.status for _, dec, _ in log)
+
+
+def test_clear_spells_write_nothing_so_a_maps_own_weather_can_play():
+    log = run(on(frequency="normal"), hours=20)
+    clears = [dec for _, dec, front in log if front is None]
+    handed_back = [dec for dec in clears if dec.sky is not None]
+    fronts = len({id(front) for _, _, front in log if front is not None})
+    assert len(clears) > 1000
+    assert len(handed_back) <= fronts                 # one hand-back per front, nothing else
+    assert all(dec.sky.describe() == "clear" for dec in handed_back)
+
+
+def test_the_sky_is_handed_back_once_when_a_front_ends():
+    log = run(on(frequency="constant", weights=only("rain")), hours=3)
+    previous_front = None
+    for index, (_, dec, front) in enumerate(log):
+        if previous_front is not None and front is None:
+            assert dec.sky is not None and dec.sky.describe() == "clear"
+            assert log[index + 1][1].sky is None
+            break
+        previous_front = front
+    else:
+        raise AssertionError("no front ended")
+
+
+def test_a_map_change_is_never_followed_by_a_late_clear():
+    """The load restores the map's sky; a 'clear' 20 s in would stamp on its opening weather."""
+    now = [0.0]
+    engine = DynamicWeather(clock=lambda: now[0], rng=random.Random(5))
+    config = on(frequency="constant", map_rules={"villa valley": d.MAP_NONE})
+    ctx = dict(players=4, manual_active=False, in_game=True)
+    while engine.front is None:
+        engine.tick(config, map_name="TD-Adale.bms", **ctx)
+        now[0] += 5
+    assert engine.tick(config, map_name="TD-Adale.bms", **ctx).sky is not None   # our front is showing
+    for _ in range(200):
+        now[0] += 5
+        assert engine.tick(config, map_name="AS - Villa Valley TAC.npj", **ctx).sky is None
 
 
 def test_snow_instead_and_never_snow():
@@ -187,7 +227,7 @@ def test_snow_front_waits_for_the_rain_to_stop():
     for _ in range(200):
         decision = engine.tick(config, sky_is_dry=False, sky_is_snow=False, **ctx)
         now[0] += 5
-    assert engine.front is None and decision.sky == w.CLEAR and "dry" in decision.status
+    assert engine.front is None and decision.sky is None and "dry" in decision.status
     engine.tick(config, sky_is_dry=True, sky_is_snow=False, **ctx)
     assert engine.front is not None
 

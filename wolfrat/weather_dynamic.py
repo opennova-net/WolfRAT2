@@ -217,6 +217,20 @@ def map_rule_for(map_name: Optional[str], rules: dict) -> str:
     return best_rule if best >= 0.82 else MAP_NORMAL
 
 
+_AS_RAIN = {"snow": "rain", "blizzard": "storm"}
+_AS_SNOW = {"drizzle": "snow", "rain": "snow", "storm": "blizzard"}
+
+
+def kind_on_map(kind: str, rule: str) -> str:
+    """What a front of `kind` turns into under this map's rule - a rolled 'blizzard'
+    is a storm on a jungle map, and the admin should be told 'storm'."""
+    if rule == MAP_NO_SNOW:
+        return _AS_RAIN.get(kind, kind)
+    if rule == MAP_SNOW:
+        return _AS_SNOW.get(kind, kind)
+    return kind
+
+
 def adjust_for_map(sky: Weather, rule: str) -> Weather:
     if rule == MAP_NONE:
         return CLEAR
@@ -309,6 +323,7 @@ class Decision:
     quake_seconds: int = 0
     lightning: bool = False
     status: str = ""
+    lightning_far: bool = False
 
 
 class DynamicWeather:
@@ -325,6 +340,10 @@ class DynamicWeather:
         self._next_quake_at: Optional[float] = None
         self._next_flash_at: Optional[float] = None
         self._paused_by = ""
+        # True while the sky on the server is one WE put there.  A clear spell is
+        # not ours: the map (and any weather script it has) owns the sky then.
+        self._hands_on = False
+        self._last_map: Optional[str] = None
 
     # -- inspection ---------------------------------------------------------
     @property
@@ -339,6 +358,7 @@ class DynamicWeather:
 
     def end_front_now(self) -> None:
         """'Clear the weather' during dynamic mode: this front is over."""
+        self._hands_on = False         # the caller clears the sky itself
         self._front = None
         self._next_front_at = self._next_kind = None
         self._announced_stage = -1
@@ -347,6 +367,13 @@ class DynamicWeather:
         clear_min, clear_max, _, _ = config.spans()
         self._next_front_at = now + self._rng.uniform(clear_min * 60, max(clear_min, clear_max) * 60)
         self._next_kind = pick_kind(config, self._rng)
+
+    def _release(self, fade_seconds: int = 90) -> Optional[Weather]:
+        """Hand the sky back to the map once, then keep our hands off it."""
+        if self._hands_on:
+            self._hands_on = False
+            return replace(CLEAR, fade_seconds=fade_seconds)
+        return None
 
     def _stage_at(self, now: float) -> tuple[int, Optional[Stage], float]:
         elapsed = now - self._front_started
@@ -377,6 +404,11 @@ class DynamicWeather:
         if config.pause_when_empty and players <= 0:
             return Decision(None, status="Paused - nobody is on the server.")
 
+        if map_name != self._last_map:
+            # A map load puts the map's own sky back by itself - nothing to hand back,
+            # and a late "clear" would stamp on the new map's opening weather.
+            self._last_map = map_name
+            self._hands_on = False
         rule = map_rule_for(map_name, config.map_rules)
         if rule == MAP_AUTO and map_is_snow is not None:
             # Auto: the map decides.  Snow maps get snow, everything else rain.
@@ -387,14 +419,14 @@ class DynamicWeather:
         if self._front is None and now >= (self._next_front_at or 0):
             if self._next_kind is None:
                 self._schedule_next(config, now)
-                return Decision(CLEAR, status="No weather types are ticked.")
+                return Decision(self._release(), status="No weather types are ticked.")
             wants_snow = self._next_kind in _SNOWY
             if rule == MAP_NO_SNOW:
                 wants_snow = False
             elif rule == MAP_SNOW and _SHAPES[self._next_kind][0] > 0:
                 wants_snow = True
             if not sky_is_dry and wants_snow != sky_is_snow:
-                return Decision(CLEAR, status="Waiting for the sky to dry before the next front.")
+                return Decision(self._release(), status="Waiting for the sky to dry before the next front.")
             self._front = build_front(self._next_kind, config, self._rng)
             self._front_started = now
             self._announced_stage = -1
@@ -408,24 +440,30 @@ class DynamicWeather:
                 self._schedule_next(config, now)
                 if rule != MAP_NONE:
                     announce = "The weather is clearing."
-                sky = replace(CLEAR, fade_seconds=self._rng.randint(60, 120))
-                status = self._clear_status(now)
+                sky = self._release(self._rng.randint(60, 120))
+                status = self._clear_status(now, rule)
+            elif rule == MAP_NONE:
+                sky = self._release()
+                status = ("This map is set to 'No weather' - WolfRAT is leaving its sky alone "
+                          f"(a {TYPE_LABELS[self._front.kind].lower()} front is passing by).")
             else:
                 sky = adjust_for_map(stage.sky, rule)
+                self._hands_on = True
                 if index != self._announced_stage:
                     first = self._announced_stage == -1
                     self._announced_stage = index
                     if rule != MAP_NONE and (first or stage.peak):
                         announce = self._announcement(stage, sky, first)
                 total_left = int(self._front.seconds - (now - self._front_started))
-                status = (f"{TYPE_LABELS[self._front.kind]} front: {stage.label.lower()}"
+                status = (f"{TYPE_LABELS[kind_on_map(self._front.kind, rule)]} front: "
+                          f"{TYPE_LABELS[kind_on_map(stage.label.lower(), rule)].lower()}"
                           f"{' (peak)' if stage.peak else ''}, "
                           f"{total_left // 60}:{total_left % 60:02d} until clear")
-                if rule == MAP_NONE:
-                    status += "  -  this map is set to 'No weather'"
         else:
-            sky = CLEAR
-            status = self._clear_status(now)
+            sky = self._release()
+            status = self._clear_status(now, rule)
+            if rule == MAP_NONE:
+                status = "This map is set to 'No weather' - WolfRAT is leaving its sky alone."
 
         lightning = False
         if (config.lightning and self._front is not None and self._front.kind == "storm"
@@ -447,14 +485,18 @@ class DynamicWeather:
         else:
             self._next_quake_at = None
 
-        return Decision(sky, announce if config.announce else "", quake, lightning, status)
+        return Decision(sky, announce if config.announce else "", quake, lightning, status,
+                        lightning_far=lightning and self._rng.random() < 0.4)
 
-    def _clear_status(self, now: float) -> str:
+    def _clear_status(self, now: float, rule: str = MAP_AUTO) -> str:
         if self._next_front_at is None:
             return "Clear."
         left = max(0, int(self._next_front_at - now))
-        kind = TYPE_LABELS.get(self._next_kind or "", "nothing ticked")
-        return f"Clear - next front in about {max(1, round(left / 60))} min ({kind.lower()})"
+        if not self._next_kind:
+            return "No WolfRAT front right now - nothing is ticked, so none is coming."
+        kind = TYPE_LABELS[kind_on_map(self._next_kind, rule)].lower()
+        return (f"No WolfRAT front right now - next one in about {max(1, round(left / 60))} min "
+                f"({kind} on this map)")
 
     @staticmethod
     def _announcement(stage: Stage, sky: Weather, first: bool) -> str:

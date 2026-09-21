@@ -17,6 +17,10 @@ MAPS = [("TD-COD4_KillHouse.bms", "Kill House"), ("AS-DoslinOblast.bms", "Doslin
 
 class Handle:
     pid = 77
+    folder = ""
+
+    def exe_path(self):
+        return str(self.folder / "jointops.exe") if self.folder else ""
 
     def close(self):
         pass
@@ -24,6 +28,8 @@ class Handle:
 
 def make(qtbot, tmp_path, server, context=None):
     attaches, said = [], []
+    Handle.folder = tmp_path / "server"
+    Handle.folder.mkdir(exist_ok=True)
 
     def attach(writable=True):
         attaches.append(writable)
@@ -35,6 +41,7 @@ def make(qtbot, tmp_path, server, context=None):
                      context=context, map_list=lambda: MAPS)
     qtbot.addWidget(tab)
     tab._timer.stop()
+    tab._dynamic._rng = __import__("random").Random(1)      # same dice every run: no flaky tests
     tab._poll()
     return tab, said, attaches
 
@@ -175,12 +182,85 @@ def test_lightning_is_reported_honestly_and_fires_only_with_the_patch(qtbot, tmp
     server.poke(Addr.LIGHTNING_MARKER, 0)
     server.poke(Addr.LIGHTNING_MAILBOX, 0)
     tab, _, _ = make(qtbot, tmp_path, server)
-    assert "add-on" in tab.dynamic_page.lightning_lbl.text() and "Not on this server" in tab.dynamic_page.lightning_lbl.text()
+    assert "Install lightning add-on" in tab.dynamic_page.lightning_lbl.text()
+    tab.dynamic_page.enabled_cb.setChecked(True)
+    tab._poll(), tab._poll()
+    assert "Install lightning add-on" in tab.dynamic_page.lightning_lbl.text()
     assert w.WeatherController(server).flash() is False
     assert server.peek(Addr.LIGHTNING_MAILBOX) == 0
 
     server.poke(Addr.LIGHTNING_MARKER, w.LIGHTNING_MAGIC)
     tab._poll()
-    assert "Ready" in tab.dynamic_page.lightning_lbl.text()
+    assert "ready" in tab.dynamic_page.lightning_lbl.text()
     assert w.WeatherController(server).flash() is True
     assert server.peek(Addr.LIGHTNING_MAILBOX) == 1
+
+
+# ---- Trench Warfare: a map that scripts its own rain ------------------------
+
+def trench_warfare(server):
+    """AS-TrenchWarfare.WAC: fogdist(350) Rain(100) skyspeed(50), once, at map start."""
+    server.set_map("AS - Trench Warfare", "dvxg3.trn")
+    server.poke(Addr.PRECIP_TARGET, 0x10000), server.poke(Addr.PRECIP_CURRENT, 0x10000)
+    server.poke(Addr.FOG_TARGET, 350 << 16), server.poke(Addr.FOG_CURRENT, 350 << 16)
+    server.poke(Addr.CLOUD_SPEED_TARGET, 50 << 10)
+
+
+def test_a_maps_own_rain_is_left_alone_and_the_status_says_so(qtbot, tmp_path):
+    server = FakeServer()
+    trench_warfare(server)
+    tab, _, _ = make(qtbot, tmp_path, server)
+    tab.dynamic_page.enabled_cb.setChecked(True)
+    for _ in range(10):
+        server.tick(5)
+        tab._poll()
+    assert server.client_sees()["precip"] == 255 and server.client_sees()["fog_m"] == 350
+    text = tab.dynamic_page.status_lbl.text()
+    assert "No WolfRAT front right now" in text and "the map\'s own sky right now: rain 100%" in text
+    assert "Clear" not in text
+
+
+def test_after_our_front_the_maps_own_rain_comes_back(qtbot, tmp_path, monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr("wolfrat.weather_tab.time.monotonic", lambda: clock[0])
+    server = FakeServer()
+    trench_warfare(server)
+    tab, _, _ = make(qtbot, tmp_path, server)
+    tab._dynamic._clock = lambda: clock[0]
+    tab._dynamic._rng = __import__("random").Random(7)       # same dice every run
+    page = tab.dynamic_page
+    for name, (box, _) in page._type_widgets.items():
+        box.setChecked(name == "fog")                        # a front with no rain in it
+    page.frequency_combo.setCurrentIndex(page.frequency_combo.findData("constant"))
+    page.enabled_cb.setChecked(True)
+
+    dried_out = False
+    for _ in range(int(40 * 60 / 5)):
+        clock[0] += 5
+        server.tick(5)
+        tab._poll()
+        front = tab._dynamic.front
+        if front is not None and server.client_sees()["precip"] == 0:
+            dried_out = True                                 # our fog front replaced the rain
+        if dried_out and front is None:
+            break
+    assert dried_out, "the fog front never took over"
+    # handed back AS FOUND (the map script's rain), not as the .env says (no rain)
+    assert server.peek(Addr.PRECIP_TARGET) == 0x10000
+    assert server.peek(Addr.FOG_TARGET) == 350 << 16
+    assert server.peek(Addr.CLOUD_SPEED_TARGET) == 50 << 10
+    server.tick(30)                                          # and it really does come back
+    assert server.client_sees()["precip"] > 60
+
+
+def test_snapshot_and_restore_round_trip():
+    server = FakeServer()
+    trench_warfare(server)
+    control = w.WeatherController(server)
+    saved = control.snapshot()
+    control.apply(w.PRESETS["fog"])
+    server.tick(60)
+    assert server.client_sees()["precip"] == 0 and server.client_sees()["fog_m"] == 150
+    control.restore(saved, 20)
+    server.tick(40)
+    assert server.client_sees()["precip"] == 255 and server.client_sees()["fog_m"] == 350
