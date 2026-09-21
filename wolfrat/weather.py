@@ -573,12 +573,50 @@ MAX_MINUTES = 240
 
 @dataclass(frozen=True)
 class ChatRequest:
-    kind: str                      # 'weather' | 'quake' | 'lightning' | 'usage'
+    kind: str                      # 'weather' | 'quake' | 'lightning' | 'dynamic' | 'usage'
     weather: Optional[Weather] = None
     name: str = ""
     minutes: Optional[int] = None
     seconds: int = 0
     message: str = ""
+    # kind == 'dynamic' (!weather on / off / status): the weather that changes
+    # on its own.  frequency "" = leave it as it is set in WolfRAT.
+    switch: str = ""               # 'on' | 'off' | 'status'
+    frequency: str = ""            # 'rare' | 'normal' | 'frequent' | 'constant' | 'custom'
+    custom_range: Optional[tuple] = None   # (min, max) minutes of clear sky, custom only
+
+
+# what a mod may type after "!weather on" -> the Dynamic page's frequency key
+DYNAMIC_FREQUENCY_WORDS = {
+    "rare": "rare", "normal": "normal", "frequent": "frequent", "often": "frequent",
+    "always": "constant", "constant": "constant", "almostalways": "constant",
+    "custom": "custom",
+}
+# replies go out as one chat line: 62 characters at most
+DYNAMIC_USAGE = "!weather on rare|normal|frequent|always|custom / !weather off"
+
+
+def _parse_dynamic(switch: str, args: list) -> ChatRequest:
+    if switch != "on":
+        return ChatRequest("dynamic", switch=switch)
+    words = [a.lower() for a in args]
+    if words[:2] == ["almost", "always"]:
+        words[:2] = ["almostalways"]
+    if not words:
+        return ChatRequest("dynamic", switch="on")
+    frequency = DYNAMIC_FREQUENCY_WORDS.get(words[0])
+    if frequency is None:
+        return ChatRequest("usage", message=DYNAMIC_USAGE)
+    custom_range = None
+    if frequency == "custom" and len(words) > 1:
+        numbers = words[1:3]
+        if len(numbers) != 2 or not all(n.isdigit() for n in numbers):
+            return ChatRequest("usage", message="Usage: !weather on custom 5 20  (minutes of clear sky)")
+        low, high = sorted(int(n) for n in numbers)
+        if high > 600:
+            return ChatRequest("usage", message="!weather on custom: 600 minutes at most")
+        custom_range = (low, high)
+    return ChatRequest("dynamic", switch="on", frequency=frequency, custom_range=custom_range)
 
 
 def parse_chat_command(cmd: str, args: list[str]) -> ChatRequest:
@@ -588,7 +626,10 @@ def parse_chat_command(cmd: str, args: list[str]) -> ChatRequest:
     if cmd == "!weather":
         if not args:
             return ChatRequest("usage", message="Usage: !weather <" + "|".join(PRESETS) + "> [minutes]")
-        cmd = "!" + args.pop(0).lower()
+        first = args.pop(0).lower()
+        if first in ("on", "off", "status"):
+            return _parse_dynamic(first, args)
+        cmd = "!" + first
     name = cmd[1:]
     if name == "lightning":
         return ChatRequest("lightning")

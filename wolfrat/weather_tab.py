@@ -10,8 +10,8 @@ from typing import Callable, Optional
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
-    QCheckBox, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QListWidget,
-    QPushButton, QSizePolicy, QSlider, QSpinBox, QTabWidget, QVBoxLayout, QWidget,
+    QCheckBox, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QListWidget,
+    QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from wolfrat import weather
@@ -46,6 +46,20 @@ _HELP = (
     "<b>Install lightning add-on</b> below and WolfRAT puts it there; it switches on at the "
     "next map change. Players still download nothing."
 )
+
+
+def scroll_column() -> tuple:
+    """(scroll area, layout to fill): a column that grows a scroll bar when
+    the window is too short for it, and looks like plain layout when not."""
+    host = QWidget()
+    layout = QVBoxLayout(host)
+    layout.setContentsMargins(0, 0, 6, 0)
+    area = QScrollArea()
+    area.setWidgetResizable(True)
+    area.setFrameShape(QFrame.Shape.NoFrame)
+    area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    area.setWidget(host)
+    return area, layout
 
 
 class WeatherTab(QWidget):
@@ -132,10 +146,13 @@ class WeatherTab(QWidget):
         self.pages.addTab(self.dynamic_page, "Dynamic")
         self._dynamic_was_on = self.dynamic_page.config().enabled
 
+        # Some servers sit on a 1024x768 desktop: each column scrolls on its
+        # own instead of squeezing its buttons and cutting the help text off.
         root = QHBoxLayout(manual_page)
-        left, right = QVBoxLayout(), QVBoxLayout()
-        root.addLayout(left, 3)
-        root.addLayout(right, 2)
+        left_scroll, left = scroll_column()
+        right_scroll, right = scroll_column()
+        root.addWidget(left_scroll, 3)
+        root.addWidget(right_scroll, 2)
 
         # -- presets
         preset_group = QGroupBox("Weather now")
@@ -146,6 +163,7 @@ class WeatherTab(QWidget):
             button = self._button_cls(label)
             button.setToolTip(weather.PRESETS[name].describe())
             button.clicked.connect(lambda _=False, n=name: self._start_preset(n))
+            button.setMinimumHeight(button.sizeHint().height())     # never squeezed into its neighbour
             grid.addWidget(button, index // 4, index % 4)
             self._action_widgets.append(button)
         preset_box.addLayout(grid)
@@ -265,7 +283,6 @@ class WeatherTab(QWidget):
         help_lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         help_box.addWidget(help_lbl)
         help_group.setLayout(help_box)
-        right.addWidget(help_group)
 
         chat_group = QGroupBox("In-game commands")
         chat_box = QVBoxLayout()
@@ -291,10 +308,14 @@ class WeatherTab(QWidget):
         chat_box.addWidget(cmds)
         chat_group.setLayout(chat_box)
         right.addWidget(chat_group)
+        # the switches first, the reading matter under them: on a short
+        # window the help is what should need scrolling to, not the tick boxes
+        right.addWidget(help_group)
 
         log_group = QGroupBox("Weather log")
         log_box = QVBoxLayout()
         self.log_list = QListWidget()
+        self.log_list.setMinimumHeight(110)
         log_box.addWidget(self.log_list)
         log_group.setLayout(log_box)
         right.addWidget(log_group, 1)
@@ -641,6 +662,41 @@ class WeatherTab(QWidget):
         return True
 
     # ----------------------------------------------------------- mod chat
+    def _dynamic_from_chat(self, sender: str, request) -> str:
+        """!weather on [how often] / off / status - the same switch and 'How
+        often' box as the Dynamic page, so the page, the saved settings and
+        the hand-back of the sky all behave exactly as if the admin clicked."""
+        page = self.dynamic_page
+        if request.switch == "status":
+            if not page.enabled_cb.isChecked():
+                return "Weather is off. Mods can type !weather on"
+            return f"Weather is on ({page.frequency_combo.currentText().lower()}). {self._dynamic_status_for_chat()}"[:62]
+        if request.switch == "off":
+            if not page.enabled_cb.isChecked():
+                return "Weather is already off."
+            page.enabled_cb.setChecked(False)
+            self.log(f"{sender} switched the changing weather off from chat.")
+            return "Weather OFF - the sky goes back to the map's own."
+        if request.custom_range is not None:
+            page.clear_min.setValue(request.custom_range[0])
+            page.clear_max.setValue(request.custom_range[1])
+        if request.frequency:
+            index = page.frequency_combo.findData(request.frequency)
+            if index >= 0:
+                page.frequency_combo.setCurrentIndex(index)
+        was_on = page.enabled_cb.isChecked()
+        page.enabled_cb.setChecked(True)
+        how = page.frequency_combo.currentText().lower()
+        config = page.config()
+        clear_min, clear_max, _hold_min, _hold_max = config.spans()
+        self.log(f"{sender} set the changing weather to {how} from chat.")
+        lead = "Weather is now" if was_on else "Weather ON:"
+        return f"{lead} {how} - a front every {clear_min}-{clear_max} min"
+
+    def _dynamic_status_for_chat(self) -> str:
+        text = self.dynamic_page.status_lbl.text().split("  -  ")[0].strip()
+        return text
+
     def on_mod_command(self, sender: str, cmd: str, args: list[str]) -> Optional[str]:
         """Called by the Mods tab for an authorised mod.  Returns a chat reply
         for the mod, or None when the public announcement already says it."""
@@ -649,6 +705,8 @@ class WeatherTab(QWidget):
         request = weather.parse_chat_command(cmd, args)
         if request.kind == "usage":
             return request.message
+        if request.kind == "dynamic":
+            return self._dynamic_from_chat(sender, request)
         if request.kind == "lightning":
             return None if self._flash(sender) else "Lightning is not set up on this server."
         if request.kind == "quake":

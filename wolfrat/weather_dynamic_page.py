@@ -75,9 +75,17 @@ class DynamicPage(QWidget):
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setWidget(left_host)
-        right = QVBoxLayout()
+        # ... and so does the right one on a 1024x768 desktop.
+        right_host = QWidget()
+        right = QVBoxLayout(right_host)
+        right.setContentsMargins(0, 0, 6, 0)
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        right_scroll.setWidget(right_host)
         root.addWidget(scroll, 3)
-        root.addLayout(right, 2)
+        root.addWidget(right_scroll, 2)
 
         # -- help first: the column scrolls, so it costs nothing
         help_group = QGroupBox("How it works")

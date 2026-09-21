@@ -1,5 +1,5 @@
 """
-WolfRAT 2.6.3 - Modern Joint Operations Server Admin Tool
+WolfRAT 2.6.4 - Modern Joint Operations Server Admin Tool
 Replaces the original WolfRAT v0.95 (2005, MFC70)
 """
 
@@ -21,7 +21,9 @@ from PyQt6.QtGui import QColor, QIcon, QTextCursor
 
 from wolfrat import vote_rules
 from wolfrat import weather
-from wolfrat.weather_tab import WeatherTab
+from wolfrat.weather_tab import WeatherTab, scroll_column
+from wolfrat.mod_entrance_panel import ModEntrancePanel
+from wolfrat.private_welcome_panel import PrivateWelcomePanel
 from wolfrat.protocol import (
     CHAT_MAX_LEN,
     ServerManager,
@@ -3955,6 +3957,13 @@ class MessagesTab(QWidget):
         welcome_group.setLayout(welcome_layout)
         layout.addWidget(welcome_group)
 
+        # --- Private welcome (server script, only the joiner sees it) ---
+        self.private_welcome = PrivateWelcomePanel(
+            self._game_server_dir,
+            log=lambda text: self.log_text.append(f"[{time.strftime('%H:%M:%S')}] {text}"),
+        )
+        layout.addWidget(self.private_welcome)
+
 
         # --- KD Tracking ---
         kd_group = QGroupBox("Player KD Tracking")
@@ -4047,6 +4056,10 @@ class MessagesTab(QWidget):
             f"[{time.strftime('%H:%M:%S')}] RECURRING: {message}"
         )
         self._recurring_index += 1
+
+    def _game_server_dir(self) -> str:
+        weather_tab = getattr(self.server, '_weather_tab', None)
+        return weather_tab._server_dir() if weather_tab is not None else ""
 
     def _toggle_welcome(self, checked):
         self._welcome_enabled = checked
@@ -4805,8 +4818,9 @@ class ModsTab(QWidget):
     def _build_ui(self):
         layout = QHBoxLayout(self)
 
-        # LEFT: Mod list
-        left_col = QVBoxLayout()
+        # LEFT: Mod list. The column scrolls on a short (1024x768) desktop
+        # instead of crushing the moderator list.
+        left_scroll, left_col = scroll_column()
 
         mod_group = QGroupBox("Moderators")
         mod_layout = QVBoxLayout()
@@ -4871,7 +4885,21 @@ class ModsTab(QWidget):
         maps_group.setLayout(maps_layout)
         left_col.addWidget(maps_group)
 
-        layout.addLayout(left_col, 1)
+        # A little fanfare (and thunder) when a moderator joins
+        self.entrance_panel = ModEntrancePanel(
+            os.path.dirname(self._config_path()),
+            announce=lambda text: self._send_mod_chat(text, "Moderator entrance"),
+            flash=self._entrance_flash,
+            log=self._entrance_log,
+        )
+        left_col.addWidget(self.entrance_panel)
+        # the list takes whatever height is left over, never less than a few rows
+        self.mod_list.setMinimumHeight(110)
+        self.mod_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
+        # wide enough that the scroll bar never covers the buttons
+        left_scroll.setMinimumWidth(left_scroll.widget().minimumSizeHint().width() + 22)
+
+        layout.addWidget(left_scroll, 1)
 
         # RIGHT: command reference + mod activity, one tab each so neither
         # is squeezed off-screen when the window is small.
@@ -4970,6 +4998,8 @@ class ModsTab(QWidget):
             ("!clear", "Back to the map's own weather", False),
             ("!quake [seconds]", "Earthquake, 1-40 seconds", False),
             ("!lightning", "A flash of lightning and thunder (needs the lightning add-on)", False),
+            ("!weather on [rare|normal|frequent|always|custom]", "Let the weather change on its own - and how often. !weather on custom 5 20 = a front every 5-20 min", False),
+            ("!weather off", "Stop the changing weather; the sky goes back to the map's own. !weather status says which it is", False),
         )),
         ("Teams (mods)", (
             ("!swap <player>", "Move a player to the other team (swaps, then kills)", False),
@@ -5099,8 +5129,20 @@ class ModsTab(QWidget):
             f"Available: {self.missions_store.available_count} maps"
         )
 
+    def _entrance_log(self, text):
+        wire_log(f"[MODS] {text}")
+        if hasattr(self, "mod_log"):
+            self.mod_log.addItem(f"[{time.strftime('%H:%M:%S')}] {text}")
+
+    def _entrance_flash(self) -> bool:
+        weather_tab = getattr(self.server, '_weather_tab', None)
+        if weather_tab is None:
+            return False
+        return weather_tab._flash("A moderator's entrance")
+
     def update_players(self, players):
         """Update the quick-add player dropdown."""
+        self.entrance_panel.on_players(players, self.mods.values())
         current = self.player_combo.currentText()
         self.player_combo.clear()
         for p in players:
@@ -7285,7 +7327,7 @@ class DownloadWorker(QThread):
 
 
 class MainWindow(QMainWindow):
-    """WolfRAT 2.6.3 Main Window."""
+    """WolfRAT 2.6.4 Main Window."""
 
     def __init__(self, runtime: DesktopRuntime | None = None):
         super().__init__()
@@ -7304,7 +7346,7 @@ class MainWindow(QMainWindow):
         self._sync_led_timer = QTimer(self)
         self._sync_led_timer.setSingleShot(True)
         self._sync_led_timer.timeout.connect(self._clear_sync_led)
-        self.setWindowTitle("WolfRAT 2.6.3 - Joint Operations Server Admin")
+        self.setWindowTitle("WolfRAT 2.6.4 - Joint Operations Server Admin")
 
         # Set Window Icon
         icon_path = os.path.join(os.path.dirname(__file__), 'icon.ico')
@@ -7378,9 +7420,10 @@ class MainWindow(QMainWindow):
         self.signals.connected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.connected_signal.connect(lambda: sounds.play("connect"))
         self.signals.disconnected_signal.connect(lambda: self.set_connected(False, 'Disconnected'))
-        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.6.3 - Joint Operations Server Admin"))
+        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.6.4 - Joint Operations Server Admin"))
         self.signals.disconnected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.disconnected_signal.connect(lambda: self.server_tab.handle_disconnect_ui())
+        self.signals.disconnected_signal.connect(lambda: self.mods_tab.entrance_panel.on_disconnected())
         self.signals.reconnecting_signal.connect(lambda attempt: self.set_connected(False, f'Reconnecting (Attempt {attempt})...'))
         self.signals.disconnected_signal.connect(lambda: sounds.play("disconnect"))
 
@@ -7389,9 +7432,9 @@ class MainWindow(QMainWindow):
     def _update_title(self, server_name=""):
         """Update window title with server name when connected."""
         if server_name:
-            self.setWindowTitle(f"WolfRAT 2.6.3 \u2014 {server_name}")
+            self.setWindowTitle(f"WolfRAT 2.6.4 \u2014 {server_name}")
         else:
-            self.setWindowTitle("WolfRAT 2.6.3 - Joint Operations Server Admin")
+            self.setWindowTitle("WolfRAT 2.6.4 - Joint Operations Server Admin")
 
     def _build_ui(self):
         central = QWidget()
@@ -7399,7 +7442,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(central)
 
         # Header
-        header = QLabel("WolfRAT 2.6.3")
+        header = QLabel("WolfRAT 2.6.4")
         header.setStyleSheet("font-size: 22pt; font-weight: bold; color: #e8c840; padding: 12px; letter-spacing: 4px;")
         header.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(header)
@@ -7550,7 +7593,7 @@ class MainWindow(QMainWindow):
 
         status_bar.addSpacing(10)
 
-        ver_label = QLabel("v2.6.3 · Built by BadgerLove · FMJ Squad")
+        ver_label = QLabel("v2.6.4 · Built by BadgerLove · FMJ Squad")
         ver_label.setStyleSheet("font-size: 9pt; color: #444;")
         status_bar.addWidget(ver_label)
 
@@ -7606,7 +7649,7 @@ class MainWindow(QMainWindow):
     # ---- Auto-updater ---------------------------------------------------
 
     _VERSION_URL = "https://fmj-squad.com/version.json"
-    _CURRENT_VERSION = "2.6.3"
+    _CURRENT_VERSION = "2.6.4"
 
     @staticmethod
     def _is_newer(latest: str, current: str) -> bool:
@@ -7865,7 +7908,7 @@ def start_desktop(
 
     runtime = runtime or DesktopRuntime.production()
     app.setStyleSheet(DARK_STYLE)
-    app.setApplicationName("WolfRAT 2.6.3")
+    app.setApplicationName("WolfRAT 2.6.4")
     sounds.set_enabled(runtime.audio_enabled)
     if runtime.audio_enabled:
         sounds.initialize()
@@ -7974,7 +8017,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
         print(f"WolfRAT startup error: {error}")
         return 2
     runtime = runtime or launch.runtime
-    wire_log("=== WolfRAT 2.6.3 STARTED ===")
+    wire_log("=== WolfRAT 2.6.4 STARTED ===")
 
     # Catch-all exception handler for debugging
     import traceback
@@ -8027,7 +8070,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
 
             bstats.bstats_start(
                 "wolfrat",
-                "2.6.3",
+                "2.6.4",
                 data_dir=runtime.data_dir,
             )
         except Exception:
