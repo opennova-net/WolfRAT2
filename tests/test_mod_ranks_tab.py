@@ -170,3 +170,25 @@ def test_add_and_remove_people(tmp_path):
     panel.people_table.selectRow(1)
     panel._remove_selected()
     assert rig.saved()["mods"] == ["Dale"]
+
+
+def test_rank_column_is_wide_enough_for_the_longest_rank_name(tmp_path):
+    """2.6.6 as first released sized the column once, to its heading: on a
+    fresh install the drop-down was clipped to 'Admi', and a long custom rank
+    name was cut off."""
+    rig = Rig(tmp_path)
+    panel = rig.tab.ranks_panel
+    rig.tab.resize(1200, 700)
+    rig.tab.show()
+    _app.processEvents()
+    panel.mod_input.setText("Ham")
+    panel._add_typed()
+    rig.answers = ["Senior Super Moderator"]
+    panel._new_rank()
+    _app.processEvents()
+    table = panel.people_table
+    combo = table.cellWidget(0, 1)
+    text = combo.fontMetrics().horizontalAdvance("Senior Super Moderator")
+    assert table.columnWidth(1) >= text + 40
+    assert combo.width() >= text + 40
+    rig.tab.hide()

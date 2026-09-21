@@ -73,7 +73,9 @@ class ModRanksPanel(QTabWidget):
         self.people_table.setShowGrid(False)
         header = self.people_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        # sized by hand in refresh(): ResizeToContents ignores the drop-downs
+        # in the cells once the table is on screen, and clipped them
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
         self.people_table.setStyleSheet(_LIST_STYLE)
         # takes whatever height is left over, never less than a few rows
         self.people_table.setMinimumHeight(150)
@@ -189,16 +191,19 @@ class ModRanksPanel(QTabWidget):
                 combo = QComboBox()
                 combo.addItems(rank_names)
                 combo.setCurrentText(rank)
-                # the theme's padding is not in Qt's own size hint
-                combo.setMinimumWidth(
-                    max(combo.fontMetrics().horizontalAdvance(r) for r in rank_names) + 44
-                )
                 combo.currentTextChanged.connect(
                     lambda new, who=name: self._rank_picked(who, new)
                 )
                 self.people_table.setCellWidget(row, 1, combo)
                 if name == selected:
                     self.people_table.selectRow(row)
+            # Wide enough for the longest rank name in the drop-downs' own
+            # font, plus the theme's padding and arrow (not in Qt's size hint).
+            sample = self.people_table.cellWidget(0, 1) or self.people_table
+            sample.ensurePolished()
+            self.people_table.setColumnWidth(1, max(
+                sample.fontMetrics().horizontalAdvance(r) for r in rank_names
+            ) + 56)
 
         finally:
             self._filling = False
