@@ -20,6 +20,10 @@ from wolfrat.weather_dynamic_page import DynamicPage
 from wolfrat.protocol import wire_log
 from wolfrat.runtime import DesktopRuntime
 
+# A mod who types no minutes gets the Manual page's "hold for" time; when that
+# is "until I clear it", this instead - only the tab itself can hold forever.
+MOD_FALLBACK_MINUTES = 10
+
 _PRESET_BUTTONS = (
     ("storm", "⛈️ Storm"), ("rain", "🌧️ Rain"), ("drizzle", "🌦️ Drizzle"),
     ("fog", "🌫️ Fog"), ("blizzard", "🌨️ Blizzard"), ("snow", "❄️ Snow"),
@@ -290,7 +294,9 @@ class WeatherTab(QWidget):
         self.mods_cb.setChecked(bool(self._settings["mods_enabled"]))
         self.mods_cb.setToolTip(
             "!storm 10   !rain   !snow   !blizzard   !fog   !drizzle   !overcast\n"
-            "!clear   !quake 5   !weather <name> [minutes]"
+            "!clear   !quake 5   !weather <name> [minutes]\n"
+            "No minutes typed = the 'Keep it for' time on the Manual page "
+            f"({MOD_FALLBACK_MINUTES} min when that says 'until I clear it')."
         )
         self.mods_cb.toggled.connect(self._save)
         chat_box.addWidget(self.mods_cb)
@@ -714,7 +720,8 @@ class WeatherTab(QWidget):
         else:
             if request.weather == weather.CLEAR:
                 self._dynamic.end_front_now()
-            ok = self._start(request.weather, request.name, request.minutes, sender)
+            minutes = request.minutes or self.minutes_spin.value() or MOD_FALLBACK_MINUTES
+            ok = self._start(request.weather, request.name, minutes, sender)
         if not ok:
             return "Weather is not available: WolfRAT must run on the server PC."
         return None if self.announce_cb.isChecked() else "Weather changed."

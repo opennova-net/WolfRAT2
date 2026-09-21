@@ -8,7 +8,7 @@ from tests.test_weather import FakeServer
 from wolfrat import weather as w
 from wolfrat.runtime import DesktopRuntime
 from wolfrat.weather import Addr
-from wolfrat.weather_tab import WeatherTab
+from wolfrat.weather_tab import MOD_FALLBACK_MINUTES, WeatherTab
 
 
 class FakeHandle:
@@ -87,6 +87,35 @@ def test_custom_dials(qtbot, tmp_path):
     assert "until cleared" in tab.active_lbl.text()
     saved = json.loads((tmp_path / "wolfrat_weather.json").read_text())
     assert saved["precip"] == 40 and saved["snow"] is True and saved["fog_metres"] == 250
+
+
+def test_mod_without_minutes_uses_the_manual_hold_time(qtbot, tmp_path):
+    """A bare !fog used to hold for ever and freeze dynamic weather with it."""
+    server = FakeServer()
+    tab, said, _ = make(qtbot, tmp_path, server)
+    tab.mods_cb.setChecked(True)
+    now = [1000.0]
+    tab._schedule._clock = lambda: now[0]
+
+    tab.minutes_spin.setValue(15)
+    assert tab.on_mod_command("Mod", "!fog", []) is None
+    assert said[-1] == "Weather: fog rolling in for 15 min."
+    assert tab._schedule.seconds_left() == 15 * 60
+
+    # a typed number still wins
+    tab.on_mod_command("Mod", "!fog", ["3"])
+    assert tab._schedule.seconds_left() == 3 * 60
+
+    # "until I clear it" is for the tab only: a mod gets the fallback
+    tab.minutes_spin.setValue(0)
+    tab.on_mod_command("Mod", "!fog", [])
+    assert tab._schedule.seconds_left() == MOD_FALLBACK_MINUTES * 60
+    assert said[-1] == f"Weather: fog rolling in for {MOD_FALLBACK_MINUTES} min."
+
+    # and it really ends by itself, which is what lets dynamic weather resume
+    now[0] += MOD_FALLBACK_MINUTES * 60 + 1
+    tab._poll()
+    assert tab._schedule.active is None
 
 
 def test_mod_chat_and_server_restart(qtbot, tmp_path):

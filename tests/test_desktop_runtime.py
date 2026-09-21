@@ -162,9 +162,7 @@ def test_web_admin_reports_running_only_after_the_listener_is_reachable(
 
     with socket.create_connection(("127.0.0.1", port), timeout=1):
         pass
-    assert window.web_admin_tab.url_label.text() == (
-        f"http://localhost:{port}"
-    )
+    assert f"http://localhost:{port}" in window.web_admin_tab.url_label.text()
     assert "Web: On" in window.web_led_label.text()
     window.shutdown()
 

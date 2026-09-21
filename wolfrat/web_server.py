@@ -12,6 +12,7 @@ from enum import Enum
 import json
 import os
 import re
+import hashlib
 import secrets
 import sys
 import threading
@@ -99,6 +100,8 @@ class WolfWebServer:
         # Auth state — separate from JO server credentials
         self._login_ips = {}  # {ip: last_login_timestamp}
         self.on_login = None  # callback(ip, timestamp) for persistence
+        # Brute-force lockout: {ip: {'guesses': set(digest), 'first': ts, 'until': ts}}
+        self._failed_logins = {}
 
     def _create_application(self):
         """Build one aiohttp application for one event-loop lifecycle."""
@@ -366,11 +369,77 @@ class WolfWebServer:
         with self._auth_lock:
             self._login_ips = {ip: float(ts) for ip, ts in ips_dict.items()}
 
+    # --- Brute-force lockout ---
+    # An address that presents LOCKOUT_MAX_FAILURES different wrong credentials
+    # within LOCKOUT_WINDOW is refused for LOCKOUT_SECONDS, even with the right
+    # token. Distinct guesses are counted (by digest, never stored in clear) so
+    # a phone re-sending one stale token after a token change cannot lock its
+    # owner out, while a guesser - who never repeats a guess - is stopped.
+    LOCKOUT_MAX_FAILURES = 5
+    LOCKOUT_WINDOW = 15 * 60
+    LOCKOUT_SECONDS = 15 * 60
+    _LOCKOUT_MAX_TRACKED = 2048
+
+    def _lockout_remaining(self, ip, now=None):
+        """Seconds this address is still locked out for (0 = not locked)."""
+        now = time.time() if now is None else now
+        with self._auth_lock:
+            record = self._failed_logins.get(ip)
+            if not record:
+                return 0
+            return max(0, int(record['until'] - now + 0.999))
+
+    def _record_failed_login(self, ip, guess, now=None):
+        """Count one wrong credential. Returns True if this locked the address."""
+        now = time.time() if now is None else now
+        digest = hashlib.sha256(guess.encode('utf-8', 'replace')).digest()
+        locked = False
+        with self._auth_lock:
+            if len(self._failed_logins) >= self._LOCKOUT_MAX_TRACKED:
+                for stale in [
+                    key for key, rec in self._failed_logins.items()
+                    if rec['until'] <= now
+                    and now - rec['first'] > self.LOCKOUT_WINDOW
+                ]:
+                    del self._failed_logins[stale]
+            record = self._failed_logins.get(ip)
+            if record is None or (
+                record['until'] <= now
+                and now - record['first'] > self.LOCKOUT_WINDOW
+            ):
+                if (record is None
+                        and len(self._failed_logins) >= self._LOCKOUT_MAX_TRACKED):
+                    return False
+                record = {'guesses': set(), 'first': now, 'until': 0}
+                self._failed_logins[ip] = record
+            record['guesses'].add(digest)
+            if (len(record['guesses']) >= self.LOCKOUT_MAX_FAILURES
+                    and record['until'] <= now):
+                record['until'] = now + self.LOCKOUT_SECONDS
+                record['guesses'] = set()
+                record['first'] = now
+                locked = True
+        if locked:
+            wire_log(
+                f"WEB AUTH LOCKOUT: {ip} refused for "
+                f"{self.LOCKOUT_SECONDS // 60} minutes after "
+                f"{self.LOCKOUT_MAX_FAILURES} failed logins"
+            )
+        return locked
+
+    def _clear_failed_logins(self, ip):
+        with self._auth_lock:
+            self._failed_logins.pop(ip, None)
+
     def _check_auth(self, request):
         """Check if request has valid auth token. Returns True if authorized."""
         with self._auth_lock:
             if not self._web_token:
                 return False  # No token set = no access
+
+        ip = request.remote or 'unknown'
+        if self._lockout_remaining(ip):
+            return False
 
         # Check Authorization header
         auth = request.headers.get('Authorization', '')
@@ -379,12 +448,15 @@ class WolfWebServer:
             with self._auth_lock:
                 if self._web_token and secrets.compare_digest(token, self._web_token):
                     return True
+            if token:
+                self._record_failed_login(ip, token)
         # Check query param (for WebSocket)
         token = request.query.get('token', '')
         if token:
             with self._auth_lock:
                 if self._web_token and secrets.compare_digest(token, self._web_token):
                     return True
+            self._record_failed_login(ip, token)
         return False
 
     def broadcast_state(self):
@@ -688,6 +760,15 @@ class WolfWebServer:
 
     # --- Auth ---
 
+    @staticmethod
+    def _locked_out_response(remaining):
+        minutes = max(1, (remaining + 59) // 60)
+        return web.json_response(
+            {'error': f'Too many failed logins. Try again in {minutes} min.'},
+            status=429,
+            headers={'Retry-After': str(remaining)},
+        )
+
     async def _handle_auth(self, request):
         """POST /api/auth — Validate username + token."""
         try:
@@ -709,10 +790,15 @@ class WolfWebServer:
             if not valid_token:
                 return web.json_response({'error': 'Web admin is not enabled'}, status=403)
 
+            ip = request.remote or 'unknown'
+            remaining = self._lockout_remaining(ip)
+            if remaining:
+                return self._locked_out_response(remaining)
+
             if (secrets.compare_digest(username, valid_user) and
                     secrets.compare_digest(token, valid_token)):
                 # Track IP
-                ip = request.remote or 'unknown'
+                self._clear_failed_logins(ip)
                 with self._auth_lock:
                     self._login_ips[ip] = time.time()
                 wire_log(f"WEB AUTH: {username} logged in from {ip}")
@@ -725,7 +811,9 @@ class WolfWebServer:
                 # Return the access token itself — client uses it for all requests
                 return web.json_response({'ok': True, 'token': token})
 
-            wire_log(f"WEB AUTH FAILED: {username}")
+            wire_log(f"WEB AUTH FAILED: {username} from {ip}")
+            if self._record_failed_login(ip, username + chr(0) + token):
+                return self._locked_out_response(self.LOCKOUT_SECONDS)
             return web.json_response({'error': 'Invalid username or token'}, status=401)
         except json.JSONDecodeError:
             return web.json_response(

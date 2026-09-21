@@ -1,5 +1,5 @@
 """
-WolfRAT 2.6.4 - Modern Joint Operations Server Admin Tool
+WolfRAT 2.6.5 - Modern Joint Operations Server Admin Tool
 Replaces the original WolfRAT v0.95 (2005, MFC70)
 """
 
@@ -480,6 +480,86 @@ def _admin_dispatcher(owner):
     return bridge
 
 
+_VIRTUAL_ADAPTER_HINTS = (
+    "vethernet", "virtual", "vmware", "hyper-v", "wsl", "loopback",
+    "docker", "tap-", "tunnel", "bluetooth",
+)
+
+
+def _lan_ips():
+    """IPv4 addresses another device could reach this PC on, best first.
+
+    Asks Qt for the machine's interfaces (app.py must not own sockets, see
+    tests/test_no_bypass.py). Skips adapters that are down, loopback, 169.254
+    link-local, and virtual switches (Hyper-V/WSL/VMware/VirtualBox hand out
+    private-looking addresses a phone can never reach).
+    """
+    from PyQt6.QtNetwork import QAbstractSocket, QNetworkInterface
+    flags = QNetworkInterface.InterfaceFlag
+    found = []
+    for iface in QNetworkInterface.allInterfaces():
+        state = iface.flags()
+        if not (state & flags.IsUp and state & flags.IsRunning):
+            continue
+        if state & flags.IsLoopBack:
+            continue
+        label = f"{iface.humanReadableName()} {iface.name()}".lower()
+        if any(hint in label for hint in _VIRTUAL_ADAPTER_HINTS):
+            continue
+        for entry in iface.addressEntries():
+            addr = entry.ip()
+            if addr.protocol() != QAbstractSocket.NetworkLayerProtocol.IPv4Protocol:
+                continue
+            if addr.isLoopback() or addr.isLinkLocal():
+                continue
+            found.append(addr.toString())
+    return found
+
+
+def _web_admin_urls(port, lan_ips):
+    """Text for the Web Admin URL label: this PC first, then the LAN address."""
+    lines = [f"This PC: http://localhost:{port}"]
+    if lan_ips:
+        for ip in lan_ips[:3]:
+            lines.append(f"Phone / other devices: http://{ip}:{port}")
+    else:
+        lines.append("Phone: no network address found - check this PC is on Wi-Fi/LAN")
+    return "\n".join(lines)
+
+
+def _build_update_batch(dest_path, current_exe, log_path):
+    """Build the self-update batch script.
+
+    Waits for the old exe to free by retrying the ``move`` itself, rather than
+    polling a hard-coded process image name. ``move /y`` fails while the target
+    is still locked and succeeds the instant the process exits, so it tests the
+    actual file. This is immune to the exe having been renamed (the old
+    ``tasklist`` filter for ``WolfRAT2.exe`` never matched a renamed exe, so the
+    swap raced the still-locked file) and to a second WolfRAT copy running
+    elsewhere (which used to hang the tasklist wait forever). Bounded to 150
+    attempts so it can never loop indefinitely.
+    """
+    return (
+        '@echo off\n'
+        f'echo [%date% %time%] Update started >> "{log_path}"\n'
+        'set /a tries=0\n'
+        ':retry\n'
+        f'move /y "{dest_path}" "{current_exe}" >> "{log_path}" 2>&1\n'
+        'if not errorlevel 1 goto done\n'
+        'set /a tries+=1\n'
+        'if %tries% geq 150 (\n'
+        f'    echo [%date% %time%] ERROR: exe still locked after 150 tries, giving up >> "{log_path}"\n'
+        '    goto done\n'
+        ')\n'
+        'ping -n 2 127.0.0.1 >nul\n'
+        'goto retry\n'
+        ':done\n'
+        f'echo [%date% %time%] Update complete, launching >> "{log_path}"\n'
+        f'start "" "{current_exe}"\n'
+        'del "%~f0"\n'
+    )
+
+
 def submit_admin(
     owner,
     operation,
@@ -574,6 +654,7 @@ class ServerTab(QWidget):
         conn_layout.addWidget(QLabel("Password:"), 3, 0)
         self.pass_input = QLineEdit()
         self.pass_input.setPlaceholderText("Password")
+        self.pass_input.setEchoMode(QLineEdit.EchoMode.Password)
         conn_layout.addWidget(self.pass_input, 3, 1)
 
         btn_layout = QHBoxLayout()
@@ -841,7 +922,10 @@ class ServerTab(QWidget):
         password = self.pass_input.text().strip()
         if host:
             item = f"{host}:{port} ({user})"
-            self.server_list.addItem(item)
+            existing = {self.server_list.item(i).text()
+                        for i in range(self.server_list.count())}
+            if item not in existing:
+                self.server_list.addItem(item)
             self._server_creds[(host, port, user)] = password
             self._persist_servers()
 
@@ -924,7 +1008,7 @@ class ServerTab(QWidget):
                 last = data.get('last_server')
                 if last and last.get('host'):
                     self.host_input.setText(last['host'])
-                    self.port_input.setValue(last.get('port', 10086))
+                    self.port_input.setValue(last.get('port', 4000))
                     self.user_input.setText(last.get('user', ''))
                     self.pass_input.setText(last.get('password', ''))
                     return True
@@ -1660,21 +1744,36 @@ class MissionsTab(QWidget):
         action_layout.addWidget(QLabel(""))  # spacer for header alignment
         action_layout.addSpacing(20)
 
-        ok_btn = SatisfyingButton("OK")
-        ok_btn.setToolTip("Apply current rotation and close")
-        ok_btn.clicked.connect(self._ok_clicked)
-        action_layout.addWidget(ok_btn)
+        move_up_btn = SatisfyingButton("Move Up")
+        move_up_btn.setToolTip(
+            "Move the selected map earlier. "
+            "The server has no reorder command, so this changes the list here only. "
+            "Press Save Auto Rotation (or save a preset) to keep the new order."
+        )
+        move_up_btn.clicked.connect(self._move_up)
+        action_layout.addWidget(move_up_btn)
 
-        cancel_btn = SatisfyingButton("Cancel")
-        cancel_btn.setToolTip("Discard changes")
-        cancel_btn.clicked.connect(self._cancel_clicked)
-        action_layout.addWidget(cancel_btn)
+        move_down_btn = SatisfyingButton("Move Down")
+        move_down_btn.setToolTip(
+            "Move the selected map later. "
+            "The server has no reorder command, so this changes the list here only. "
+            "Press Save Auto Rotation (or save a preset) to keep the new order."
+        )
+        move_down_btn.clicked.connect(self._move_down)
+        action_layout.addWidget(move_down_btn)
 
         action_layout.addSpacing(10)
 
-        review_event_btn = SatisfyingButton("Review\nEvent Log")
-        review_event_btn.clicked.connect(self._review_event_log)
-        action_layout.addWidget(review_event_btn)
+        save_auto_btn = SatisfyingButton("Save Auto\nRotation")
+        save_auto_btn.setToolTip(
+            "Save this rotation (and its order) so WolfRAT re-applies it "
+            "automatically the next time it connects (it clears the server's "
+            "rotation first, then adds these maps in this order)"
+        )
+        save_auto_btn.clicked.connect(self._ok_clicked)
+        action_layout.addWidget(save_auto_btn)
+
+        action_layout.addSpacing(10)
 
         review_chat_btn = SatisfyingButton("Review\nChat Log")
         review_chat_btn.clicked.connect(self._review_chat_log)
@@ -2355,20 +2454,10 @@ class MissionsTab(QWidget):
         self._add_missions_in_sequence(entries, index + 1, on_complete)
 
     def _ok_clicked(self):
-        """OK button - apply rotation and show feedback."""
+        """Save Auto Rotation - snapshot the current cycle for auto-apply on connect."""
         self._presets['_auto'] = self._build_auto_preset()
         self._save_presets()
-        self.server._log("Rotation saved and applied.")
-
-    def _cancel_clicked(self):
-        """Cancel button - discard unsaved changes."""
-        self.server._log("Changes discarded.")
-
-    def _review_event_log(self):
-        """Review Event Log button."""
-        self.server._log(
-            "Retail admin has no EVENTLOG command; review the local console/wire log."
-        )
+        self.server._log("Rotation saved; it will auto-apply on the next connect.")
 
     def _review_chat_log(self):
         """Review Chat Log button."""
@@ -2552,7 +2641,12 @@ class SettingsTab(QWidget):
         self.ping_min_val = QSpinBox()
         self.ping_min_val.setRange(0, 999)
         self.ping_min_val.setFixedWidth(80)
-        self.ping_min_val.valueChanged.connect(lambda v: self._on_slider("MinPing", v))
+        _ping_min_timer = QTimer(self)
+        _ping_min_timer.setSingleShot(True)
+        _ping_min_timer.timeout.connect(lambda k="MinPing": self._send_debounced(k))
+        self._debounce_timers["MinPing"] = _ping_min_timer
+        self.ping_min_val.valueChanged.connect(
+            lambda v: self._on_spinbox_changed("MinPing", v))
         ping_layout.addWidget(self.ping_min_val, 1, 1)
         self._sliders["MinPing"] = self.ping_min_val
 
@@ -2565,7 +2659,12 @@ class SettingsTab(QWidget):
         self.ping_max_val = QSpinBox()
         self.ping_max_val.setRange(0, 999)
         self.ping_max_val.setFixedWidth(80)
-        self.ping_max_val.valueChanged.connect(lambda v: self._on_slider("MaxPing", v))
+        _ping_max_timer = QTimer(self)
+        _ping_max_timer.setSingleShot(True)
+        _ping_max_timer.timeout.connect(lambda k="MaxPing": self._send_debounced(k))
+        self._debounce_timers["MaxPing"] = _ping_max_timer
+        self.ping_max_val.valueChanged.connect(
+            lambda v: self._on_spinbox_changed("MaxPing", v))
         ping_layout.addWidget(self.ping_max_val, 3, 1)
         self._sliders["MaxPing"] = self.ping_max_val
 
@@ -2904,72 +3003,10 @@ class SettingsTab(QWidget):
             policy=CompletionPolicy.ACCEPTED,
         )
 
-    def _lock_server(self):
-        """Lock/unlock all settings controls to prevent accidental changes."""
-        locked = not getattr(self, '_controls_locked', False)
-        self._controls_locked = locked
-
-        # Disable/enable all checkboxes
-        for cb in self._checkboxes.values():
-            cb.setEnabled(not locked)
-
-        # Disable/enable all sliders
-        for spin in self._sliders.values():
-            if isinstance(spin, tuple):
-                spin[0].setEnabled(not locked)  # slider
-                spin[1].setEnabled(not locked)  # spinbox
-            else:
-                spin.setEnabled(not locked)
-
-        # Disable/enable weapon table
-        self.weapon_table.setEnabled(not locked)
-
-        # Disable/enable password fields
-        for field in [self.pw_server, self.pw_sideA, self.pw_sideB, self.pw_title]:
-            field.setEnabled(not locked)
-
-        # Disable/enable combos
-        self.tod_combo.setEnabled(not locked)
-        self.game_pass_combo.setEnabled(not locked)
-
-        # Update lock button appearance
-        if locked:
-            self._show_feedback("Settings LOCKED - controls disabled")
-        else:
-            self._show_feedback("Settings UNLOCKED - controls enabled")
-
-    def _toggle_auto_refresh(self, state):
-        self._auto_refresh = state == 2
-        if self._auto_refresh:
-            self._refresh_timer.start(15000)
-            self._show_feedback("Auto-refresh ON (every 15s)")
-        else:
-            self._refresh_timer.stop()
-            self._show_feedback("Auto-refresh OFF")
-
     def _do_refresh(self):
         """Re-fetch settings from server."""
         self.server.refresh_settings()
         self._show_feedback("Settings refreshed")
-
-    def _save_settings(self):
-        """Save current settings to a local JSON file."""
-        import json
-        settings = {}
-        for key, cb in self._checkboxes.items():
-            settings[key] = "1" if cb.isChecked() else "0"
-        for key, spin in self._sliders.items():
-            if isinstance(spin, tuple):
-                settings[key] = str(spin[1].value())  # spin is index 1
-            else:
-                settings[key] = str(spin.value())
-        try:
-            path = self.runtime.path("settings_preset.json")
-            with open(path, "w") as f:
-                json.dump(settings, f, indent=2)
-            self._show_feedback(f"Settings saved to {os.path.basename(path)}")
-        except Exception as e:
-            self._show_feedback(f"Save failed: {e}")
 
     def _on_slider_pressed(self, key):
         """Slider drag started — block all sends until release."""
@@ -3299,6 +3336,9 @@ class ChatBotTab(QWidget):
                 cfg['spam_enabled'] = self.spam_cb.isChecked()
             if hasattr(self, 'spam_msg_spin'):
                 cfg['spam_msg_count'] = self.spam_msg_spin.value()
+            if hasattr(self, 'spam_time_spin'):
+                cfg['spam_seconds'] = self.spam_time_spin.value()
+            cfg['bad_words'] = dict(self.bad_words)
             self._chat_config = cfg
             with open(self._chat_config_path(), 'w') as f:
                 json.dump(cfg, f, indent=2)
@@ -3376,7 +3416,8 @@ class ChatBotTab(QWidget):
 
         self.spam_time_spin = QSpinBox()
         self.spam_time_spin.setRange(2, 20)
-        self.spam_time_spin.setValue(5)
+        self.spam_time_spin.setValue(self._chat_config.get('spam_seconds', 5))
+        self.spam_time_spin.valueChanged.connect(self._save_chat_config)
         spam_layout.addWidget(self.spam_time_spin)
 
         spam_layout.addWidget(QLabel("secs)"))
@@ -3385,6 +3426,9 @@ class ChatBotTab(QWidget):
         filter_layout.addLayout(spam_layout)
 
         self.bad_words_list = QListWidget()
+        for word, action in self._chat_config.get('bad_words', {}).items():
+            self.bad_words[word] = action
+            self.bad_words_list.addItem(f"{word} → {action}")
         filter_layout.addWidget(self.bad_words_list)
 
         add_layout = QHBoxLayout()
@@ -3438,7 +3482,7 @@ class ChatBotTab(QWidget):
             self.bad_words[word] = action
             self.bad_words_list.addItem(f"{word} → {action}")
             self.bad_word_input.clear()
-            self._save_config()
+            self._save_chat_config()
 
     def _remove_bad_word(self):
         row = self.bad_words_list.currentRow()
@@ -3447,7 +3491,7 @@ class ChatBotTab(QWidget):
             word = item.text().split(' → ')[0].strip()
             self.bad_words.pop(word, None)
             self.bad_words_list.takeItem(row)
-            self._save_config()
+            self._save_chat_config()
 
     def update_chat(self, messages: list):
         # Skip the first batch - those are old messages from before we connected
@@ -3972,8 +4016,7 @@ class MessagesTab(QWidget):
         self.kd_checkbox.setChecked(self._kd_enabled)
         self.kd_checkbox.stateChanged.connect(self._toggle_kd)
         kd_layout.addWidget(self.kd_checkbox)
-        kd_hint = QLabel("Players can type !kd in game chat to see their stats.\nTracked: {0} players".format(
-            self.stats_store.get_player_count() if self.stats_store else 0))
+        kd_hint = QLabel(self._kd_tracked_text())
         kd_hint.setStyleSheet("color: #6a6a30; font-size: 8pt;")
         kd_hint.setWordWrap(True)
         self.kd_hint_label = kd_hint
@@ -3990,7 +4033,6 @@ class MessagesTab(QWidget):
         log_layout.addWidget(self.log_text)
         log_group.setLayout(log_layout)
         layout.addWidget(log_group)
-        log_group.setVisible(False)
 
         scroll_area.setWidget(scroll_content)
         main_layout.addWidget(scroll_area)
@@ -4073,8 +4115,25 @@ class MessagesTab(QWidget):
         self._kd_enabled = (state == 2)
         self._save_config()
 
+    def _kd_tracked_text(self):
+        count = self.stats_store.get_player_count() if self.stats_store else 0
+        return (
+            "Players can type !kd in game chat to see their stats.\n"
+            f"Tracked: {count} players"
+        )
+
+    def _refresh_kd_hint(self):
+        """Recompute the 'Tracked: N players' hint from the live stats store."""
+        if hasattr(self, 'kd_hint_label'):
+            self.kd_hint_label.setText(self._kd_tracked_text())
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._refresh_kd_hint()
+
     def check_new_players(self, players):
         """Called when player list updates. Detects first-time joiners."""
+        self._refresh_kd_hint()
         if not self._welcome_enabled:
             return
         for p in players:
@@ -4772,7 +4831,6 @@ class ModsTab(QWidget):
     def _vote_transition_succeeded(self):
         self._vote_transition_pending = False
         self._vote_active = False
-        self._vote_cooldown_until = time.time() + 900
 
     def _vote_transition_failed(self):
         self._vote_transition_pending = False
@@ -4994,7 +5052,7 @@ class ModsTab(QWidget):
         )),
         ("Weather (mods - switch on in the Weather tab)", (
             ("!storm [minutes]", "Rain, dark cloud and fog. !storm 10 lasts ten minutes", False),
-            ("!rain  !drizzle  !snow  !blizzard  !fog  !overcast", "Other skies, same optional minutes", False),
+            ("!rain  !drizzle  !snow  !blizzard  !fog  !overcast", "Other skies, same optional minutes. No minutes = the Weather tab's 'Keep it for' time", False),
             ("!clear", "Back to the map's own weather", False),
             ("!quake [seconds]", "Earthquake, 1-40 seconds", False),
             ("!lightning", "A flash of lightning and thunder (needs the lightning add-on)", False),
@@ -7082,6 +7140,9 @@ class WebAdminTab(QWidget):
         status_layout.addWidget(self.status_label, 0, 1)
         self.url_label = QLabel("-")
         self.url_label.setStyleSheet("color: #888; font-size: 10pt;")
+        self.url_label.setWordWrap(True)
+        self.url_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
         status_layout.addWidget(QLabel("URL:"), 1, 0)
         status_layout.addWidget(self.url_label, 1, 1)
         status_group.setLayout(status_layout)
@@ -7245,7 +7306,8 @@ class WebAdminTab(QWidget):
         if self.ws.is_running:
             self.status_label.setText("Running")
             self.status_label.setStyleSheet("font-size: 12pt; font-weight: bold; color: #50ff50;")
-            self.url_label.setText(f"http://localhost:{self.port_spin.value()}")
+            self.url_label.setText(
+                _web_admin_urls(self.port_spin.value(), _lan_ips()))
         elif error:
             self.status_label.setText("Failed")
             self.status_label.setStyleSheet(
@@ -7327,7 +7389,7 @@ class DownloadWorker(QThread):
 
 
 class MainWindow(QMainWindow):
-    """WolfRAT 2.6.4 Main Window."""
+    """WolfRAT 2.6.5 Main Window."""
 
     def __init__(self, runtime: DesktopRuntime | None = None):
         super().__init__()
@@ -7346,7 +7408,7 @@ class MainWindow(QMainWindow):
         self._sync_led_timer = QTimer(self)
         self._sync_led_timer.setSingleShot(True)
         self._sync_led_timer.timeout.connect(self._clear_sync_led)
-        self.setWindowTitle("WolfRAT 2.6.4 - Joint Operations Server Admin")
+        self.setWindowTitle("WolfRAT 2.6.5 - Joint Operations Server Admin")
 
         # Set Window Icon
         icon_path = os.path.join(os.path.dirname(__file__), 'icon.ico')
@@ -7420,7 +7482,7 @@ class MainWindow(QMainWindow):
         self.signals.connected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.connected_signal.connect(lambda: sounds.play("connect"))
         self.signals.disconnected_signal.connect(lambda: self.set_connected(False, 'Disconnected'))
-        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.6.4 - Joint Operations Server Admin"))
+        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.6.5 - Joint Operations Server Admin"))
         self.signals.disconnected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.disconnected_signal.connect(lambda: self.server_tab.handle_disconnect_ui())
         self.signals.disconnected_signal.connect(lambda: self.mods_tab.entrance_panel.on_disconnected())
@@ -7432,9 +7494,9 @@ class MainWindow(QMainWindow):
     def _update_title(self, server_name=""):
         """Update window title with server name when connected."""
         if server_name:
-            self.setWindowTitle(f"WolfRAT 2.6.4 \u2014 {server_name}")
+            self.setWindowTitle(f"WolfRAT 2.6.5 \u2014 {server_name}")
         else:
-            self.setWindowTitle("WolfRAT 2.6.4 - Joint Operations Server Admin")
+            self.setWindowTitle("WolfRAT 2.6.5 - Joint Operations Server Admin")
 
     def _build_ui(self):
         central = QWidget()
@@ -7442,7 +7504,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(central)
 
         # Header
-        header = QLabel("WolfRAT 2.6.4")
+        header = QLabel("WolfRAT 2.6.5")
         header.setStyleSheet("font-size: 22pt; font-weight: bold; color: #e8c840; padding: 12px; letter-spacing: 4px;")
         header.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(header)
@@ -7593,7 +7655,7 @@ class MainWindow(QMainWindow):
 
         status_bar.addSpacing(10)
 
-        ver_label = QLabel("v2.6.4 · Built by BadgerLove · FMJ Squad")
+        ver_label = QLabel("v2.6.5 · Built by BadgerLove · FMJ Squad")
         ver_label.setStyleSheet("font-size: 9pt; color: #444;")
         status_bar.addWidget(ver_label)
 
@@ -7649,7 +7711,7 @@ class MainWindow(QMainWindow):
     # ---- Auto-updater ---------------------------------------------------
 
     _VERSION_URL = "https://fmj-squad.com/version.json"
-    _CURRENT_VERSION = "2.6.4"
+    _CURRENT_VERSION = "2.6.5"
 
     @staticmethod
     def _is_newer(latest: str, current: str) -> bool:
@@ -7783,22 +7845,7 @@ class MainWindow(QMainWindow):
         bat_path = os.path.join(exe_dir, '_update.bat')
         log_path = os.path.join(exe_dir, '_update.log')
 
-        bat_content = (
-            '@echo off\n'
-            f'echo [%date% %time%] Update started >> "{log_path}"\n'
-            ':wait\n'
-            'tasklist /fi "imagename eq WolfRAT2.exe" | findstr /i "WolfRAT2.exe" >nul\n'
-            'if not errorlevel 1 (\n'
-            '    ping -n 2 127.0.0.1 >nul\n'
-            '    goto wait\n'
-            ')\n'
-            f'echo [%date% %time%] WolfRAT closed, moving update >> "{log_path}"\n'
-            f'move /y "{dest_path}" "{current_exe}" >> "{log_path}" 2>&1\n'
-            f'if errorlevel 1 echo [%date% %time%] ERROR: move failed >> "{log_path}"\n'
-            f'echo [%date% %time%] Update complete, launching >> "{log_path}"\n'
-            f'start "" "{current_exe}"\n'
-            'del "%~f0"\n'
-        )
+        bat_content = _build_update_batch(dest_path, current_exe, log_path)
         with open(bat_path, 'w') as f:
             f.write(bat_content)
 
@@ -7908,7 +7955,7 @@ def start_desktop(
 
     runtime = runtime or DesktopRuntime.production()
     app.setStyleSheet(DARK_STYLE)
-    app.setApplicationName("WolfRAT 2.6.4")
+    app.setApplicationName("WolfRAT 2.6.5")
     sounds.set_enabled(runtime.audio_enabled)
     if runtime.audio_enabled:
         sounds.initialize()
@@ -8017,7 +8064,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
         print(f"WolfRAT startup error: {error}")
         return 2
     runtime = runtime or launch.runtime
-    wire_log("=== WolfRAT 2.6.4 STARTED ===")
+    wire_log("=== WolfRAT 2.6.5 STARTED ===")
 
     # Catch-all exception handler for debugging
     import traceback
@@ -8070,7 +8117,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
 
             bstats.bstats_start(
                 "wolfrat",
-                "2.6.4",
+                "2.6.5",
                 data_dir=runtime.data_dir,
             )
         except Exception:
