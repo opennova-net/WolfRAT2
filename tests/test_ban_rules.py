@@ -91,8 +91,21 @@ def test_enforcer_punts_once_per_cooldown_and_records_the_hit():
     assert [r.player_id for r in first] == ["3"]
     assert first[0].why() == "Troll (5.6.7.8) matches banned name Troll - griefing"
     assert bans.entries[0].hits == 1 and bans.entries[0].last_hit_ip == "5.6.7.8"
-    assert enf.decide(bans, players, {"Troll": "5.6.7.8"}, NOW + 10) == []
-    assert len(enf.decide(bans, players, {"Troll": "5.6.7.8"}, NOW + 31)) == 1
+    assert enf.decide(bans, players, {"Troll": "5.6.7.8"}, NOW + 10) == []      # still there: wait
+    assert len(enf.decide(bans, players, {"Troll": "5.6.7.8"}, NOW + 31)) == 1  # still there after 30 s: again
+
+
+def test_a_rejoin_after_a_successful_punt_is_punted_at_once():
+    """Live 2026-09-22: Dale got back in and spammed chat for up to 30 s because
+    the cooldown ignored that the punt had already worked."""
+    bans = BanList(); bans.add(name("Troll"))
+    enf = Enforcer(cooldown=30)
+    troll = [{"id": "3", "name": "Troll"}]
+    assert len(enf.decide(bans, troll, {"Troll": "5.6.7.8"}, NOW)) == 1
+    assert enf.decide(bans, [], {}, NOW + 5) == []                    # gone - punt worked
+    assert len(enf.decide(bans, troll, {"Troll": "5.6.7.8"}, NOW + 10)) == 1   # back 10 s later: out again
+    enf.note_punted("Troll", "5.6.7.8", NOW + 20)                     # hand punt from the button
+    assert enf.decide(bans, troll, {"Troll": "5.6.7.8"}, NOW + 21) == []       # no double punt this tick
 
 
 def test_enforcer_ip_ban_works_without_a_name_match_and_says_ip_unknown_otherwise():

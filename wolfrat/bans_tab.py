@@ -437,6 +437,7 @@ class BansTab(QWidget):
         added = self.ban_now(name, reason=self.online_reason.text().strip(), kind=kind,
                              expiry=self._expiry_code(self.online_expiry))
         if added:
+            self.enforcer.note_punted(name, self.ip_of(name), self._clock())
             try:
                 self._punt(player, f"Banned: {self.online_reason.text().strip() or name}")
             except Exception as exc:

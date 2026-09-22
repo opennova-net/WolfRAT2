@@ -225,16 +225,31 @@ class Removal:
 
 class Enforcer:
     """Decides who to punt this tick.  Remembers who it punted recently so a
-    player who takes a few seconds to leave is not punted five times."""
+    player who takes a few seconds to leave is not punted five times - but
+    only while they are STILL there.  The moment they drop off the list the
+    memory is cleared, so a rejoin is punted on the very next poll.
+
+    Live 2026-09-22: a 30 s cooldown keyed on the name alone let Dale rejoin
+    after a punt and sit on the server for up to 30 s, chatting."""
 
     def __init__(self, cooldown: float = PUNT_COOLDOWN_SECONDS):
         self._cooldown = cooldown
         self._recent: dict[str, float] = {}
 
+    def note_punted(self, name: str, ip: str, now: float) -> None:
+        """A punt was just sent by hand (button / !ban) - do not double up this tick."""
+        self._recent[f"{name.lower()}|{ip}"] = now
+
     def decide(self, bans: BanList, players: Iterable[dict], ips: dict, now: float) -> list:
         """players = admin-port dicts (id, name); ips = name -> ip from the process."""
         removals = []
-        self._recent = {k: t for k, t in self._recent.items() if now - t < self._cooldown}
+        present = set()
+        for player in players:
+            name = str(player.get("name", ""))
+            present.add(f"{name.lower()}|{ips.get(name, '') or ''}")
+        # forget anyone who has left (the punt worked) or whose cooldown ran out
+        self._recent = {k: t for k, t in self._recent.items()
+                        if k in present and now - t < self._cooldown}
         for player in players:
             name = str(player.get("name", ""))
             ip = str(ips.get(name, "") or "")
