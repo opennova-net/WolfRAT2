@@ -1,0 +1,145 @@
+"""Each player's IP, read from the Joint Ops server process on this PC.
+
+The admin port never sends an IP, so this is the only way WolfRAT can see one.
+Proven live 2026-09-22 (spike ``wolfcontrol/spike_jo_ip_read.py``): the read
+needs no elevation when WolfRAT runs as the same Windows user as the server.
+
+Chain (Jointops.exe.kong.c, Server_PlayerPuntCRCMisMatch @ 0x50F380):
+    capacity  = dword [0x24C0CA4]
+    slotPtr   = dword [0x24C0CA8]          one slot = 0x188E8 bytes
+    slot+4    = active byte
+    slot+40   = name, 32 bytes
+    slot+28   = CNetPlayer*  ->  +196 = IPv4, network byte order
+Slot 0 is the host itself (null CNetPlayer).  Read-only: this module never
+opens the process for writing.
+"""
+
+from __future__ import annotations
+
+import socket
+import struct
+import sys
+import time
+from dataclasses import dataclass
+from typing import Optional
+
+from wolfrat import weather
+
+CAPACITY_VA = 0x24C0CA4
+SLOTPTR_VA = 0x24C0CA8
+SLOT_STRIDE = 0x188E8
+NAME_OFFSET, NAME_LEN = 40, 32
+NETPLAYER_OFFSET = 28
+IP_OFFSET = 196
+MAX_CAPACITY = 256
+RETRY_SECONDS = 10
+
+
+@dataclass(frozen=True)
+class SlotInfo:
+    slot: int
+    name: str
+    ip: str
+
+
+class LocalServerPlayers:
+    """``read()`` -> list of SlotInfo, or [] with ``status`` saying why."""
+
+    def __init__(self, clock=time.time, find=None, open_memory=None):
+        self._clock = clock
+        self._find = find or weather.find_process_ids
+        self._open = open_memory or (lambda pid: weather.ProcessMemory(pid, writable=False))
+        self._memory = None
+        self._pid: Optional[int] = None
+        self._next_try = 0.0
+        self.status = "Not looked yet."
+        self.available = False
+
+    def _attach(self) -> bool:
+        now = self._clock()
+        if self._memory is not None:
+            return True
+        if now < self._next_try:
+            return False
+        self._next_try = now + RETRY_SECONDS
+        if sys.platform != "win32":
+            self.status = "IP reading only works on Windows."
+            return False
+        try:
+            pids = self._find()
+        except Exception as exc:                 # pragma: no cover - OS oddities
+            self.status = f"Could not list processes: {exc}"
+            return False
+        if not pids:
+            self.status = ("jointops.exe is not running on this PC - IPs need the server "
+                           "on the same machine as WolfRAT.")
+            return False
+        try:
+            self._memory = self._open(pids[0])
+            self._pid = pids[0]
+        except Exception as exc:
+            self.status = str(exc)
+            self._memory = None
+            return False
+        return True
+
+    def _drop(self, why: str) -> None:
+        try:
+            if self._memory is not None:
+                self._memory.close()
+        except Exception:
+            pass
+        self._memory, self._pid = None, None
+        self.status = why
+        self.available = False
+
+    def exe_path(self) -> str:
+        if self._memory is None:
+            return ""
+        try:
+            return self._memory.exe_path()
+        except Exception:
+            return ""
+
+    def read(self) -> list:
+        if not self._attach():
+            self.available = False
+            return []
+        mem = self._memory
+        try:
+            capacity = struct.unpack("<I", mem.read(CAPACITY_VA, 4))[0]
+            base = struct.unpack("<I", mem.read(SLOTPTR_VA, 4))[0]
+        except Exception as exc:
+            self._drop(f"Lost the server process ({exc}).")
+            return []
+        if not base or capacity == 0 or capacity > MAX_CAPACITY:
+            self._drop("The server process does not look like Joint Ops (slot table not found).")
+            return []
+        found = []
+        for index in range(capacity):
+            slot = base + index * SLOT_STRIDE
+            try:
+                head = mem.read(slot, NAME_OFFSET + NAME_LEN)
+            except Exception:
+                continue
+            if not head[4]:
+                continue
+            name = head[NAME_OFFSET:NAME_OFFSET + NAME_LEN].split(b"\0", 1)[0].decode("latin-1", "replace")
+            netplayer = struct.unpack_from("<I", head, NETPLAYER_OFFSET)[0]
+            ip = ""
+            if netplayer:
+                try:
+                    raw = mem.read(netplayer + IP_OFFSET, 4)
+                    if any(raw):
+                        ip = socket.inet_ntoa(raw)
+                except Exception:
+                    ip = ""
+            found.append(SlotInfo(index, name, ip))
+        self.available = True
+        self.status = f"Reading IPs from jointops.exe (pid {self._pid})."
+        return found
+
+
+def ips_by_name(slots) -> dict:
+    """name -> ip for every slot that has both (the host has neither)."""
+    return {s.name: s.ip for s in slots if s.name and s.ip}

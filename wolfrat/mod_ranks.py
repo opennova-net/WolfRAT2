@@ -52,7 +52,7 @@ PERMISSION_GROUPS = (
         ("warn", "!warn - warn a player", ("!warn",)),
         ("kill", "!kill - kill a player", ("!kill",)),
         ("kick", "!kick - kick a player", ("!kick",)),
-        ("ban", "!ban - ban a player", ("!ban",)),
+        ("ban", "!ban / !unban - ban and unban a player", ("!ban", "!unban")),
     )),
     ("Rotation", (
         ("add", "!add - add a map to the rotation", ("!add",)),
