@@ -374,9 +374,11 @@ def test_zone_flip_is_reported_to_the_sprees_hook_and_zones_left_feeds_the_vote(
     charlie = [ZoneInfo(z.tier, 2 if z.tier == 3 else z.team, z.pos) for z in start]
     rig.reader.read_zones = lambda: charlie
     rig.now += 5; rig.tab.on_players([{"id": "1", "name": "Dale", "team": "2"}])
-    assert len(got) == 1 and (got[0].team, got[0].name, got[0].player, got[0].first) == (2, "Charlie", "Dale", True)
+    assert len(got) == 2 and (got[0].team, got[0].name, got[0].player, got[0].first) == (2, "Charlie", "Dale", True)
+    assert type(got[1]).__name__ == "LeadEvent" and (got[1].team, got[1].owned, got[1].total) == (2, 3, 5)
     assert rig.tab.zones_left() == (2, 2)
     assert any("Rebels took Charlie (Dale) - first zone of the map" in line for line in rig.logged)
+    assert any("Rebels now lead 3-2" in line for line in rig.logged)
     rig.tab.on_missions_updated(["3: AS-Other.bms - () () () <CURRENT MISSION> <>"])
     rig.now += 5; rig.tab.on_players([{"id": "1", "name": "Dale", "team": "2"}])   # after a map change: first sight again
-    assert len(got) == 1
+    assert len(got) == 2

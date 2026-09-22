@@ -37,7 +37,7 @@ def test_first_capture_is_reported_once_with_the_nearest_player_of_that_team():
     positions = {"Dale": (-16900178 + 200000, 52104356 - 100000, 0), "Far": (0, 0, 0), "Blue": (-16900178, 52104356, 0)}
     teams = {"Dale": 2, "Far": 2, "Blue": 1}
     ev = w.update(with_owner(START, 3, 2), positions, teams)
-    assert len(ev) == 1 and (ev[0].team, ev[0].tier, ev[0].name, ev[0].player, ev[0].first) == (2, 3, "Charlie", "Dale", True)
+    assert len(ev) == 2 and (ev[0].team, ev[0].tier, ev[0].name, ev[0].player, ev[0].first) == (2, 3, "Charlie", "Dale", True)
     ev2 = w.update(with_owner(with_owner(START, 3, 2), 2, 2), {}, {})
     assert ev2[0].first is False and ev2[0].player == "" and ev2[0].name == "Bravo"
     assert w.update(with_owner(with_owner(START, 3, 2), 2, 2), {}, {}) == []       # no change: nothing
@@ -51,3 +51,20 @@ def test_capture_lines_fill_and_fall_back():
     ev2 = zr.CaptureEvent(1, 1, "Alpha", "", True)
     assert zr.capture_line(ev2, "{player} takes {zone} for the {team}!", "{team} take {zone} - first zone!") == "Joint Ops take Alpha - first zone!"
     assert len(zr.capture_line(zr.CaptureEvent(2, 3, "Charlie", "A" * 32, True), "X" * 70, "Y" * 70)) <= 62
+
+
+def test_lead_changes_are_reported_and_ties_are_nobodys():
+    from wolfrat.zone_rules import LeadEvent
+    w = ZoneWatch()
+    assert w.update(START, {}, {}) == []                                   # 2-2: no lead, first sight
+    z = with_owner(START, 3, 2)                                            # Rebels 3-2
+    ev = w.update(z, {}, {})
+    assert [type(e).__name__ for e in ev] == ["CaptureEvent", "LeadEvent"]
+    assert ev[1] == LeadEvent(2, 3, 5)
+    z = with_owner(z, 3, 1)                                                # Joint Ops take it back 3-2
+    ev = w.update(z, {}, {})
+    assert ev[-1] == LeadEvent(1, 3, 5)
+    assert w.update(z, {}, {}) == []
+    z = with_owner(z, 3, 0)                                                # neutralised: 2-2, a tie says nothing
+    assert w.update(z, {}, {}) == []
+    assert zr.lead_line(LeadEvent(2, 3, 5), "{team} take the lead! ({owned} of {total} zones)") == "Rebels take the lead! (3 of 5 zones)"

@@ -57,24 +57,50 @@ class CaptureEvent:
     first: bool          # first capture of this map
 
 
+@dataclass(frozen=True)
+class LeadEvent:
+    """The team holding MORE zones changed (a tie is nobody's lead)."""
+    team: int
+    owned: int
+    total: int
+
+
+def leader(zones: Iterable) -> int:
+    """1 or 2 when that team holds strictly more zones, else 0."""
+    owned = {1: 0, 2: 0}
+    for z in zones:
+        if int(z.team) in owned:
+            owned[int(z.team)] += 1
+    if owned[1] > owned[2]:
+        return 1
+    if owned[2] > owned[1]:
+        return 2
+    return 0
+
+
 class ZoneWatch:
-    """Remembers each zone's owner and reports flips.  ``reset()`` on a map change."""
+    """Remembers each zone's owner and reports flips and lead changes.
+    ``reset()`` on a map change."""
 
     NEAR = 6_000_000.0   # engine units; a 20 s run was ~1.5-3.5 million on one axis
 
     def __init__(self):
         self._owner: dict[int, int] = {}
         self._seen_capture = False
+        self._leader: Optional[int] = None
 
     def reset(self) -> None:
         self._owner.clear()
         self._seen_capture = False
+        self._leader = None
 
     def update(self, zones: Iterable, positions: dict, teams: dict) -> list:
         """zones: .tier/.team/.pos; positions: name -> (x, y, z); teams: name -> team int.
-        Returns CaptureEvents for zones whose owner changed to a team."""
+        Returns CaptureEvents for zones whose owner changed to a team, then a
+        LeadEvent when the team holding more zones changed."""
         events = []
         current = {}
+        zones = list(zones)
         for z in zones:
             tier, team = int(z.tier), int(z.team)
             current[tier] = team
@@ -95,7 +121,21 @@ class ZoneWatch:
                 events.append(CaptureEvent(team, tier, zone_name(tier), who, not self._seen_capture))
                 self._seen_capture = True
         self._owner = current
+        lead = leader(zones)
+        if self._leader is None:
+            self._leader = lead                # first sight of the map: just remember
+        elif lead != self._leader:
+            self._leader = lead
+            if lead in (1, 2):
+                owned = sum(1 for z in zones if int(z.team) == lead)
+                events.append(LeadEvent(lead, owned, len(zones)))
         return events
+
+
+def lead_line(event: LeadEvent, template: str) -> str:
+    return (template.replace("{team}", team_name(event.team))
+                    .replace("{owned}", str(event.owned))
+                    .replace("{total}", str(event.total)))[:62]
 
 
 def capture_line(event: CaptureEvent, template_with_player: str, template_without: str) -> str:

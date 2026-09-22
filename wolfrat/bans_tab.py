@@ -425,8 +425,11 @@ class BansTab(QWidget):
             except (TypeError, ValueError):
                 pass
         for event in self._zone_watch.update(self.zones, self._positions, teams):
-            self.log(f"{zone_rules.team_name(event.team)} took {event.name}"
-                     + (f" ({event.player})" if event.player else "") + (" - first zone of the map" if event.first else ""))
+            if isinstance(event, zone_rules.LeadEvent):
+                self.log(f"{zone_rules.team_name(event.team)} now lead {event.owned}-{event.total - event.owned}")
+            else:
+                self.log(f"{zone_rules.team_name(event.team)} took {event.name}"
+                         + (f" ({event.player})" if event.player else "") + (" - first zone of the map" if event.first else ""))
             if self.zone_capture is not None:
                 try:
                     self.zone_capture(event)

@@ -4212,6 +4212,13 @@ class SpreeTab(QWidget):
         self._zone_capture_enabled = True
         self._zone_line_player = "{player} takes {zone} for the {team} - first zone!"
         self._zone_line_team = "{team} take {zone} - first zone of the map!"
+        self._lead_enabled = True
+        self._lead_lines = [
+            "{team} take the lead! ({owned} of {total} zones)",
+            "The {team} are now in front - {owned} of {total} zones",
+            "Lead change! {team} hold {owned} of {total}",
+            "{team} push ahead - {owned} zones to their name",
+        ]
         self._spree_table_loading = False
         self._player_stats = {}
         self._load_config()
@@ -4233,6 +4240,10 @@ class SpreeTab(QWidget):
                     self._zone_capture_enabled = cfg.get('zone_capture_enabled', True)
                     self._zone_line_player = str(cfg.get('zone_line_player', self._zone_line_player))
                     self._zone_line_team = str(cfg.get('zone_line_team', self._zone_line_team))
+                    self._lead_enabled = cfg.get('lead_enabled', True)
+                    lines = [str(x).strip() for x in (cfg.get('lead_lines') or []) if str(x).strip()]
+                    if lines:
+                        self._lead_lines = lines
                     raw_thresholds = cfg.get('spree_thresholds', None)
                     if raw_thresholds is not None:
                         self._spree_thresholds = {int(k): v for k, v in raw_thresholds.items()}
@@ -4257,6 +4268,8 @@ class SpreeTab(QWidget):
                 'zone_capture_enabled': self._zone_capture_enabled,
                 'zone_line_player': self._zone_line_player,
                 'zone_line_team': self._zone_line_team,
+                'lead_enabled': self._lead_enabled,
+                'lead_lines': self._lead_lines,
                 'spree_thresholds': {str(k): v for k, v in sorted(self._spree_thresholds.items())}
             }
             with open(self._config_path(), 'w') as f:
@@ -4299,6 +4312,17 @@ class SpreeTab(QWidget):
                            "of that team when it flipped (a good guess, not gospel - the second line is used when nobody was near).")
         zone_hint.setWordWrap(True); zone_hint.setStyleSheet("font-size: 9pt; color: #a89830;")
         spree_layout.addWidget(zone_hint)
+
+        self.lead_checkbox = QCheckBox("Announce when the lead changes on an Advance and Secure map "
+                                       "(the team holding more zones) - one line picked at random:")
+        self.lead_checkbox.setChecked(self._lead_enabled)
+        self.lead_checkbox.stateChanged.connect(self._toggle_lead)
+        spree_layout.addWidget(self.lead_checkbox)
+        self.lead_lines_edit = QPlainTextEdit("\n".join(self._lead_lines))
+        self.lead_lines_edit.setMaximumHeight(70)
+        self.lead_lines_edit.setPlaceholderText("{team} take the lead! ({owned} of {total} zones)")
+        self.lead_lines_edit.textChanged.connect(self._lead_lines_changed)
+        spree_layout.addWidget(self.lead_lines_edit)
 
         spree_layout.addWidget(QLabel("Streak Thresholds (kill count → announcement message):"))
         self.spree_table = QTableWidget(0, 2)
@@ -4434,12 +4458,27 @@ class SpreeTab(QWidget):
         self._zone_line_team = self.zone_line_team_edit.text().strip() or "{team} take {zone} - first zone of the map!"
         self._save_config()
 
+    def _toggle_lead(self, state):
+        self._lead_enabled = bool(state)
+        self._save_config()
+
+    def _lead_lines_changed(self):
+        lines = [row.strip() for row in self.lead_lines_edit.toPlainText().splitlines() if row.strip()]
+        if lines:
+            self._lead_lines = lines
+            self._save_config()
+
     def announce_zone_capture(self, event):
-        """From the Bans tab's zone watch.  Only the first capture of a map is announced."""
-        if not self._zone_capture_enabled or not getattr(event, "first", False):
-            return
+        """From the Bans tab's zone watch: the first capture of a map, and lead changes."""
         from wolfrat import zone_rules
-        msg = zone_rules.capture_line(event, self._zone_line_player, self._zone_line_team)
+        if isinstance(event, zone_rules.LeadEvent):
+            if not self._lead_enabled:
+                return
+            msg = zone_rules.lead_line(event, random.choice(self._lead_lines))
+        else:
+            if not self._zone_capture_enabled or not getattr(event, "first", False):
+                return
+            msg = zone_rules.capture_line(event, self._zone_line_player, self._zone_line_team)
         submit_admin(
             self,
             lambda message=msg: self.server.send_chat(message),
