@@ -4278,7 +4278,17 @@ class SpreeTab(QWidget):
             pass
 
     def _build_ui(self):
-        layout = QVBoxLayout(self)
+        # Two pages (Dale, 2026-09-22): the kill-spree announcer as it always
+        # was, and the Advance-and-Secure announcer on its own page so it is
+        # not buried.
+        root = QVBoxLayout(self)
+        root.setContentsMargins(4, 4, 4, 4)
+        self.pages = QTabWidget()
+        root.addWidget(self.pages, 1)
+
+        spree_page = QWidget()
+        layout = QVBoxLayout(spree_page)
+        self.pages.addTab(spree_page, "Killing sprees")
 
         spree_group = QGroupBox("Killing Spree Announcer")
         spree_layout = QVBoxLayout()
@@ -4293,11 +4303,22 @@ class SpreeTab(QWidget):
         self.first_blood_checkbox.stateChanged.connect(self._toggle_first_blood)
         spree_layout.addWidget(self.first_blood_checkbox)
 
+        lead_page = QWidget()
+        lead_layout = QVBoxLayout(lead_page)
+        self.pages.addTab(lead_page, "Lead announcer")
+        lead_intro = QLabel(
+            "Advance and Secure only. WolfRAT reads every zone's owner from the server running on "
+            "this PC (the same way the Bans tab reads IPs), so it can say who took the first zone "
+            "and when the lead changes hands. Nothing here works with the server on another machine.")
+        lead_intro.setWordWrap(True); lead_intro.setStyleSheet("color: #a89830; font-size: 9pt; padding: 4px;")
+        lead_layout.addWidget(lead_intro)
+        capture_group = QGroupBox("First zone of the map")
+        zone_layout = QVBoxLayout(capture_group)
         self.zone_capture_checkbox = QCheckBox(
-            "Announce the first zone captured on each Advance and Secure map (server on this PC)")
+            "Announce the first zone captured on each Advance and Secure map")
         self.zone_capture_checkbox.setChecked(self._zone_capture_enabled)
         self.zone_capture_checkbox.stateChanged.connect(self._toggle_zone_capture)
-        spree_layout.addWidget(self.zone_capture_checkbox)
+        zone_layout.addWidget(self.zone_capture_checkbox)
         zone_row = QHBoxLayout()
         zone_row.addWidget(QLabel("With a name:"))
         self.zone_line_player_edit = QLineEdit(self._zone_line_player)
@@ -4307,22 +4328,31 @@ class SpreeTab(QWidget):
         self.zone_line_team_edit = QLineEdit(self._zone_line_team)
         self.zone_line_team_edit.editingFinished.connect(self._zone_lines_changed)
         zone_row.addWidget(self.zone_line_team_edit, 1)
-        spree_layout.addLayout(zone_row)
+        zone_layout.addLayout(zone_row)
         zone_hint = QLabel("{team} = Joint Ops / Rebels, {zone} = Alpha, Bravo..., {player} = the nearest player "
                            "of that team when it flipped (a good guess, not gospel - the second line is used when nobody was near).")
         zone_hint.setWordWrap(True); zone_hint.setStyleSheet("font-size: 9pt; color: #a89830;")
-        spree_layout.addWidget(zone_hint)
+        zone_layout.addWidget(zone_hint)
+        lead_layout.addWidget(capture_group)
 
-        self.lead_checkbox = QCheckBox("Announce when the lead changes on an Advance and Secure map "
-                                       "(the team holding more zones) - one line picked at random:")
+        lead_group = QGroupBox("Lead changes")
+        lead_box = QVBoxLayout(lead_group)
+        self.lead_checkbox = QCheckBox("Announce when the lead changes (the team holding more zones) - "
+                                       "one line picked at random from:")
         self.lead_checkbox.setChecked(self._lead_enabled)
         self.lead_checkbox.stateChanged.connect(self._toggle_lead)
-        spree_layout.addWidget(self.lead_checkbox)
+        lead_box.addWidget(self.lead_checkbox)
         self.lead_lines_edit = QPlainTextEdit("\n".join(self._lead_lines))
-        self.lead_lines_edit.setMaximumHeight(70)
+        self.lead_lines_edit.setMinimumHeight(90)
         self.lead_lines_edit.setPlaceholderText("{team} take the lead! ({owned} of {total} zones)")
         self.lead_lines_edit.textChanged.connect(self._lead_lines_changed)
-        spree_layout.addWidget(self.lead_lines_edit)
+        lead_box.addWidget(self.lead_lines_edit)
+        lead_hint = QLabel("One line per row. {team} = Joint Ops / Rebels, {owned} = zones they hold, {total} = zones on the map. "
+                           "A tie is nobody's lead, so neutralising a zone back to even says nothing.")
+        lead_hint.setWordWrap(True); lead_hint.setStyleSheet("font-size: 9pt; color: #a89830;")
+        lead_box.addWidget(lead_hint)
+        lead_layout.addWidget(lead_group)
+        lead_layout.addStretch(1)
 
         spree_layout.addWidget(QLabel("Streak Thresholds (kill count → announcement message):"))
         self.spree_table = QTableWidget(0, 2)
