@@ -249,7 +249,7 @@ class BansTab(QWidget):
         # -- the list
         list_box = QGroupBox("Banned")
         list_layout = QVBoxLayout(list_box)
-        self.ban_table = self._table(["Kind", "Name / address", "Reason", "By", "Added", "Expires", "Hits", "Last seen trying"], 2)
+        self.ban_table = self._table(["Kind", "Name / address", "Banned with", "Reason", "By", "Added", "Expires", "Hits", "Last seen trying"], 3)
         self.ban_table.setMinimumHeight(220)
         self.ban_table.itemSelectionChanged.connect(self._sync_buttons)
         list_layout.addWidget(self.ban_table)
@@ -385,16 +385,18 @@ class BansTab(QWidget):
         added = []
         ip = self.ip_of(name)
         if kind in ("both", KIND_NAME) and name:
-            entry = BanEntry(KIND_NAME, name, reason, added_by or self.admin_name, now, expires)
+            entry = BanEntry(KIND_NAME, name, reason, added_by or self.admin_name, now, expires, linked=ip)
             self.bans.add(entry); added.append(entry)
         if kind in ("both", KIND_IP):
             if ip:
-                entry = BanEntry(KIND_IP, ip, reason or f"IP of {name}", added_by or self.admin_name, now, expires)
+                entry = BanEntry(KIND_IP, ip, reason or f"IP of {name}", added_by or self.admin_name, now, expires,
+                                 linked=name)
                 self.bans.add(entry); added.append(entry)
             elif kind == KIND_IP:
                 self.log(f"No IP known for {name} - cannot IP-ban (is the server on this PC?)")
         for entry in added:
-            self.log(f"Banned {entry.kind} {entry.value}" + (f" - {entry.reason}" if entry.reason else "")
+            self.log(f"Banned {entry.kind} {entry.value}" + (f" ({entry.linked})" if entry.linked else "")
+                     + (f" - {entry.reason}" if entry.reason else "")
                      + f" (by {entry.added_by}, until {br.format_expiry(entry.expires_at)})")
         self._dirty = True
         self._refresh_ban_table()
@@ -570,7 +572,7 @@ class BansTab(QWidget):
             last = "-"
             if e.last_hit_at:
                 last = f"{e.last_hit_name} {e.last_hit_ip} {describe_when(e.last_hit_at, now)}".strip()
-            cells = [e.kind, e.value, e.reason, e.added_by,
+            cells = [e.kind, e.value, e.linked or "-", e.reason, e.added_by,
                      time.strftime("%Y-%m-%d", time.localtime(e.added_at)) if e.added_at else "-",
                      br.format_expiry(e.expires_at), str(e.hits), last]
             for col, text in enumerate(cells):

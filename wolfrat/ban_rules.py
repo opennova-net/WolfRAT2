@@ -43,6 +43,7 @@ class BanEntry:
     last_hit_at: Optional[float] = None
     last_hit_name: str = ""
     last_hit_ip: str = ""
+    linked: str = ""               # the IP this name was banned with, or the name this IP belonged to
 
     def key(self) -> tuple[str, str]:
         return self.kind, self.value.lower()
@@ -62,6 +63,7 @@ class BanEntry:
         entry.kind = KIND_IP if entry.kind == KIND_IP else KIND_NAME
         entry.reason = str(entry.reason or "")
         entry.added_by = str(entry.added_by or "")
+        entry.linked = str(entry.linked or "")
         try:
             entry.added_at = float(entry.added_at or 0.0)
         except (TypeError, ValueError):

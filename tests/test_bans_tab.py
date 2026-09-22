@@ -158,3 +158,19 @@ def test_pages_scroll_instead_of_squashing(tmp_path):
     assert all(isinstance(rig.tab.pages.widget(i), QScrollArea) for i in range(3))
     rig.tab.resize(900, 500); rig.tab.show(); _app.processEvents()
     assert rig.tab.ban_table.minimumHeight() >= 200
+
+
+def test_name_and_ip_rows_say_what_they_were_banned_with(tmp_path):
+    """Dale, live 2026-09-22: a name row gave no clue which IP went with it."""
+    rig = Rig(tmp_path)
+    rig.poll(("Troll", "5.6.7.8"))
+    rig.tab.ban_now("Troll", reason="griefing", kind="both")
+    by_kind = {e.kind: e for e in rig.tab.bans.entries}
+    assert by_kind["name"].linked == "5.6.7.8" and by_kind["ip"].linked == "Troll"
+    headers = [rig.tab.ban_table.horizontalHeaderItem(c).text() for c in range(rig.tab.ban_table.columnCount())]
+    col = headers.index("Banned with")
+    shown = {rig.tab.ban_table.item(r, 1).text(): rig.tab.ban_table.item(r, col).text()
+             for r in range(rig.tab.ban_table.rowCount())}
+    assert shown == {"Troll": "5.6.7.8", "5.6.7.8": "Troll"}
+    again = rig.build()
+    assert {e.kind: e.linked for e in again.bans.entries} == {"name": "5.6.7.8", "ip": "Troll"}
