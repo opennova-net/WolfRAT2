@@ -10,6 +10,9 @@ Chain (Jointops.exe.kong.c, Server_PlayerPuntCRCMisMatch @ 0x50F380):
     slot+4    = active byte
     slot+40   = name, 32 bytes
     slot+28   = CNetPlayer*  ->  +196 = IPv4, network byte order
+    slot+0    = GamePlayerEntity*  ->  +0x04/+0x08/+0x0C = int32 X/Y/Z position
+                (Entity_ValidatePtr @ 0x500910; proven 2026-09-22 with Dale walking:
+                 ~400k units/s moving, exactly constant standing still)
 Slot 0 is the host itself (null CNetPlayer).  Read-only: this module never
 opens the process for writing.
 """
@@ -31,6 +34,8 @@ SLOT_STRIDE = 0x188E8
 NAME_OFFSET, NAME_LEN = 40, 32
 NETPLAYER_OFFSET = 28
 IP_OFFSET = 196
+ENTITY_OFFSET = 0
+POSITION_OFFSET = 4          # three int32: X, Y, Z(height)
 MAX_CAPACITY = 256
 RETRY_SECONDS = 10
 
@@ -40,6 +45,7 @@ class SlotInfo:
     slot: int
     name: str
     ip: str
+    pos: Optional[tuple] = None      # (x, y, z) engine units, None when unreadable
 
 
 class LocalServerPlayers:
@@ -134,7 +140,14 @@ class LocalServerPlayers:
                         ip = socket.inet_ntoa(raw)
                 except Exception:
                     ip = ""
-            found.append(SlotInfo(index, name, ip))
+            entity = struct.unpack_from("<I", head, ENTITY_OFFSET)[0]
+            pos = None
+            if entity:
+                try:
+                    pos = struct.unpack("<iii", mem.read(entity + POSITION_OFFSET, 12))
+                except Exception:
+                    pos = None
+            found.append(SlotInfo(index, name, ip, pos))
         self.available = True
         self.status = f"Reading IPs from jointops.exe (pid {self._pid})."
         return found
@@ -143,3 +156,8 @@ class LocalServerPlayers:
 def ips_by_name(slots) -> dict:
     """name -> ip for every slot that has both (the host has neither)."""
     return {s.name: s.ip for s in slots if s.name and s.ip}
+
+
+def positions_by_name(slots) -> dict:
+    """name -> (x, y, z) for every slot with a readable entity."""
+    return {s.name: s.pos for s in slots if s.name and s.pos}

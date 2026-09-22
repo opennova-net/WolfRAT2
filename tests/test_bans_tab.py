@@ -77,7 +77,7 @@ def test_rejoin_under_a_new_name_is_caught_by_ip_and_shown_as_an_alias(tmp_path)
     rig.punts.clear()
     rig.poll(("NewName", "5.6.7.8"), seconds=60)
     assert rig.punts == [("NewName", "Banned: griefing")]
-    assert rig.tab.online_table.item(0, 4).text() == "Troll"
+    assert rig.tab.online_table.item(0, 5).text() == "Troll"
 
 
 def test_whitelist_beats_a_range_and_the_tab_says_so_in_its_log(tmp_path):
@@ -158,8 +158,8 @@ def test_punt_on_sight_hands_over_the_whole_player_record(tmp_path):
 def test_pages_scroll_instead_of_squashing(tmp_path):
     from PyQt6.QtWidgets import QScrollArea
     rig = Rig(tmp_path)
-    assert [rig.tab.pages.tabText(i) for i in range(rig.tab.pages.count())] ==         ["Ban list", "Whitelist", "Player history", "Connection checks"]
-    assert all(isinstance(rig.tab.pages.widget(i), QScrollArea) for i in range(4))
+    assert [rig.tab.pages.tabText(i) for i in range(rig.tab.pages.count())] ==         ["Ban list", "Whitelist", "Player history", "Connection checks", "Idle kick"]
+    assert all(isinstance(rig.tab.pages.widget(i), QScrollArea) for i in range(5))
     # a 1024x768 desktop leaves the tab about 560 px: every page must fit without the page scrolling
     rig.tab.resize(1000, 560); rig.tab.show(); _app.processEvents()
     for i in range(rig.tab.pages.count()):
@@ -299,3 +299,59 @@ def test_country_letters_sit_in_front_of_the_ip_once_known(tmp_path):
     assert rig.tab.ban_table.item(0, 1).text() == "GB 82.68.58.92"
     rig.tab.pages.setCurrentIndex(2); rig.tab._refresh_history()
     assert rig.tab.hist_table.item(0, 1).text() == "GB 82.68.58.92"
+
+
+# ---- idle kick ------------------------------------------------------------------
+
+def idle_rig(tmp_path, mods=("Ham",)):
+    rig = Rig(tmp_path)
+    rig.tab = BansTab(rig.folder, punt=lambda p, why: (rig.punts.append((p["name"], why)), rig.punted_records.append(p)),
+                      announce=rig.said.append, log=rig.logged.append, reader=rig.reader,
+                      clock=lambda: rig.now, admin_name="Dale", checker=FakeChecker(), mods=lambda: mods)
+    return rig
+
+
+def poll_pos(rig, *players, seconds=5):
+    rig.now += seconds
+    rig.reader.slots = [SlotInfo(0, "Host", "", (1, 1, 1))] + [SlotInfo(i + 1, n, ip, pos) for i, (n, ip, pos) in enumerate(players)]
+    rig.tab.on_players([{"id": str(i + 1), "name": n, "team": "1", "class": "R", "kills": "0", "deaths": "0", "ping": "20"}
+                        for i, (n, _ip, _pos) in enumerate(players)])
+
+
+def test_idle_page_exists_off_by_default_and_the_column_counts(tmp_path):
+    rig = idle_rig(tmp_path)
+    assert rig.tab.pages.tabText(4) == "Idle kick" and not rig.tab.idle_cfg.enabled
+    poll_pos(rig, ("Camper", "5.6.7.8", (100, 100, 5)))
+    poll_pos(rig, ("Camper", "5.6.7.8", (100, 100, 5)), seconds=90)
+    assert rig.tab.online_table.item(0, 3).text() == "1:30" and rig.punts == []
+
+
+def test_idle_warns_then_kicks_but_never_mods_or_whitelist(tmp_path):
+    rig = idle_rig(tmp_path, mods=("Ham",))
+    rig.tab.idle_cb.setChecked(True); rig.tab.idle_minutes.setValue(2)
+    rig.tab.white_value.setText("Regular"); rig.tab._add_white()
+    still = lambda n: (n, "5.6.7.8", (100, 100, 5))
+    poll_pos(rig, still("Camper"), still("Ham"), still("Regular"))
+    poll_pos(rig, still("Camper"), still("Ham"), still("Regular"), seconds=61)
+    assert rig.said == ["Camper: move or you will be kicked for idling in 60s"] and rig.punts == []
+    poll_pos(rig, still("Camper"), still("Ham"), still("Regular"), seconds=60)
+    assert rig.punts == [("Camper", "Idle for 2 min")]
+    assert rig.said[-1] == "Camper was kicked for being idle 2 min"
+    assert all(n == "Camper" for n, _ in rig.punts)
+    rig.tab.idle_mods_cb.setChecked(False)
+    poll_pos(rig, still("Ham"), seconds=5)
+    assert ("Ham", "Idle for 2 min") in rig.punts               # mods only exempt while the box is ticked
+
+
+def test_map_change_resets_idle_clocks_and_settings_persist(tmp_path):
+    rig = idle_rig(tmp_path)
+    rig.tab.idle_cb.setChecked(True); rig.tab.idle_minutes.setValue(3); rig.tab.idle_mods_cb.setChecked(False)
+    poll_pos(rig, ("Camper", "5.6.7.8", (100, 100, 5)))
+    poll_pos(rig, ("Camper", "5.6.7.8", (100, 100, 5)), seconds=100)
+    assert rig.tab.idle.idle_seconds("Camper", rig.now) == 100
+    rig.tab.on_missions_updated(["3: TD-A.bms - () () () <CURRENT MISSION> <>"])
+    assert rig.tab.idle.idle_seconds("Camper", rig.now) is None
+    rig.tab.on_missions_updated(["3: TD-A.bms - () () () <CURRENT MISSION> <>"])   # same map again: no reset spam
+    again = BansTab(rig.folder, punt=lambda *a: None, announce=lambda *a: None, reader=rig.reader,
+                    clock=lambda: rig.now, checker=FakeChecker())
+    assert (again.idle_cfg.enabled, again.idle_cfg.minutes, again.idle_cfg.exempt_mods) == (True, 3, False)

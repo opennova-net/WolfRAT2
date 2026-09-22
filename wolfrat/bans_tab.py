@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from typing import Callable, Optional
+from typing import Callable, Iterable, Optional
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor
@@ -22,18 +22,20 @@ from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboB
                              QDialog, QDialogButtonBox, QFileDialog, QFrame, QGroupBox,
                              QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox,
                              QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy,
-                             QSplitter, QTableWidget, QTableWidgetItem, QTabWidget,
-                             QVBoxLayout, QWidget)
+                             QSpinBox, QSplitter, QTableWidget, QTableWidgetItem,
+                             QTabWidget, QVBoxLayout, QWidget)
 
 from wolfrat import ban_rules as br
+from wolfrat import idle_rules
 from wolfrat import ip_checks
 from wolfrat.ban_rules import BanEntry, BanList, Enforcer, KIND_IP, KIND_NAME
-from wolfrat.jo_players import LocalServerPlayers, ips_by_name
+from wolfrat.jo_players import LocalServerPlayers, ips_by_name, positions_by_name
 from wolfrat.player_history import PlayerHistory, describe_when
 
 BANS_FILE = "wolfrat_bans.json"
 HISTORY_FILE = "wolfrat_player_history.json"
 CHECKS_FILE = "wolfrat_ip_checks.json"
+IDLE_FILE = "wolfrat_idle.json"
 EXPIRY_CHOICES = [("never", ""), ("1 hour", "1h"), ("1 day", "1d"), ("7 days", "7d"),
                   ("30 days", "30d"), ("90 days", "90d")]
 
@@ -124,6 +126,7 @@ class BansTab(QWidget):
                  button_cls=QPushButton,
                  admin_name: str = "admin",
                  checker=None,
+                 mods: Optional[Callable[[], Iterable[str]]] = None,
                  parent=None):
         super().__init__(parent)
         self._dir = str(settings_dir)
@@ -141,6 +144,12 @@ class BansTab(QWidget):
         self._verdict_signal.connect(self._on_verdict)
         self._check_acted: dict = {}          # name|ip -> when we last kicked for a connection check
         self._loading_checks = True
+        self._mods = mods or (lambda: ())
+        self.idle_cfg = self._load_idle()
+        self.idle = idle_rules.IdleWatch()
+        self._positions: dict = {}
+        self._current_map: Optional[str] = None
+        self._loading_idle = True
         self._ips: dict = {}
         self._online: list = []
         self._chat_initialized = False
@@ -177,10 +186,18 @@ class BansTab(QWidget):
             data = {}
         return ip_checks.ChecksConfig.from_json(data.get("config")), ip_checks.VerdictCache.from_json(data.get("cache"))
 
+    def _load_idle(self) -> idle_rules.IdleConfig:
+        try:
+            with open(os.path.join(self._dir, IDLE_FILE), "r", encoding="utf-8") as handle:
+                return idle_rules.IdleConfig.from_json(json.load(handle))
+        except (OSError, ValueError):
+            return idle_rules.IdleConfig()
+
     def save(self) -> None:
         self.verdicts.dirty = False
         for name, payload in ((BANS_FILE, self.bans.to_json()), (HISTORY_FILE, self.history.to_json()),
-                              (CHECKS_FILE, {"config": self.checks.to_json(), "cache": self.verdicts.to_json()})):
+                              (CHECKS_FILE, {"config": self.checks.to_json(), "cache": self.verdicts.to_json()}),
+                              (IDLE_FILE, self.idle_cfg.to_json())):
             path = os.path.join(self._dir, name)
             try:
                 tmp = path + ".tmp"
@@ -211,6 +228,7 @@ class BansTab(QWidget):
         self.pages.addTab(self._scrolling(self._build_whitelist_page()), "Whitelist")
         self.pages.addTab(self._scrolling(self._build_history_page()), "Player history")
         self.pages.addTab(self._scrolling(self._build_checks_page()), "Connection checks")
+        self.pages.addTab(self._scrolling(self._build_idle_page()), "Idle kick")
         self.log_text = QPlainTextEdit(); self.log_text.setReadOnly(True)
         self.log_text.setMaximumHeight(56)
         self.log_text.setStyleSheet("font-family: Consolas, monospace; font-size: 9pt; background-color: #0a0a00; "
@@ -252,7 +270,7 @@ class BansTab(QWidget):
         # -- on the server now
         online_box = QGroupBox("On the server now")
         online_layout = QVBoxLayout(online_box)
-        self.online_table = self._table(["Name", "IP", "Connection", "Visits", "Other names seen on this IP"], 4)
+        self.online_table = self._table(["Name", "IP", "Connection", "Idle", "Visits", "Other names seen on this IP"], 5)
         self.online_table.setMinimumHeight(84)
         online_layout.addWidget(self.online_table)
         online_row = QHBoxLayout()
@@ -308,6 +326,86 @@ class BansTab(QWidget):
         splitter.setStretchFactor(0, 1); splitter.setStretchFactor(1, 2)
         self._sync_buttons()
         return page
+
+    def _build_idle_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        box = QGroupBox("Idle kick - remove players who have stopped moving")
+        grid = QVBoxLayout(box)
+        note = QLabel(
+            "Watches each player's position on the map (read from the server on this PC, like the IPs). "
+            "Someone who has not moved for the time below gets one chat warning a minute before, then is "
+            "kicked with a message everyone sees. Kills do not count - a sniper lying still is playing, "
+            "but a sniper who has not moved at all for ten minutes is not. The clock does not run while "
+            "a map is loading, and a map change restarts it for everyone.")
+        note.setWordWrap(True); note.setStyleSheet("color: #a89830; font-size: 9pt;")
+        grid.addWidget(note)
+        row = QHBoxLayout()
+        self.idle_cb = QCheckBox("Kick players who have not moved for")
+        self.idle_minutes = QSpinBox(); self.idle_minutes.setRange(idle_rules.MIN_MINUTES, idle_rules.MAX_MINUTES)
+        self.idle_minutes.setSuffix(" min"); self.idle_minutes.setMaximumWidth(90)
+        row.addWidget(self.idle_cb); row.addWidget(self.idle_minutes); row.addStretch()
+        grid.addLayout(row)
+        self.idle_mods_cb = QCheckBox("Never kick names on the Mods tab (the Whitelist page is always exempt)")
+        grid.addWidget(self.idle_mods_cb)
+        self.idle_status = QLabel(); self.idle_status.setStyleSheet("color: #e8c840;"); self.idle_status.setWordWrap(True)
+        grid.addWidget(self.idle_status)
+        layout.addWidget(box); layout.addStretch(1)
+        self.idle_cb.setChecked(self.idle_cfg.enabled)
+        self.idle_minutes.setValue(self.idle_cfg.minutes)
+        self.idle_mods_cb.setChecked(self.idle_cfg.exempt_mods)
+        self.idle_cb.stateChanged.connect(self._idle_changed)
+        self.idle_mods_cb.stateChanged.connect(self._idle_changed)
+        self.idle_minutes.valueChanged.connect(self._idle_changed)
+        self._loading_idle = False
+        self._idle_changed()
+        return page
+
+    def _idle_changed(self):
+        self.idle_cfg.enabled = self.idle_cb.isChecked()
+        self.idle_cfg.minutes = self.idle_minutes.value()
+        self.idle_cfg.exempt_mods = self.idle_mods_cb.isChecked()
+        if not self.idle_cfg.enabled:
+            self.idle_status.setText("Off. The 'Idle' column on the Ban list page still shows how long since each player moved.")
+        else:
+            self.idle_status.setText(f"On - warning at {self.idle_cfg.minutes - 1} min, kick at {self.idle_cfg.minutes} min"
+                                     if self.idle_cfg.minutes > 1 else "On - warning straight away, kick at 1 min")
+        if not self._loading_idle:
+            self._dirty = True
+            self.save()
+
+    def _idle_exempt(self) -> set:
+        names = {e.value.lower() for e in self.bans.whitelist if e.kind == KIND_NAME}
+        if self.idle_cfg.exempt_mods:
+            try:
+                names |= {str(n).lower() for n in self._mods()}
+            except Exception:
+                pass
+        return names
+
+    def _idle_tick(self, now: float) -> None:
+        for event in self.idle.tick(self.idle_cfg, self._online, self._positions, self._idle_exempt(), now):
+            if event.kind == "warn":
+                self.log(f"Idle warning to {event.name} ({event.idle_seconds // 60} min without moving)")
+                self._announce(idle_rules.warn_text(event.name))
+            else:
+                self.log(f"Kicked {event.name} for being idle {event.idle_seconds // 60} min")
+                try:
+                    self._punt(event.player, f"Idle for {event.idle_seconds // 60} min")
+                except Exception as exc:
+                    self.log(f"Punt failed for {event.name}: {exc}")
+                self._announce(idle_rules.kick_text(event.name, self.idle_cfg.minutes))
+
+    def on_missions_updated(self, missions) -> None:
+        """A map change restarts every idle clock."""
+        current = None
+        for m in missions or ():
+            if "<CURRENT MISSION>" in str(m):
+                current = str(m).split(" - ")[0].strip()
+                break
+        if current and current != self._current_map:
+            self._current_map = current
+            self.idle.reset()
 
     def _build_checks_page(self):
         page = QWidget()
@@ -539,12 +637,14 @@ class BansTab(QWidget):
         now = self._clock()
         slots = self._reader.read()
         self._ips = ips_by_name(slots)
+        self._positions = positions_by_name(slots)
         self._online = list(players or [])
         self.status_lbl.setText(("IPs: " + self._reader.status) if not self._reader.available
                                 else f"IPs: reading from the server on this PC ({len(self._ips)} known)")
         self.history.observe(self._online, self._ips, now)
         self._act_on_checks()
         self._enforce(now)
+        self._idle_tick(now)
         self._refresh_online()
         self._update_checks_status()
         if self._dirty or self.history.dirty or self.verdicts.dirty:
@@ -786,12 +886,17 @@ class BansTab(QWidget):
             rec = self.history.get(name)
             others = [r.name for r in self.history.by_ip(ip) if r.name.lower() != name.lower()] if ip else []
             verdict_text = self._verdict_text(ip)
-            cells = [name, self._with_country(ip), verdict_text, str(rec.visits) if rec else "-", ", ".join(others[:6]) or "-"]
+            idle = self.idle.idle_seconds(name, self._clock())
+            idle_text = "-" if idle is None else (f"{idle // 60}:{idle % 60:02d}" if idle >= 60 else f"{idle}s")
+            cells = [name, self._with_country(ip), verdict_text, idle_text, str(rec.visits) if rec else "-",
+                     ", ".join(others[:6]) or "-"]
             for col, text in enumerate(cells):
                 item = QTableWidgetItem(text)
-                if col == 4 and others:
+                if col == 5 and others:
                     item.setForeground(QColor("#ff9040"))
                 if col == 2 and verdict_text not in ("-", "checking...") and not verdict_text.startswith("clear"):
+                    item.setForeground(QColor("#ff6040"))
+                if col == 3 and idle is not None and self.idle_cfg.enabled and idle >= (self.idle_cfg.minutes - 1) * 60:
                     item.setForeground(QColor("#ff6040"))
                 table.setItem(row, col, item)
 
