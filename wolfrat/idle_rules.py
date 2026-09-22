@@ -113,9 +113,13 @@ class IdleWatch:
         return events
 
 
-def warn_text(name: str, seconds: int = WARN_SECONDS) -> str:
-    return f"{name}: move or you will be kicked for idling in {seconds}s"[:62]
+# Chat lines.  The game shows ~60 characters and a name can be 32, so the
+# warning goes out as TWO short lines (Dale, live 2026-09-22: one line ended
+# at "60" with the "s" cut off).
+def warn_lines(name: str, minutes_idle: int, seconds: int = WARN_SECONDS) -> list:
+    return [f"{name[:32]}: you have not moved for {minutes_idle} min"[:50],
+            f"Move now or you will be kicked in {seconds} seconds"[:50]]
 
 
 def kick_text(name: str, minutes: int) -> str:
-    return f"{name} was kicked for being idle {minutes} min"[:62]
+    return f"{name[:32]} kicked - idle {minutes} min"[:50]

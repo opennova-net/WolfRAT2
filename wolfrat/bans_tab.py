@@ -387,7 +387,8 @@ class BansTab(QWidget):
         for event in self.idle.tick(self.idle_cfg, self._online, self._positions, self._idle_exempt(), now):
             if event.kind == "warn":
                 self.log(f"Idle warning to {event.name} ({event.idle_seconds // 60} min without moving)")
-                self._announce(idle_rules.warn_text(event.name))
+                for line in idle_rules.warn_lines(event.name, event.idle_seconds // 60):
+                    self._announce(line)
             else:
                 self.log(f"Kicked {event.name} for being idle {event.idle_seconds // 60} min")
                 try:

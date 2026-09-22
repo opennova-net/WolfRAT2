@@ -80,7 +80,10 @@ def test_config_round_trip_and_clamp():
     assert IdleConfig.from_json("junk") == IdleConfig()
 
 
-def test_chat_lines_fit_the_62_char_limit():
-    assert len(ir.warn_text("A" * 32)) <= 62 and len(ir.kick_text("A" * 32, 120)) <= 62
-    assert ir.warn_text("Camper") == "Camper: move or you will be kicked for idling in 60s"
-    assert ir.kick_text("Camper", 10) == "Camper was kicked for being idle 10 min"
+def test_chat_lines_are_short_enough_for_a_32_char_name():
+    """Live 2026-09-22: 'FMJ-BadgerLove: move or ... in 60s' lost its last letter in game."""
+    for line in ir.warn_lines("A" * 32, 9) + [ir.kick_text("A" * 32, 120)]:
+        assert len(line) <= 50, line
+    assert ir.warn_lines("FMJ-BadgerLove", 9) == ["FMJ-BadgerLove: you have not moved for 9 min",
+                                                  "Move now or you will be kicked in 60 seconds"]
+    assert ir.kick_text("FMJ-BadgerLove", 10) == "FMJ-BadgerLove kicked - idle 10 min"

@@ -333,10 +333,10 @@ def test_idle_warns_then_kicks_but_never_mods_or_whitelist(tmp_path):
     still = lambda n: (n, "5.6.7.8", (100, 100, 5))
     poll_pos(rig, still("Camper"), still("Ham"), still("Regular"))
     poll_pos(rig, still("Camper"), still("Ham"), still("Regular"), seconds=61)
-    assert rig.said == ["Camper: move or you will be kicked for idling in 60s"] and rig.punts == []
+    assert rig.said == ["Camper: you have not moved for 1 min", "Move now or you will be kicked in 60 seconds"] and rig.punts == []
     poll_pos(rig, still("Camper"), still("Ham"), still("Regular"), seconds=60)
     assert rig.punts == [("Camper", "Idle for 2 min")]
-    assert rig.said[-1] == "Camper was kicked for being idle 2 min"
+    assert rig.said[-1] == "Camper kicked - idle 2 min"
     assert all(n == "Camper" for n, _ in rig.punts)
     rig.tab.idle_mods_cb.setChecked(False)
     poll_pos(rig, still("Ham"), seconds=5)
