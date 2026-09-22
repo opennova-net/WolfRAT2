@@ -279,3 +279,40 @@ def decide(
     if notes:
         status += f"   |   {label} early vote: " + " or ".join(notes)
     return Decision(False, status=status)
+
+
+# ---- the player gate --------------------------------------------------------
+#
+# The player count is the admin-port PLAYER list WolfRAT polls every few
+# seconds - the same list the Server tab shows. No memory reading, nothing to
+# do with the weather scripts. Slot 0 (the server itself) is already dropped
+# before the list reaches us.
+
+DEFAULT_MIN_PLAYERS = 2
+MIN_PLAYERS_RANGE = (1, 32)
+
+
+def clamp_min_players(value) -> int:
+    lo, hi = MIN_PLAYERS_RANGE
+    try:
+        return max(lo, min(hi, int(value)))
+    except (TypeError, ValueError):
+        return DEFAULT_MIN_PLAYERS
+
+
+def hold_for_players(players: int, minimum: int) -> str | None:
+    """Why the auto-vote must wait, or None when enough players are on.
+
+    Returned text is the status line - the point is that a held vote SAYS so
+    instead of sitting on 'Auto-vote pending...' for ever.
+    """
+    minimum = clamp_min_players(minimum)
+    if players >= minimum:
+        return None
+    if players <= 0:
+        who = "nobody is on the server"
+    elif players == 1:
+        who = "only 1 player is on the server"
+    else:
+        who = f"only {players} players are on the server"
+    return f"Status: Paused - {who}. Votes start with {minimum} or more."

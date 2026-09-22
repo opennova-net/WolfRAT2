@@ -5998,6 +5998,7 @@ class MapVotingTab(QWidget):
         # Optional early-vote rules, all off unless the saved file says otherwise.
         self._mode_rules = vote_rules.rules_from_json(None)
         self._kill_watch = vote_rules.KillWatch()
+        self._hold_logged = False
 
         self._recently_played_file = str(
             self.runtime.path("wolfrat_recently_played.json")
@@ -6016,6 +6017,9 @@ class MapVotingTab(QWidget):
                         self._match_duration = data.get('match_duration', 30)
                         self._trigger_mins = data.get('trigger_mins', 3)
                         self._vote_duration = data.get('vote_duration', 2)
+                        self._min_players = vote_rules.clamp_min_players(
+                            data.get('min_players', vote_rules.DEFAULT_MIN_PLAYERS)
+                        )
                         self._mode_rules = vote_rules.rules_from_json(
                             data.get('mode_rules')
                         )
@@ -6029,6 +6033,7 @@ class MapVotingTab(QWidget):
                         self._match_duration = 30
                         self._trigger_mins = 3
                         self._vote_duration = 2
+                        self._min_players = vote_rules.DEFAULT_MIN_PLAYERS
             else:
                 self._recently_played = []
                 self._current_map = None
@@ -6039,6 +6044,7 @@ class MapVotingTab(QWidget):
                 self._match_duration = 30
                 self._trigger_mins = 3
                 self._vote_duration = 2
+                self._min_players = vote_rules.DEFAULT_MIN_PLAYERS
         except Exception:
             self._recently_played = []
             self._current_map = None
@@ -6049,6 +6055,7 @@ class MapVotingTab(QWidget):
             self._match_duration = 30
             self._trigger_mins = 3
             self._vote_duration = 2
+            self._min_players = vote_rules.DEFAULT_MIN_PLAYERS
 
         self._build_ui()
 
@@ -6143,9 +6150,23 @@ class MapVotingTab(QWidget):
         self.blacklist_lbl.setToolTip("Maps are only blacklisted if players are on the server and actively voting.")
         config_layout.addWidget(self.blacklist_lbl, 3, 3)
 
+        min_title = QLabel("Only auto-vote with at least this many players:")
+        min_tip = (
+            "Nobody on the server, or fewer than this? The automatic vote waits "
+            "and the status line says so. Counts the players the Server tab "
+            "shows. 'Start Vote Now' and a mod's !startvote are not affected."
+        )
+        min_title.setToolTip(min_tip)
+        config_layout.addWidget(min_title, 4, 0)
+        self.min_players_spin = small(QSpinBox())
+        self.min_players_spin.setRange(*vote_rules.MIN_PLAYERS_RANGE)
+        self.min_players_spin.setValue(self._min_players)
+        self.min_players_spin.setToolTip(min_tip)
+        config_layout.addWidget(self.min_players_spin, 4, 1)
+
         self.start_btn = SatisfyingButton("Start Vote Now")
         self.start_btn.clicked.connect(self._start_vote)
-        config_layout.addWidget(self.start_btn, 4, 0, 1, 4)
+        config_layout.addWidget(self.start_btn, 5, 0, 1, 4)
         config_layout.setColumnStretch(4, 1)
 
         self.reset_pool_slider.valueChanged.connect(self._on_reset_pool_changed)
@@ -6154,6 +6175,7 @@ class MapVotingTab(QWidget):
         self.match_duration_spin.valueChanged.connect(self._save_recently_played)
         self.trigger_spin.valueChanged.connect(self._save_recently_played)
         self.duration_spin.valueChanged.connect(self._save_recently_played)
+        self.min_players_spin.valueChanged.connect(self._save_recently_played)
 
         config_group.setLayout(config_layout)
         layout.addWidget(config_group)
@@ -6348,6 +6370,7 @@ class MapVotingTab(QWidget):
                 'match_duration': self.match_duration_spin.value(),
                 'trigger_mins': self.trigger_spin.value(),
                 'vote_duration': self.duration_spin.value(),
+                'min_players': self.min_players_spin.value(),
                 'mode_rules': vote_rules.rules_to_json(self._current_rules()),
             }
             with open(self._recently_played_file, 'w', encoding='utf-8') as f:
@@ -6386,6 +6409,7 @@ class MapVotingTab(QWidget):
             self._vote_active = False
             self._vote_stage = 'idle'
             self._kill_watch.reset()
+            self._hold_logged = False
 
             # --- FIX: Clear list if it hits 50% of the total rotation ---
             mtab = getattr(self, 'missions_tab', None)
@@ -6476,13 +6500,24 @@ class MapVotingTab(QWidget):
                 self._current_rules(),
                 self._kill_watch,
             )
-            self.status_lbl.setText(decision.status)
+            players = len(self.server.players or ())
+            held = vote_rules.hold_for_players(players, self.min_players_spin.value())
+            if held is None:
+                self.status_lbl.setText(decision.status)
+                self._hold_logged = False
+            else:
+                # Say WHY nothing is happening - a held vote used to sit on
+                # 'Auto-vote pending...' with no clue in the log either.
+                self.status_lbl.setText(held)
+                if decision.fire and not self._hold_logged:
+                    self._hold_logged = True
+                    self.log(f"Auto-vote held: {held[len('Status: '):]}")
+                    wire_log(f"[VOTE] auto-start held: {players} players, need {self.min_players_spin.value()}")
 
-            if self.enable_cb.isChecked() and decision.fire:
-                if len(self.server.players) > 0:
-                    self.log(f"Auto-vote: {decision.reason}")
-                    wire_log(f"[VOTE] auto-start: {decision.reason}")
-                    self._start_vote()
+            if self.enable_cb.isChecked() and decision.fire and held is None:
+                self.log(f"Auto-vote: {decision.reason}")
+                wire_log(f"[VOTE] auto-start: {decision.reason}")
+                self._start_vote()
 
     def _start_vote(self):
         import time

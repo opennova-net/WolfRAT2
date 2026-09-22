@@ -228,3 +228,29 @@ def test_a_missing_or_damaged_settings_file_means_every_rule_off(junk):
 def test_saved_numbers_are_clamped():
     rule = ModeRule.from_json({"minutes_in": 9999, "kills_before_limit": -5})
     assert rule.minutes_in == 240 and rule.kills_before_limit == 1
+
+
+# ---- the player gate (2026-09-22): a held vote must SAY it is held ----------
+
+def test_enough_players_means_no_hold():
+    assert vr.hold_for_players(2, 2) is None
+    assert vr.hold_for_players(9, 2) is None
+    assert vr.hold_for_players(1, 1) is None
+
+
+@pytest.mark.parametrize("players, minimum, text", [
+    (0, 2, "Status: Paused - nobody is on the server. Votes start with 2 or more."),
+    (1, 2, "Status: Paused - only 1 player is on the server. Votes start with 2 or more."),
+    (3, 6, "Status: Paused - only 3 players are on the server. Votes start with 6 or more."),
+    (0, 1, "Status: Paused - nobody is on the server. Votes start with 1 or more."),
+])
+def test_held_status_says_why(players, minimum, text):
+    assert vr.hold_for_players(players, minimum) == text
+
+
+@pytest.mark.parametrize("junk, expected", [
+    (None, vr.DEFAULT_MIN_PLAYERS), ("x", vr.DEFAULT_MIN_PLAYERS),
+    (0, 1), (-5, 1), (99, 32), ("4", 4), (2.9, 2),
+])
+def test_min_players_is_clamped(junk, expected):
+    assert vr.clamp_min_players(junk) == expected
