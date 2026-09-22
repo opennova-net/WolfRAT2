@@ -158,9 +158,14 @@ def test_punt_on_sight_hands_over_the_whole_player_record(tmp_path):
 def test_pages_scroll_instead_of_squashing(tmp_path):
     from PyQt6.QtWidgets import QScrollArea
     rig = Rig(tmp_path)
-    assert all(isinstance(rig.tab.pages.widget(i), QScrollArea) for i in range(3))
-    rig.tab.resize(900, 500); rig.tab.show(); _app.processEvents()
-    assert rig.tab.ban_table.minimumHeight() >= 200
+    assert [rig.tab.pages.tabText(i) for i in range(rig.tab.pages.count())] ==         ["Ban list", "Whitelist", "Player history", "Connection checks"]
+    assert all(isinstance(rig.tab.pages.widget(i), QScrollArea) for i in range(4))
+    # a 1024x768 desktop leaves the tab about 560 px: every page must fit without the page scrolling
+    rig.tab.resize(1000, 560); rig.tab.show(); _app.processEvents()
+    for i in range(rig.tab.pages.count()):
+        rig.tab.pages.setCurrentIndex(i); _app.processEvents()
+        scroll = rig.tab.pages.widget(i)
+        assert scroll.widget().sizeHint().height() <= scroll.viewport().height(), rig.tab.pages.tabText(i)
 
 
 def test_name_and_ip_rows_say_what_they_were_banned_with(tmp_path):
@@ -272,7 +277,7 @@ def test_country_block_and_settings_survive_a_restart(tmp_path):
                     clock=lambda: rig.now, checker=FakeChecker())
     assert again.checks.enabled and again.checks.countries == ["RU", "CN"] and again.checks.provider == "proxycheck"
     assert again.checks.api_key == "k" and again.verdicts.get("5.6.7.8", rig.now).country == "RU"
-    assert again.key_edit.isVisibleTo(again) and again.countries_edit.isEnabled()
+    assert not again.key_edit.isHidden() and again.countries_edit.isEnabled()
 
 
 def test_lookup_errors_never_kick(tmp_path):

@@ -21,9 +21,9 @@ from PyQt6.QtWidgets import QMenu
 from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox,
                              QDialog, QDialogButtonBox, QFileDialog, QFrame, QGroupBox,
                              QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox,
-                             QPlainTextEdit, QPushButton, QScrollArea, QSplitter,
-                             QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout,
-                             QWidget)
+                             QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy,
+                             QSplitter, QTableWidget, QTableWidgetItem, QTabWidget,
+                             QVBoxLayout, QWidget)
 
 from wolfrat import ban_rules as br
 from wolfrat import ip_checks
@@ -49,11 +49,7 @@ _HELP = (
     "<b>Whitelist</b> entries are never removed, whatever else matches."
 )
 
-_HELP_SHORT = (
-    "WolfRAT's own ban list - by name or IP, removed the moment they are seen. "
-    "IPs come from the server on this PC. Firewall lines are copy-paste for PowerShell "
-    "(as administrator, on the server PC). Hover here for the full story."
-)
+_HELP_SHORT = "WolfRAT's own ban list - by name or IP, removed on sight. Hover here for how it works."
 
 _TABLE_STYLE = "QTableWidget { background: #0a0a00; color: #d0c060; gridline-color: #2a2a00; }"
 
@@ -214,8 +210,9 @@ class BansTab(QWidget):
         self.pages.addTab(self._scrolling(self._build_bans_page()), "Ban list")
         self.pages.addTab(self._scrolling(self._build_whitelist_page()), "Whitelist")
         self.pages.addTab(self._scrolling(self._build_history_page()), "Player history")
+        self.pages.addTab(self._scrolling(self._build_checks_page()), "Connection checks")
         self.log_text = QPlainTextEdit(); self.log_text.setReadOnly(True)
-        self.log_text.setMaximumHeight(90)
+        self.log_text.setMaximumHeight(56)
         self.log_text.setStyleSheet("font-family: Consolas, monospace; font-size: 9pt; background-color: #0a0a00; "
                                     "color: #a89830; border: 1px solid #3a3a00;")
         root.addWidget(self.log_text)
@@ -227,6 +224,9 @@ class BansTab(QWidget):
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         table.verticalHeader().setVisible(False)
         table.setStyleSheet(_TABLE_STYLE)
+        # Tables ask for ~250 px each by default; on a 1024x768 desktop that forced
+        # the whole page to scroll.  Let the layout give them whatever is left.
+        table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
         header = table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         if stretch_col is not None:
@@ -236,6 +236,7 @@ class BansTab(QWidget):
     def _build_bans_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
+        layout.setContentsMargins(4, 2, 4, 2); layout.setSpacing(3)
         help_lbl = QLabel(_HELP_SHORT); help_lbl.setWordWrap(True)
         help_lbl.setToolTip(_HELP)
         help_lbl.setStyleSheet("color: #a89830; font-size: 9pt; padding: 2px 4px;")
@@ -252,7 +253,7 @@ class BansTab(QWidget):
         online_box = QGroupBox("On the server now")
         online_layout = QVBoxLayout(online_box)
         self.online_table = self._table(["Name", "IP", "Connection", "Visits", "Other names seen on this IP"], 4)
-        self.online_table.setMinimumHeight(150)
+        self.online_table.setMinimumHeight(84)
         online_layout.addWidget(self.online_table)
         online_row = QHBoxLayout()
         self.ban_name_btn = self._button_cls("Ban name"); self.ban_name_btn.clicked.connect(lambda: self._ban_selected(KIND_NAME))
@@ -284,7 +285,7 @@ class BansTab(QWidget):
         btn_row.addStretch()
         list_layout.addLayout(btn_row)
         self.ban_table = self._table(["Kind", "Name / address", "Banned with", "Reason", "By", "Added", "Expires", "Hits", "Last seen trying"], 3)
-        self.ban_table.setMinimumHeight(220)
+        self.ban_table.setMinimumHeight(120)
         self.ban_table.itemSelectionChanged.connect(self._sync_buttons)
         self.ban_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.ban_table.customContextMenuRequested.connect(self._ban_table_menu)
@@ -305,8 +306,14 @@ class BansTab(QWidget):
         list_layout.addWidget(self.announce_cb)
         splitter.addWidget(list_box)
         splitter.setStretchFactor(0, 1); splitter.setStretchFactor(1, 2)
-        layout.addWidget(self._build_checks_box())
         self._sync_buttons()
+        return page
+
+    def _build_checks_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.addWidget(self._build_checks_box())
+        layout.addStretch(1)
         return page
 
     def _build_checks_box(self):
