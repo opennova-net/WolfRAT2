@@ -8,13 +8,14 @@ import re
 import time
 from typing import Callable, Optional
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QListWidget,
     QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from wolfrat import weather
+from wolfrat import server_link
 from wolfrat import weather_dynamic
 from wolfrat.weather_dynamic_page import DynamicPage
 from wolfrat.protocol import wire_log
@@ -47,8 +48,9 @@ _HELP = (
     "further."
     "<br>• Earthquake really does nudge players and vehicles about a little."
     "<br>• <b>Lightning and thunder</b> need one tiny script file on the server. Press "
-    "<b>Install lightning add-on</b> below and WolfRAT puts it there; it switches on at the "
-    "next map change. Players still download nothing."
+    "<b>Install lightning add-on</b> below (or <b>Link WolfRAT to the server</b> on the Server "
+    "tab) and WolfRAT puts it there; it switches on at the next map change. Players still "
+    "download nothing."
 )
 
 
@@ -71,6 +73,8 @@ class WeatherTab(QWidget):
 
     POLL_MS = 5000
     SETTLE_SECONDS = 20      # after a (re)connect or map change, before writing
+
+    link_changed = pyqtSignal()   # after every poll: the Server tab's link box redraws
 
     def __init__(
         self,
@@ -101,12 +105,16 @@ class WeatherTab(QWidget):
         self._writable = False
         self._schedule = weather.WeatherSchedule()
         self._last_problem = ""
+        self._looked = False           # tried to find the server at least once
+        self._server_missing = False   # last attempt: no jointops.exe at all
+        self._script_answer = None     # the add-on's last answer (None = not asked)
 
         self._settings_file = self.runtime.path("wolfrat_weather.json")
         self._settings = {
             "mods_enabled": False, "announce": True, "minutes": 10,
             "precip": 60, "snow": False, "overcast": 80, "fog_on": False,
             "fog_metres": 300, "fade": 25, "dynamic": {}, "seen_maps": {},
+            "linked": False,
         }
         try:
             if self._settings_file.exists():
@@ -377,6 +385,7 @@ class WeatherTab(QWidget):
                 pass
         self._controller = self._memory = None
         self._writable = False
+        self._script_answer = None
 
     def _ensure(self, writable: bool) -> Optional[weather.WeatherController]:
         """Status polling only ever holds a read-only handle; the first real
@@ -384,11 +393,14 @@ class WeatherTab(QWidget):
         if self._controller is not None and (self._writable or not writable):
             return self._controller
         self._detach()
+        self._looked = True
         try:
             self._controller, self._memory = self._attach(writable=writable)
             self._writable = writable
             self._last_problem = ""
+            self._server_missing = False
         except weather.WeatherError as exc:
+            self._server_missing = isinstance(exc, weather.ServerNotRunning)
             self._problem(str(exc))
         return self._controller
 
@@ -402,11 +414,18 @@ class WeatherTab(QWidget):
             wire_log(f"[WEATHER] unavailable: {text}")
 
     def _poll(self):
+        try:
+            self._poll_once()
+        finally:
+            self.link_changed.emit()
+
+    def _poll_once(self):
         # A held weather must keep being re-asserted even after the server
-        # restarted under us, so it asks for the writable handle back.
+        # restarted under us, so it asks for the writable handle back.  Once
+        # linked, the add-on check needs it too.
         controller = self._ensure(
-            writable=(self._writable or self._schedule.active is not None
-                      or self.dynamic_page.config().enabled)
+            writable=bool(self._writable or self._schedule.active is not None
+                          or self.dynamic_page.config().enabled or self._settings.get("linked"))
         )
         if controller is None:
             return
@@ -420,6 +439,10 @@ class WeatherTab(QWidget):
             self.log("Timed weather finished - clearing.")
             self._announce("The weather is clearing.")
         self._set_available(True)
+        folder = self._server_dir()
+        if not self._settings.get("linked") and folder and weather.addon_installed(folder):
+            self._settings["linked"] = True       # installed from this tab before linking existed
+            self._save()
         self.status_lbl.setText(f"🟢 Game server found on this PC (process {self._memory.pid}).")
         kind = "snow" if reading.snow else "rain"
         self.sky_lbl.setText(
@@ -463,6 +486,7 @@ class WeatherTab(QWidget):
             if self._writable and settled:          # never write into a loading server
                 controller.probe_addon()
             can_flash = controller.lightning_available()
+            self._script_answer = True if can_flash else controller._addon
             for button in (self.flash_btn, self.far_flash_btn):
                 button.setEnabled(can_flash)
             text, offer_install = self._lightning_state(can_flash, controller._addon is not None)
@@ -639,7 +663,60 @@ class WeatherTab(QWidget):
             return
         self.log("Lightning add-on already installed." if result == "already"
                  else f"Lightning add-on installed in {folder}. It switches on at the next map change.")
+        self._settings["linked"] = True
+        self._save()
         self._poll()
+
+    # ------------------------------------------------------ server link
+    def link_state(self) -> server_link.LinkState:
+        """What the Server tab's 'Link WolfRAT to the server' box shows."""
+        folder = self._server_dir()
+        connected = True
+        if self._context is not None:
+            try:
+                connected = bool((self._context() or {}).get("connected"))
+            except Exception:
+                connected = False
+        attached = self._controller is not None
+        return server_link.LinkState(
+            looked=self._looked,
+            found=attached or (self._looked and not self._server_missing),
+            reachable=attached,
+            problem="" if attached else self._last_problem,
+            pid=getattr(self._memory, "pid", None),
+            folder=folder,
+            script_installed=bool(folder) and weather.addon_installed(folder),
+            writable=self._writable,
+            script_running=self._script_answer if self._writable else None,
+            connected=connected,
+        )
+
+    def link_to_server(self) -> tuple[bool, str]:
+        """The one-click set-up: a handle that can talk to the server, the
+        script in its folder, and the link remembered for next time."""
+        try:
+            controller = self._ensure(writable=True)
+            if controller is None:
+                return False, self._last_problem or "WolfRAT could not open the game server."
+            folder = self._server_dir()
+            if not folder:
+                return False, ("WolfRAT found the server but could not work out which folder "
+                               "it runs from.")
+            try:
+                result = weather.install_addon(folder)
+            except weather.WeatherError as exc:
+                self.log(str(exc))
+                return False, str(exc)
+            self._settings["linked"] = True
+            self._save()
+            if result == "installed":
+                self.log(f"Linked to the server - script added to server.wac in {folder}.")
+                return True, (f"Linked. The server script is in {folder} and switches on at "
+                              "the next map change.")
+            self.log("Linked to the server - its script was already in place.")
+            return True, "Linked. The server script was already in place."
+        finally:
+            self._poll()
 
     def _flash(self, who: str, far: bool = False) -> bool:
         controller = self._ensure(writable=True)

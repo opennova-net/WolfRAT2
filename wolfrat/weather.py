@@ -182,6 +182,10 @@ class WeatherError(Exception):
     """Something the admin should be told about in plain words."""
 
 
+class ServerNotRunning(WeatherError):
+    """No jointops.exe on this PC at all - as opposed to one we cannot use."""
+
+
 class Memory(Protocol):
     def read(self, address: int, size: int) -> bytes: ...
     def write(self, address: int, data: bytes) -> None: ...
@@ -761,7 +765,7 @@ def attach_local_server(writable: bool = True) -> tuple[WeatherController, Proce
         raise WeatherError("Weather control needs Windows.")
     pids = find_process_ids()
     if not pids:
-        raise WeatherError(
+        raise ServerNotRunning(
             "No jointops.exe is running on this PC. Weather works when WolfRAT "
             "runs on the same machine as the game server."
         )
