@@ -286,3 +286,16 @@ def test_lookup_errors_never_kick(tmp_path):
     rig.poll(("Troll", "5.6.7.8"))
     rig.tab._on_verdict(ic.Verdict("5.6.7.8", rig.now, proxy=True, error="HTTP 429 (rate limit)"))
     assert rig.punts == [] and rig.tab.online_table.item(0, 2).text() == "check failed: HTTP 429 (rate limit)"
+
+
+def test_country_letters_sit_in_front_of_the_ip_once_known(tmp_path):
+    rig = checks_rig(tmp_path)
+    rig.tab.checks_cb.setChecked(True)
+    rig.poll(("Dale", "82.68.58.92"))
+    rig.tab.ban_now("Dale", kind="ip")
+    assert rig.tab.online_table.item(0, 1).text() == "82.68.58.92"
+    rig.tab._on_verdict(ic.Verdict("82.68.58.92", rig.now, country="GB", provider="Zen"))
+    assert rig.tab.online_table.item(0, 1).text() == "GB 82.68.58.92"
+    assert rig.tab.ban_table.item(0, 1).text() == "GB 82.68.58.92"
+    rig.tab.pages.setCurrentIndex(2); rig.tab._refresh_history()
+    assert rig.tab.hist_table.item(0, 1).text() == "GB 82.68.58.92"

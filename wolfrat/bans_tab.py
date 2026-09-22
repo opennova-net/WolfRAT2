@@ -426,8 +426,18 @@ class BansTab(QWidget):
         self._act_on_checks()
         self._enforce(self._clock())          # a fresh connection-check ban removes them now, not next poll
         self._refresh_online()
+        self._refresh_ban_table(); self._refresh_white_table()
+        if self.pages.currentIndex() == 2:
+            self._refresh_history()
         self._update_checks_status()
         self.save()
+
+    def _with_country(self, ip: str) -> str:
+        """'GB 82.68.58.92' when a connection check has told us the country."""
+        if not ip:
+            return "-"
+        v = self.verdicts.get(ip, self._clock())
+        return f"{v.country} {ip}" if v is not None and v.country else ip
 
     def _verdict_text(self, ip: str) -> str:
         if not ip:
@@ -776,7 +786,7 @@ class BansTab(QWidget):
             rec = self.history.get(name)
             others = [r.name for r in self.history.by_ip(ip) if r.name.lower() != name.lower()] if ip else []
             verdict_text = self._verdict_text(ip)
-            cells = [name, ip or "-", verdict_text, str(rec.visits) if rec else "-", ", ".join(others[:6]) or "-"]
+            cells = [name, self._with_country(ip), verdict_text, str(rec.visits) if rec else "-", ", ".join(others[:6]) or "-"]
             for col, text in enumerate(cells):
                 item = QTableWidgetItem(text)
                 if col == 4 and others:
@@ -794,7 +804,7 @@ class BansTab(QWidget):
             last = "-"
             if e.last_hit_at:
                 last = f"{e.last_hit_name} {e.last_hit_ip} {describe_when(e.last_hit_at, now)}".strip()
-            cells = [e.kind, e.value, e.linked or "-", e.reason, e.added_by,
+            cells = [e.kind, self._with_country(e.value) if e.kind == KIND_IP else e.value, e.linked or "-", e.reason, e.added_by,
                      time.strftime("%Y-%m-%d", time.localtime(e.added_at)) if e.added_at else "-",
                      br.format_expiry(e.expires_at), str(e.hits), last]
             for col, text in enumerate(cells):
@@ -808,7 +818,7 @@ class BansTab(QWidget):
         table = self.white_table
         table.setRowCount(len(self.bans.whitelist))
         for row, e in enumerate(self.bans.whitelist):
-            cells = [e.kind, e.value, e.reason, e.added_by,
+            cells = [e.kind, self._with_country(e.value) if e.kind == KIND_IP else e.value, e.reason, e.added_by,
                      time.strftime("%Y-%m-%d", time.localtime(e.added_at)) if e.added_at else "-"]
             for col, text in enumerate(cells):
                 table.setItem(row, col, QTableWidgetItem(text))
@@ -819,7 +829,7 @@ class BansTab(QWidget):
         table = self.hist_table
         table.setRowCount(len(records))
         for row, rec in enumerate(records):
-            cells = [rec.name, rec.last_ip() or "-", str(len(rec.ips)), str(rec.visits),
+            cells = [rec.name, self._with_country(rec.last_ip()), str(len(rec.ips)), str(rec.visits),
                      describe_when(rec.first_seen, now), describe_when(rec.last_seen, now)]
             for col, text in enumerate(cells):
                 table.setItem(row, col, QTableWidgetItem(text))
@@ -835,7 +845,7 @@ class BansTab(QWidget):
         lines.append("IPs:")
         for ip, (count, seen) in sorted(rec.ips.items(), key=lambda kv: kv[1][1], reverse=True):
             others = [r.name for r in self.history.by_ip(ip) if r.name.lower() != rec.name.lower()]
-            lines.append(f"  {ip}  last {describe_when(seen, now)}" + (f"   also: {', '.join(others[:8])}" if others else ""))
+            lines.append(f"  {self._with_country(ip)}  last {describe_when(seen, now)}" + (f"   also: {', '.join(others[:8])}" if others else ""))
         lines.append("")
         lines.append("Chat:" if rec.chat else "Chat: nothing recorded yet")
         for stamp, text in list(rec.chat)[-60:]:
