@@ -17,6 +17,7 @@ from typing import Callable, Optional
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QColor
+from PyQt6.QtWidgets import QMenu
 from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox,
                              QDialog, QDialogButtonBox, QFileDialog, QFrame, QGroupBox,
                              QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox,
@@ -247,11 +248,24 @@ class BansTab(QWidget):
         splitter.addWidget(online_box)
 
         # -- the list
-        list_box = QGroupBox("Banned")
+        list_box = QGroupBox("Banned  (select a row, then use the buttons or right-click it)")
         list_layout = QVBoxLayout(list_box)
+        btn_row = QHBoxLayout()
+        self.remove_btn = self._button_cls("Remove from list"); self.remove_btn.clicked.connect(self._remove_selected)
+        self.copy_block_btn = self._button_cls("Copy firewall block"); self.copy_block_btn.clicked.connect(lambda: self._copy_firewall(True))
+        self.copy_unblock_btn = self._button_cls("Copy firewall unblock"); self.copy_unblock_btn.clicked.connect(lambda: self._copy_firewall(False))
+        self.copy_all_btn = self._button_cls("Copy block for every IP"); self.copy_all_btn.clicked.connect(self._copy_all_blocks)
+        self.import_btn = self._button_cls("Import..."); self.import_btn.clicked.connect(self._import)
+        self.export_btn = self._button_cls("Export..."); self.export_btn.clicked.connect(self._export)
+        for widget in (self.remove_btn, self.copy_block_btn, self.copy_unblock_btn, self.copy_all_btn, self.import_btn, self.export_btn):
+            btn_row.addWidget(widget)
+        btn_row.addStretch()
+        list_layout.addLayout(btn_row)
         self.ban_table = self._table(["Kind", "Name / address", "Banned with", "Reason", "By", "Added", "Expires", "Hits", "Last seen trying"], 3)
         self.ban_table.setMinimumHeight(220)
         self.ban_table.itemSelectionChanged.connect(self._sync_buttons)
+        self.ban_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.ban_table.customContextMenuRequested.connect(self._ban_table_menu)
         list_layout.addWidget(self.ban_table)
         add_row = QHBoxLayout()
         self.add_value = QLineEdit(); self.add_value.setPlaceholderText("name, IP, 82.68.*, 82.68.0.0/16 or a.b.c.d-e.f.g.h")
@@ -264,17 +278,6 @@ class BansTab(QWidget):
         add_row.addWidget(self.add_value, 2); add_row.addWidget(self.add_reason, 2)
         add_row.addWidget(QLabel("For:")); add_row.addWidget(self.add_expiry); add_row.addWidget(self.add_btn)
         list_layout.addLayout(add_row)
-        btn_row = QHBoxLayout()
-        self.remove_btn = self._button_cls("Remove"); self.remove_btn.clicked.connect(self._remove_selected)
-        self.copy_block_btn = self._button_cls("Copy firewall block"); self.copy_block_btn.clicked.connect(lambda: self._copy_firewall(True))
-        self.copy_unblock_btn = self._button_cls("Copy firewall unblock"); self.copy_unblock_btn.clicked.connect(lambda: self._copy_firewall(False))
-        self.copy_all_btn = self._button_cls("Copy block for every IP"); self.copy_all_btn.clicked.connect(self._copy_all_blocks)
-        self.import_btn = self._button_cls("Import..."); self.import_btn.clicked.connect(self._import)
-        self.export_btn = self._button_cls("Export..."); self.export_btn.clicked.connect(self._export)
-        for widget in (self.remove_btn, self.copy_block_btn, self.copy_unblock_btn, self.copy_all_btn, self.import_btn, self.export_btn):
-            btn_row.addWidget(widget)
-        btn_row.addStretch()
-        list_layout.addLayout(btn_row)
         self.announce_cb = QCheckBox("Tell the server in chat when a banned player is removed")
         self.announce_cb.setChecked(True)
         list_layout.addWidget(self.announce_cb)
@@ -455,6 +458,21 @@ class BansTab(QWidget):
         self.add_value.clear(); self.add_reason.clear()
         self._dirty = True
         self._refresh_ban_table(); self.save()
+
+    def _ban_table_menu(self, pos):
+        row = self.ban_table.rowAt(pos.y())
+        if row < 0:
+            return
+        self.ban_table.selectRow(row)
+        entry = self._selected_entry()
+        if entry is None:
+            return
+        menu = QMenu(self)
+        menu.addAction(f"Remove {entry.value} from the ban list", self._remove_selected)
+        if entry.kind == KIND_IP:
+            menu.addAction("Copy firewall block line", lambda: self._copy_firewall(True))
+            menu.addAction("Copy firewall unblock line", lambda: self._copy_firewall(False))
+        menu.exec(self.ban_table.viewport().mapToGlobal(pos))
 
     def _selected_entry(self) -> Optional[BanEntry]:
         row = self.ban_table.currentRow()

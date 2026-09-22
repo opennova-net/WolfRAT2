@@ -174,3 +174,17 @@ def test_name_and_ip_rows_say_what_they_were_banned_with(tmp_path):
     assert shown == {"Troll": "5.6.7.8", "5.6.7.8": "Troll"}
     again = rig.build()
     assert {e.kind: e.linked for e in again.bans.entries} == {"name": "5.6.7.8", "ip": "Troll"}
+
+
+def test_remove_button_sits_above_the_table_and_removes_the_selected_row(tmp_path):
+    """Dale, live 2026-09-22: the buttons under the table scrolled out of sight."""
+    rig = Rig(tmp_path)
+    rig.tab.add_value.setText("Troll"); rig.tab._add_typed()
+    rig.tab.resize(1000, 600); rig.tab.show(); _app.processEvents()
+    assert rig.tab.remove_btn.text() == "Remove from list"
+    assert rig.tab.remove_btn.mapTo(rig.tab, rig.tab.remove_btn.rect().topLeft()).y() \
+        < rig.tab.ban_table.mapTo(rig.tab, rig.tab.ban_table.rect().topLeft()).y()
+    rig.tab.ban_table.selectRow(0)
+    assert rig.tab.remove_btn.isEnabled()
+    rig.tab._remove_selected()
+    assert rig.tab.bans.entries == [] and rig.tab.ban_table.rowCount() == 0
