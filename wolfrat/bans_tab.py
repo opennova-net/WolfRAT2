@@ -15,7 +15,7 @@ import os
 import time
 from typing import Callable, Optional
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import QMenu
 from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox,
@@ -26,12 +26,14 @@ from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboB
                              QWidget)
 
 from wolfrat import ban_rules as br
+from wolfrat import ip_checks
 from wolfrat.ban_rules import BanEntry, BanList, Enforcer, KIND_IP, KIND_NAME
 from wolfrat.jo_players import LocalServerPlayers, ips_by_name
 from wolfrat.player_history import PlayerHistory, describe_when
 
 BANS_FILE = "wolfrat_bans.json"
 HISTORY_FILE = "wolfrat_player_history.json"
+CHECKS_FILE = "wolfrat_ip_checks.json"
 EXPIRY_CHOICES = [("never", ""), ("1 hour", "1h"), ("1 day", "1d"), ("7 days", "7d"),
                   ("30 days", "30d"), ("90 days", "90d")]
 
@@ -115,6 +117,8 @@ class ImportDialog(QDialog):
 
 
 class BansTab(QWidget):
+    _verdict_signal = pyqtSignal(object)     # worker thread -> Qt thread
+
     def __init__(self, settings_dir: str,
                  punt: Callable[[dict, str], None],
                  announce: Callable[[str], None],
@@ -123,6 +127,7 @@ class BansTab(QWidget):
                  clock: Callable[[], float] = time.time,
                  button_cls=QPushButton,
                  admin_name: str = "admin",
+                 checker=None,
                  parent=None):
         super().__init__(parent)
         self._dir = str(settings_dir)
@@ -135,6 +140,11 @@ class BansTab(QWidget):
         self.bans = self._load_bans()
         self.history = self._load_history()
         self.enforcer = Enforcer()
+        self.checks, self.verdicts = self._load_checks()
+        self._checker = checker if checker is not None else ip_checks.Checker(self._verdict_signal.emit)
+        self._verdict_signal.connect(self._on_verdict)
+        self._check_acted: dict = {}          # name|ip -> when we last kicked for a connection check
+        self._loading_checks = True
         self._ips: dict = {}
         self._online: list = []
         self._chat_initialized = False
@@ -161,8 +171,20 @@ class BansTab(QWidget):
         except (OSError, ValueError):
             return PlayerHistory()
 
+    def _load_checks(self):
+        try:
+            with open(os.path.join(self._dir, CHECKS_FILE), "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, ValueError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        return ip_checks.ChecksConfig.from_json(data.get("config")), ip_checks.VerdictCache.from_json(data.get("cache"))
+
     def save(self) -> None:
-        for name, payload in ((BANS_FILE, self.bans.to_json()), (HISTORY_FILE, self.history.to_json())):
+        self.verdicts.dirty = False
+        for name, payload in ((BANS_FILE, self.bans.to_json()), (HISTORY_FILE, self.history.to_json()),
+                              (CHECKS_FILE, {"config": self.checks.to_json(), "cache": self.verdicts.to_json()})):
             path = os.path.join(self._dir, name)
             try:
                 tmp = path + ".tmp"
@@ -229,7 +251,7 @@ class BansTab(QWidget):
         # -- on the server now
         online_box = QGroupBox("On the server now")
         online_layout = QVBoxLayout(online_box)
-        self.online_table = self._table(["Name", "IP", "Visits", "Other names seen on this IP"], 3)
+        self.online_table = self._table(["Name", "IP", "Connection", "Visits", "Other names seen on this IP"], 4)
         self.online_table.setMinimumHeight(150)
         online_layout.addWidget(self.online_table)
         online_row = QHBoxLayout()
@@ -283,8 +305,173 @@ class BansTab(QWidget):
         list_layout.addWidget(self.announce_cb)
         splitter.addWidget(list_box)
         splitter.setStretchFactor(0, 1); splitter.setStretchFactor(1, 2)
+        layout.addWidget(self._build_checks_box())
         self._sync_buttons()
         return page
+
+    def _build_checks_box(self):
+        box = QGroupBox("Connection checks - VPN, proxy, Tor, hosting, country")
+        grid = QVBoxLayout(box)
+        note = QLabel(
+            "Every new address is looked up once (cached a week) and, if it is a VPN, proxy, Tor exit or a "
+            "hosting range, WolfRAT can kick or ban it. Real players at home are on ordinary ISPs. Some mobile "
+            "networks get flagged, so <b>kick</b> is the safe choice - the log says why, and the Whitelist page "
+            "covers anyone you trust. Needs internet from this PC.")
+        note.setWordWrap(True); note.setStyleSheet("color: #a89830; font-size: 9pt;")
+        grid.addWidget(note)
+        row1 = QHBoxLayout()
+        self.checks_cb = QCheckBox("Check every connection")
+        row1.addWidget(self.checks_cb)
+        row1.addWidget(QLabel("Lookup service:"))
+        self.provider_combo = QComboBox()
+        for _code, label in ip_checks.PROVIDERS:
+            self.provider_combo.addItem(label)
+        row1.addWidget(self.provider_combo)
+        self.key_lbl = QLabel("Key:")
+        self.key_edit = QLineEdit(); self.key_edit.setPlaceholderText("proxycheck.io key (optional, 1000/day free)")
+        self.key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        row1.addWidget(self.key_lbl); row1.addWidget(self.key_edit, 1)
+        grid.addLayout(row1)
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("VPN / proxy / Tor:"))
+        self.proxy_action = QComboBox(); self.proxy_action.addItems(ip_checks.ACTION_LABELS); row2.addWidget(self.proxy_action)
+        row2.addWidget(QLabel("   Hosting / datacentre:"))
+        self.hosting_action = QComboBox(); self.hosting_action.addItems(ip_checks.ACTION_LABELS); row2.addWidget(self.hosting_action)
+        row2.addStretch()
+        grid.addLayout(row2)
+        row3 = QHBoxLayout()
+        row3.addWidget(QLabel("Countries:"))
+        self.country_mode = QComboBox(); self.country_mode.addItems(["ignore", "block these", "allow only these"]); row3.addWidget(self.country_mode)
+        self.countries_edit = QLineEdit(); self.countries_edit.setPlaceholderText("two-letter codes, e.g. GB, IE, US")
+        row3.addWidget(self.countries_edit, 1)
+        row3.addWidget(QLabel("then:"))
+        self.country_action = QComboBox(); self.country_action.addItems(ip_checks.ACTION_LABELS); row3.addWidget(self.country_action)
+        grid.addLayout(row3)
+        row4 = QHBoxLayout()
+        self.probe_edit = QLineEdit(); self.probe_edit.setPlaceholderText("try an address, e.g. 8.8.8.8")
+        self.probe_btn = self._button_cls("Check it"); self.probe_btn.clicked.connect(self._probe)
+        self.probe_edit.returnPressed.connect(self._probe)
+        self.checks_status = QLabel("Off."); self.checks_status.setStyleSheet("color: #e8c840;")
+        row4.addWidget(self.probe_edit, 1); row4.addWidget(self.probe_btn); row4.addWidget(self.checks_status, 2)
+        grid.addLayout(row4)
+        # load config into the widgets
+        cfg = self.checks
+        self.checks_cb.setChecked(cfg.enabled)
+        self.provider_combo.setCurrentIndex([c for c, _l in ip_checks.PROVIDERS].index(cfg.provider))
+        self.key_edit.setText(cfg.api_key)
+        self.proxy_action.setCurrentIndex(cfg.action_proxy)
+        self.hosting_action.setCurrentIndex(cfg.action_hosting)
+        self.country_mode.setCurrentIndex({ip_checks.COUNTRY_OFF: 0, ip_checks.COUNTRY_BLOCK: 1, ip_checks.COUNTRY_ALLOW: 2}[cfg.country_mode])
+        self.countries_edit.setText(", ".join(cfg.countries))
+        self.country_action.setCurrentIndex(cfg.action_country)
+        for widget in (self.checks_cb,):
+            widget.stateChanged.connect(self._checks_changed)
+        for widget in (self.provider_combo, self.proxy_action, self.hosting_action, self.country_mode, self.country_action):
+            widget.currentIndexChanged.connect(self._checks_changed)
+        for widget in (self.key_edit, self.countries_edit):
+            widget.editingFinished.connect(self._checks_changed)
+        self._loading_checks = False
+        self._checks_changed()
+        return box
+
+    def _checks_changed(self):
+        cfg = self.checks
+        cfg.enabled = self.checks_cb.isChecked()
+        cfg.provider = ip_checks.PROVIDERS[self.provider_combo.currentIndex()][0]
+        cfg.api_key = self.key_edit.text().strip()
+        cfg.action_proxy = self.proxy_action.currentIndex()
+        cfg.action_hosting = self.hosting_action.currentIndex()
+        cfg.country_mode = [ip_checks.COUNTRY_OFF, ip_checks.COUNTRY_BLOCK, ip_checks.COUNTRY_ALLOW][self.country_mode.currentIndex()]
+        cfg.countries = ip_checks.parse_countries(self.countries_edit.text())
+        cfg.action_country = self.country_action.currentIndex()
+        uses_key = cfg.provider == ip_checks.PROVIDER_PROXYCHECK
+        self.key_lbl.setVisible(uses_key); self.key_edit.setVisible(uses_key)
+        self.countries_edit.setEnabled(cfg.country_mode != ip_checks.COUNTRY_OFF)
+        self.country_action.setEnabled(cfg.country_mode != ip_checks.COUNTRY_OFF)
+        self._update_checks_status()
+        if not self._loading_checks:
+            self._dirty = True
+            self.save()
+
+    def _update_checks_status(self):
+        if not self.checks.enabled:
+            self.checks_status.setText("Off.")
+            return
+        pending = self._checker.pending()
+        self.checks_status.setText(f"On - {ip_checks.PROVIDERS[self.provider_combo.currentIndex()][1].split(' (')[0]}"
+                                   + (f", {pending} lookup(s) waiting" if pending else ""))
+
+    def _probe(self):
+        ip = self.probe_edit.text().strip()
+        if not ip:
+            return
+        if ip_checks.is_private(ip):
+            self.log(f"{ip} is a private address - nothing to look up."); return
+        self.verdicts.forget(ip)
+        if self._checker.submit(ip, self.checks.provider, self.checks.api_key):
+            self.log(f"Looking up {ip}...")
+        self._update_checks_status()
+
+    # ---- verdicts -------------------------------------------------------------
+    def _on_verdict(self, verdict):
+        self.verdicts.put(verdict)
+        self.log(f"Connection check {verdict.ip}: {verdict.summary()}")
+        self._act_on_checks()
+        self._enforce(self._clock())          # a fresh connection-check ban removes them now, not next poll
+        self._refresh_online()
+        self._update_checks_status()
+        self.save()
+
+    def _verdict_text(self, ip: str) -> str:
+        if not ip:
+            return "-"
+        v = self.verdicts.get(ip, self._clock())
+        if v is None:
+            return "checking..." if self.checks.enabled else "-"
+        return v.summary()
+
+    def _act_on_checks(self):
+        """Kick or ban anyone online whose cached verdict says so.  Runs on every
+        poll and again when a lookup lands."""
+        if not self.checks.enabled:
+            return
+        now = self._clock()
+        present = set()
+        for player in self._online:
+            name = str(player.get("name", ""))
+            ip = self._ips.get(name, "")
+            if not ip or ip_checks.is_private(ip):
+                continue
+            mark = f"{name.lower()}|{ip}"
+            present.add(mark)
+            verdict = self.verdicts.get(ip, now)
+            if verdict is None:
+                self._checker.submit(ip, self.checks.provider, self.checks.api_key)
+                continue
+            outcome = ip_checks.decide(verdict, self.checks)
+            if outcome.action == ip_checks.ACTION_NONE:
+                continue
+            if br.find_match(self.bans.whitelist, name, ip, now) is not None:
+                continue
+            if mark in self._check_acted and now - self._check_acted[mark] < br.PUNT_COOLDOWN_SECONDS:
+                continue
+            self._check_acted[mark] = now
+            if outcome.action == ip_checks.ACTION_BAN:
+                if self.bans.check(name, ip, now) is None:
+                    self.bans.add(BanEntry(KIND_IP, ip, f"connection check: {outcome.reason}", "connection check",
+                                           now, None, linked=name))
+                    self.log(f"Banned ip {ip} ({name}) - {outcome.reason}")
+                    self._dirty = True
+                    self._refresh_ban_table()
+                continue                     # the ban list removes them on this or the next poll
+            self.log(f"Kicked {name} ({ip}) - {outcome.reason}")
+            try:
+                self._punt(dict(player), f"Kicked: {outcome.reason}"[:60])
+            except Exception as exc:
+                self.log(f"Punt failed for {name}: {exc}")
+            if self.announce_cb.isChecked():
+                self._announce(f"{name} removed - {outcome.reason}"[:62])
+        self._check_acted = {k: t for k, t in self._check_acted.items() if k in present}
 
     def _build_whitelist_page(self):
         page = QWidget()
@@ -339,6 +526,16 @@ class BansTab(QWidget):
         self.status_lbl.setText(("IPs: " + self._reader.status) if not self._reader.available
                                 else f"IPs: reading from the server on this PC ({len(self._ips)} known)")
         self.history.observe(self._online, self._ips, now)
+        self._act_on_checks()
+        self._enforce(now)
+        self._refresh_online()
+        self._update_checks_status()
+        if self._dirty or self.history.dirty or self.verdicts.dirty:
+            self._refresh_ban_table()
+            self.save()
+
+    def _enforce(self, now: float) -> None:
+        """Punt everyone online who trips the ban list (once per visit)."""
         for removal in self.enforcer.decide(self.bans, self._online, self._ips, now):
             why = removal.why()
             self.log(f"Removed {why}")
@@ -352,10 +549,6 @@ class BansTab(QWidget):
                     text += f": {removal.entry.reason}"
                 self._announce(text[:62])
             self._dirty = True
-        self._refresh_online()
-        if self._dirty or self.history.dirty:
-            self._refresh_ban_table()
-            self.save()
 
     def on_chat(self, messages: list) -> None:
         if not self._chat_initialized:
@@ -575,11 +768,14 @@ class BansTab(QWidget):
             ip = self._ips.get(name, "")
             rec = self.history.get(name)
             others = [r.name for r in self.history.by_ip(ip) if r.name.lower() != name.lower()] if ip else []
-            cells = [name, ip or "-", str(rec.visits) if rec else "-", ", ".join(others[:6]) or "-"]
+            verdict_text = self._verdict_text(ip)
+            cells = [name, ip or "-", verdict_text, str(rec.visits) if rec else "-", ", ".join(others[:6]) or "-"]
             for col, text in enumerate(cells):
                 item = QTableWidgetItem(text)
-                if col == 3 and others:
+                if col == 4 and others:
                     item.setForeground(QColor("#ff9040"))
+                if col == 2 and verdict_text not in ("-", "checking...") and not verdict_text.startswith("clear"):
+                    item.setForeground(QColor("#ff6040"))
                 table.setItem(row, col, item)
 
     def _refresh_ban_table(self):
@@ -652,7 +848,7 @@ class BansTab(QWidget):
             self.log(f"{gone} expired ban(s) dropped off the list")
             self._dirty = True
             self._refresh_ban_table()
-        if self._dirty or self.history.dirty:
+        if self._dirty or self.history.dirty or self.verdicts.dirty:
             self.save()
         if self.pages.currentIndex() == 2:
             self._refresh_history()

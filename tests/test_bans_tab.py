@@ -77,7 +77,7 @@ def test_rejoin_under_a_new_name_is_caught_by_ip_and_shown_as_an_alias(tmp_path)
     rig.punts.clear()
     rig.poll(("NewName", "5.6.7.8"), seconds=60)
     assert rig.punts == [("NewName", "Banned: griefing")]
-    assert rig.tab.online_table.item(0, 3).text() == "Troll"
+    assert rig.tab.online_table.item(0, 4).text() == "Troll"
 
 
 def test_whitelist_beats_a_range_and_the_tab_says_so_in_its_log(tmp_path):
@@ -191,3 +191,93 @@ def test_remove_button_sits_above_the_table_and_removes_the_selected_row(tmp_pat
     assert rig.tab.remove_btn.isEnabled()
     rig.tab._remove_selected()
     assert rig.tab.bans.entries == [] and rig.tab.ban_table.rowCount() == 0
+
+
+# ---- connection checks -------------------------------------------------------------
+
+from wolfrat import ip_checks as ic
+
+
+class FakeChecker:
+    def __init__(self):
+        self.submitted = []
+
+    def submit(self, ip, provider, key):
+        if any(ip == done[0] for done in self.submitted):      # the real one dedupes pending lookups too
+            return False
+        self.submitted.append((ip, provider, key)); return True
+
+    def pending(self):
+        return len(self.submitted)
+
+
+def checks_rig(tmp_path):
+    rig = Rig(tmp_path)
+    rig.checker = FakeChecker()
+    rig.tab = BansTab(rig.folder, punt=lambda p, why: (rig.punts.append((p["name"], why)), rig.punted_records.append(p)),
+                      announce=rig.said.append, log=rig.logged.append, reader=rig.reader,
+                      clock=lambda: rig.now, admin_name="Dale", checker=rig.checker)
+    return rig
+
+
+def test_checks_off_by_default_and_nothing_is_looked_up(tmp_path):
+    rig = checks_rig(tmp_path)
+    assert not rig.tab.checks.enabled and rig.tab.checks_status.text() == "Off."
+    rig.poll(("Troll", "5.6.7.8"))
+    assert rig.checker.submitted == [] and rig.tab.online_table.item(0, 2).text() == "-"
+
+
+def test_vpn_is_kicked_once_per_visit_and_the_verdict_shows_in_the_table(tmp_path):
+    rig = checks_rig(tmp_path)
+    rig.tab.checks_cb.setChecked(True)
+    rig.poll(("Troll", "5.6.7.8"), ("Dale", "82.68.58.92"))
+    assert sorted(x[0] for x in rig.checker.submitted) == ["5.6.7.8", "82.68.58.92"]
+    assert rig.tab.online_table.item(0, 2).text() == "checking..."
+    rig.tab._on_verdict(ic.Verdict("82.68.58.92", rig.now, country="GB", provider="Zen"))
+    rig.tab._on_verdict(ic.Verdict("5.6.7.8", rig.now, proxy=True, kind="VPN", country="DE", provider="NordVPN"))
+    assert rig.punts == [("Troll", "Kicked: VPN connection (NordVPN)")]
+    assert rig.said == ["Troll removed - VPN connection (NordVPN)"]
+    assert rig.tab.online_table.item(0, 2).text() == "VPN (DE, NordVPN)"
+    assert rig.tab.online_table.item(1, 2).text() == "clear (GB, Zen)"
+    rig.poll(("Troll", "5.6.7.8"), ("Dale", "82.68.58.92"))          # still there 5 s later: no repeat
+    assert len(rig.punts) == 1
+    rig.poll(("Dale", "82.68.58.92"))                                  # gone
+    rig.poll(("Troll", "5.6.7.8"), ("Dale", "82.68.58.92"))          # back: kicked again, from the cache
+    assert len(rig.punts) == 2 and len(rig.checker.submitted) == 2
+
+
+def test_ban_action_puts_the_ip_on_the_list_and_whitelist_still_wins(tmp_path):
+    rig = checks_rig(tmp_path)
+    rig.tab.checks_cb.setChecked(True); rig.tab.proxy_action.setCurrentIndex(ic.ACTION_BAN)
+    rig.tab.white_value.setText("Regular"); rig.tab._add_white()
+    rig.poll(("Troll", "5.6.7.8"), ("Regular", "5.6.7.9"))
+    rig.tab._on_verdict(ic.Verdict("5.6.7.8", rig.now, proxy=True, kind="VPN"))
+    rig.tab._on_verdict(ic.Verdict("5.6.7.9", rig.now, proxy=True, kind="VPN"))
+    entries = [(e.kind, e.value, e.added_by, e.linked) for e in rig.tab.bans.entries]
+    assert entries == [("ip", "5.6.7.8", "connection check", "Troll")]
+    assert rig.punts == [("Troll", "Banned: connection check: VPN connection")]   # the ban list removed him
+    assert all(name != "Regular" for name, _ in rig.punts)
+
+
+def test_country_block_and_settings_survive_a_restart(tmp_path):
+    rig = checks_rig(tmp_path)
+    rig.tab.checks_cb.setChecked(True)
+    rig.tab.country_mode.setCurrentIndex(1); rig.tab.countries_edit.setText("ru, cn"); rig.tab.countries_edit.editingFinished.emit()
+    rig.tab.provider_combo.setCurrentIndex(1); rig.tab.key_edit.setText("k"); rig.tab.key_edit.editingFinished.emit()
+    rig.poll(("Bot", "5.6.7.8"))
+    assert rig.checker.submitted[-1] == ("5.6.7.8", "proxycheck", "k")
+    rig.tab._on_verdict(ic.Verdict("5.6.7.8", rig.now, country="RU", country_name="Russia"))
+    assert rig.punts == [("Bot", "Kicked: country Russia is blocked")]
+    again = BansTab(rig.folder, punt=lambda *a: None, announce=lambda *a: None, reader=rig.reader,
+                    clock=lambda: rig.now, checker=FakeChecker())
+    assert again.checks.enabled and again.checks.countries == ["RU", "CN"] and again.checks.provider == "proxycheck"
+    assert again.checks.api_key == "k" and again.verdicts.get("5.6.7.8", rig.now).country == "RU"
+    assert again.key_edit.isVisibleTo(again) and again.countries_edit.isEnabled()
+
+
+def test_lookup_errors_never_kick(tmp_path):
+    rig = checks_rig(tmp_path)
+    rig.tab.checks_cb.setChecked(True)
+    rig.poll(("Troll", "5.6.7.8"))
+    rig.tab._on_verdict(ic.Verdict("5.6.7.8", rig.now, proxy=True, error="HTTP 429 (rate limit)"))
+    assert rig.punts == [] and rig.tab.online_table.item(0, 2).text() == "check failed: HTTP 429 (rate limit)"
