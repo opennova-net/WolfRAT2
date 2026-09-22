@@ -355,3 +355,28 @@ def test_map_change_resets_idle_clocks_and_settings_persist(tmp_path):
     again = BansTab(rig.folder, punt=lambda *a: None, announce=lambda *a: None, reader=rig.reader,
                     clock=lambda: rig.now, checker=FakeChecker())
     assert (again.idle_cfg.enabled, again.idle_cfg.minutes, again.idle_cfg.exempt_mods) == (True, 3, False)
+
+
+# ---- AAS zones -------------------------------------------------------------------
+
+def test_zone_flip_is_reported_to_the_sprees_hook_and_zones_left_feeds_the_vote(tmp_path):
+    from wolfrat.jo_players import ZoneInfo
+    rig = idle_rig(tmp_path)
+    got = []
+    rig.tab.zone_capture = got.append
+    start = [ZoneInfo(3, 0, (-16900178, 52104356, 0)), ZoneInfo(4, 2, (-18569420, 56731684, 0)),
+             ZoneInfo(5, 2, (-12567544, 54416764, 0)), ZoneInfo(2, 1, (-18556912, 47465764, 0)),
+             ZoneInfo(1, 1, (-24908850, 52048208, 0))]
+    rig.reader.read_zones = lambda: start
+    rig.reader.slots = [SlotInfo(1, "Dale", "82.68.58.92", (-16900178 + 100000, 52104356, 0))]
+    rig.tab.on_players([{"id": "1", "name": "Dale", "team": "2"}])
+    assert rig.tab.zones_left() == (1, 3) and got == []
+    charlie = [ZoneInfo(z.tier, 2 if z.tier == 3 else z.team, z.pos) for z in start]
+    rig.reader.read_zones = lambda: charlie
+    rig.now += 5; rig.tab.on_players([{"id": "1", "name": "Dale", "team": "2"}])
+    assert len(got) == 1 and (got[0].team, got[0].name, got[0].player, got[0].first) == (2, "Charlie", "Dale", True)
+    assert rig.tab.zones_left() == (2, 2)
+    assert any("Rebels took Charlie (Dale) - first zone of the map" in line for line in rig.logged)
+    rig.tab.on_missions_updated(["3: AS-Other.bms - () () () <CURRENT MISSION> <>"])
+    rig.now += 5; rig.tab.on_players([{"id": "1", "name": "Dale", "team": "2"}])   # after a map change: first sight again
+    assert len(got) == 1

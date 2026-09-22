@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboB
 from wolfrat import ban_rules as br
 from wolfrat import idle_rules
 from wolfrat import ip_checks
+from wolfrat import zone_rules
 from wolfrat.ban_rules import BanEntry, BanList, Enforcer, KIND_IP, KIND_NAME
 from wolfrat.jo_players import LocalServerPlayers, ips_by_name, positions_by_name
 from wolfrat.player_history import PlayerHistory, describe_when
@@ -149,6 +150,9 @@ class BansTab(QWidget):
         self.idle = idle_rules.IdleWatch()
         self._positions: dict = {}
         self._current_map: Optional[str] = None
+        self.zones: list = []
+        self._zone_watch = zone_rules.ZoneWatch()
+        self.zone_capture: Optional[Callable] = None      # set by the main window (Sprees tab)
         self._loading_idle = True
         self._ips: dict = {}
         self._online: list = []
@@ -398,7 +402,7 @@ class BansTab(QWidget):
                 self._announce(idle_rules.kick_text(event.name, self.idle_cfg.minutes))
 
     def on_missions_updated(self, missions) -> None:
-        """A map change restarts every idle clock."""
+        """A map change restarts every idle clock and the zone watch."""
         current = None
         for m in missions or ():
             if "<CURRENT MISSION>" in str(m):
@@ -407,6 +411,27 @@ class BansTab(QWidget):
         if current and current != self._current_map:
             self._current_map = current
             self.idle.reset()
+            self._zone_watch.reset()
+
+    def zones_left(self):
+        """(leading team, zones it still needs) on an AAS map, else None."""
+        return zone_rules.zones_left(self.zones)
+
+    def _zone_tick(self) -> None:
+        teams = {}
+        for player in self._online:
+            try:
+                teams[str(player.get("name", ""))] = int(player.get("team", 0))
+            except (TypeError, ValueError):
+                pass
+        for event in self._zone_watch.update(self.zones, self._positions, teams):
+            self.log(f"{zone_rules.team_name(event.team)} took {event.name}"
+                     + (f" ({event.player})" if event.player else "") + (" - first zone of the map" if event.first else ""))
+            if self.zone_capture is not None:
+                try:
+                    self.zone_capture(event)
+                except Exception as exc:
+                    self.log(f"Capture announcement failed: {exc}")
 
     def _build_checks_page(self):
         page = QWidget()
@@ -640,12 +665,14 @@ class BansTab(QWidget):
         self._ips = ips_by_name(slots)
         self._positions = positions_by_name(slots)
         self._online = list(players or [])
+        self.zones = self._reader.read_zones() if hasattr(self._reader, "read_zones") else []
         self.status_lbl.setText(("IPs: " + self._reader.status) if not self._reader.available
                                 else f"IPs: reading from the server on this PC ({len(self._ips)} known)")
         self.history.observe(self._online, self._ips, now)
         self._act_on_checks()
         self._enforce(now)
         self._idle_tick(now)
+        self._zone_tick()
         self._refresh_online()
         self._update_checks_status()
         if self._dirty or self.history.dirty or self.verdicts.dirty:

@@ -15,6 +15,13 @@ Chain (Jointops.exe.kong.c, Server_PlayerPuntCRCMisMatch @ 0x50F380):
                  ~400k units/s moving, exactly constant standing still)
 Slot 0 is the host itself (null CNetPlayer).  Read-only: this module never
 opens the process for writing.
+
+AAS zones (GameEvent_FlagCapture @ 0x50F6F0, ZoneSlotChain_* helpers; proven
+2026-09-22 with Dale capturing Charlie then Bravo on Doslin Oblast):
+    g_zone_slot_chain @ 0x24D1EBC: dword +44 = vector begin, +48 = vector end
+    element = ZoneEntry*  ->  +0 = PSP entity*
+    PSP entity +354 = owning team byte (0 / 1 Joint Ops / 2 Rebels), +538 = tier,
+               +4 = int32 X/Y/Z like a player
 """
 
 from __future__ import annotations
@@ -38,6 +45,9 @@ ENTITY_OFFSET = 0
 POSITION_OFFSET = 4          # three int32: X, Y, Z(height)
 MAX_CAPACITY = 256
 RETRY_SECONDS = 10
+ZONE_CHAIN_VA = 0x24D1EBC
+ZONE_TEAM_OFFSET, ZONE_TIER_OFFSET = 354, 538
+MAX_ZONES = 64
 
 
 @dataclass(frozen=True)
@@ -46,6 +56,13 @@ class SlotInfo:
     name: str
     ip: str
     pos: Optional[tuple] = None      # (x, y, z) engine units, None when unreadable
+
+
+@dataclass(frozen=True)
+class ZoneInfo:
+    tier: int
+    team: int
+    pos: Optional[tuple] = None
 
 
 class LocalServerPlayers:
@@ -151,6 +168,34 @@ class LocalServerPlayers:
         self.available = True
         self.status = f"Reading IPs from jointops.exe (pid {self._pid})."
         return found
+
+
+    def read_zones(self) -> list:
+        """Every AAS zone on the current map, or [] (non-AAS map or no process)."""
+        if not self._attach():
+            return []
+        mem = self._memory
+        try:
+            begin = struct.unpack("<I", mem.read(ZONE_CHAIN_VA + 44, 4))[0]
+            end = struct.unpack("<I", mem.read(ZONE_CHAIN_VA + 48, 4))[0]
+        except Exception:
+            return []
+        if not begin or end < begin or (end - begin) > 4 * MAX_ZONES:
+            return []
+        zones = []
+        for address in range(begin, end, 4):
+            try:
+                entry = struct.unpack("<I", mem.read(address, 4))[0]
+                entity = struct.unpack("<I", mem.read(entry, 4))[0] if entry else 0
+                if not entity:
+                    continue
+                team = mem.read(entity + ZONE_TEAM_OFFSET, 1)[0]
+                tier = mem.read(entity + ZONE_TIER_OFFSET, 1)[0]
+                pos = struct.unpack("<iii", mem.read(entity + POSITION_OFFSET, 12))
+            except Exception:
+                continue
+            zones.append(ZoneInfo(tier, team, pos))
+        return zones
 
 
 def ips_by_name(slots) -> dict:

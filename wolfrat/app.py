@@ -4209,6 +4209,9 @@ class SpreeTab(QWidget):
         ]
         self._first_blood_ready = True
         self._first_blood_pending = False
+        self._zone_capture_enabled = True
+        self._zone_line_player = "{player} takes {zone} for the {team} - first zone!"
+        self._zone_line_team = "{team} take {zone} - first zone of the map!"
         self._spree_table_loading = False
         self._player_stats = {}
         self._load_config()
@@ -4227,6 +4230,9 @@ class SpreeTab(QWidget):
                     cfg = json.load(f)
                     self._spree_enabled = cfg.get('spree_enabled', True)
                     self._first_blood_enabled = cfg.get('first_blood_enabled', True)
+                    self._zone_capture_enabled = cfg.get('zone_capture_enabled', True)
+                    self._zone_line_player = str(cfg.get('zone_line_player', self._zone_line_player))
+                    self._zone_line_team = str(cfg.get('zone_line_team', self._zone_line_team))
                     raw_thresholds = cfg.get('spree_thresholds', None)
                     if raw_thresholds is not None:
                         self._spree_thresholds = {int(k): v for k, v in raw_thresholds.items()}
@@ -4248,6 +4254,9 @@ class SpreeTab(QWidget):
             cfg = {
                 'spree_enabled': self._spree_enabled,
                 'first_blood_enabled': self._first_blood_enabled,
+                'zone_capture_enabled': self._zone_capture_enabled,
+                'zone_line_player': self._zone_line_player,
+                'zone_line_team': self._zone_line_team,
                 'spree_thresholds': {str(k): v for k, v in sorted(self._spree_thresholds.items())}
             }
             with open(self._config_path(), 'w') as f:
@@ -4270,6 +4279,26 @@ class SpreeTab(QWidget):
         self.first_blood_checkbox.setChecked(self._first_blood_enabled)
         self.first_blood_checkbox.stateChanged.connect(self._toggle_first_blood)
         spree_layout.addWidget(self.first_blood_checkbox)
+
+        self.zone_capture_checkbox = QCheckBox(
+            "Announce the first zone captured on each Advance and Secure map (server on this PC)")
+        self.zone_capture_checkbox.setChecked(self._zone_capture_enabled)
+        self.zone_capture_checkbox.stateChanged.connect(self._toggle_zone_capture)
+        spree_layout.addWidget(self.zone_capture_checkbox)
+        zone_row = QHBoxLayout()
+        zone_row.addWidget(QLabel("With a name:"))
+        self.zone_line_player_edit = QLineEdit(self._zone_line_player)
+        self.zone_line_player_edit.editingFinished.connect(self._zone_lines_changed)
+        zone_row.addWidget(self.zone_line_player_edit, 1)
+        zone_row.addWidget(QLabel("Without:"))
+        self.zone_line_team_edit = QLineEdit(self._zone_line_team)
+        self.zone_line_team_edit.editingFinished.connect(self._zone_lines_changed)
+        zone_row.addWidget(self.zone_line_team_edit, 1)
+        spree_layout.addLayout(zone_row)
+        zone_hint = QLabel("{team} = Joint Ops / Rebels, {zone} = Alpha, Bravo..., {player} = the nearest player "
+                           "of that team when it flipped (a good guess, not gospel - the second line is used when nobody was near).")
+        zone_hint.setWordWrap(True); zone_hint.setStyleSheet("font-size: 9pt; color: #a89830;")
+        spree_layout.addWidget(zone_hint)
 
         spree_layout.addWidget(QLabel("Streak Thresholds (kill count → announcement message):"))
         self.spree_table = QTableWidget(0, 2)
@@ -4395,6 +4424,29 @@ class SpreeTab(QWidget):
             for stat in self._player_stats.values():
                 stat['streak'] = 0
             wire_log(f"[SPREE] Map changed to {current} - first blood + streaks reset")
+
+    def _toggle_zone_capture(self, state):
+        self._zone_capture_enabled = bool(state)
+        self._save_config()
+
+    def _zone_lines_changed(self):
+        self._zone_line_player = self.zone_line_player_edit.text().strip() or "{player} takes {zone} for the {team} - first zone!"
+        self._zone_line_team = self.zone_line_team_edit.text().strip() or "{team} take {zone} - first zone of the map!"
+        self._save_config()
+
+    def announce_zone_capture(self, event):
+        """From the Bans tab's zone watch.  Only the first capture of a map is announced."""
+        if not self._zone_capture_enabled or not getattr(event, "first", False):
+            return
+        from wolfrat import zone_rules
+        msg = zone_rules.capture_line(event, self._zone_line_player, self._zone_line_team)
+        submit_admin(
+            self,
+            lambda message=msg: self.server.send_chat(message),
+            lambda _result, message=msg: self.log_text.append(
+                f"[{time.strftime('%H:%M:%S')}] ZONE: {message}"),
+            "Announce first zone capture",
+        )
 
     def check_sprees(self, players):
         kd_enabled = self.messages_tab._kd_enabled
@@ -6023,6 +6075,9 @@ class MapVotingTab(QWidget):
         self._mode_rules = vote_rules.rules_from_json(None)
         self._kill_watch = vote_rules.KillWatch()
         self._hold_logged = False
+        self._zone_rule = False
+        self.zones_left = lambda: None          # the Bans tab's reader, wired by the main window
+        self._zone_fired_map = None
 
         self._recently_played_file = str(
             self.runtime.path("wolfrat_recently_played.json")
@@ -6047,6 +6102,7 @@ class MapVotingTab(QWidget):
                         self._mode_rules = vote_rules.rules_from_json(
                             data.get('mode_rules')
                         )
+                        self._zone_rule = bool(data.get('zone_rule', False))
                     elif isinstance(data, list):
                         self._recently_played = data
                         self._current_map = None
@@ -6321,6 +6377,21 @@ class MapVotingTab(QWidget):
         grid.setColumnStretch(4, 1)
         outer.addLayout(grid)
 
+        # Advance and Secure: the only honest signal is the zone chain itself,
+        # read from the server on this PC (2026-09-22, proven on Doslin Oblast).
+        self.zone_rule_cb = QCheckBox(
+            "Advance and Secure: start the vote when one zone is left "
+            "(the server must run on this PC)"
+        )
+        self.zone_rule_cb.setChecked(self._zone_rule)
+        self.zone_rule_cb.setToolTip(
+            "WolfRAT reads every zone's owner from the running server. When the leading "
+            "team has one zone to go, the vote starts - however much time is on the clock. "
+            "Does nothing on maps without zones or when the server is on another machine."
+        )
+        self.zone_rule_cb.toggled.connect(self._save_recently_played)
+        outer.addWidget(self.zone_rule_cb)
+
         self.current_mode_lbl = QLabel("Current map: -")
         self.current_mode_lbl.setStyleSheet("font-size: 9pt; color: #a89830;")
         outer.addWidget(self.current_mode_lbl)
@@ -6396,6 +6467,7 @@ class MapVotingTab(QWidget):
                 'vote_duration': self.duration_spin.value(),
                 'min_players': self.min_players_spin.value(),
                 'mode_rules': vote_rules.rules_to_json(self._current_rules()),
+                'zone_rule': bool(getattr(self, 'zone_rule_cb', None) and self.zone_rule_cb.isChecked()),
             }
             with open(self._recently_played_file, 'w', encoding='utf-8') as f:
                 json.dump(data, f)
@@ -6434,6 +6506,7 @@ class MapVotingTab(QWidget):
             self._vote_stage = 'idle'
             self._kill_watch.reset()
             self._hold_logged = False
+            self._zone_fired_map = None
 
             # --- FIX: Clear list if it hits 50% of the total rotation ---
             mtab = getattr(self, 'missions_tab', None)
@@ -6524,6 +6597,22 @@ class MapVotingTab(QWidget):
                 self._current_rules(),
                 self._kill_watch,
             )
+            if (not decision.fire and mode == vote_rules.MODE_AS
+                    and self.zone_rule_cb.isChecked() and self._zone_fired_map != self._current_map):
+                try:
+                    left = self.zones_left()
+                except Exception:
+                    left = None
+                if left is not None:
+                    team, to_go = left
+                    if to_go == 1:
+                        self._zone_fired_map = self._current_map
+                        decision = vote_rules.Decision(
+                            True, "AAS: one zone left (rule: start the vote when one zone is left)",
+                            decision.status)
+                    else:
+                        decision = vote_rules.Decision(
+                            False, "", decision.status + f"   |   AAS: {to_go} zones to go")
             players = len(self.server.players or ())
             held = vote_rules.hold_for_players(players, self.min_players_spin.value())
             if held is None:
@@ -7593,6 +7682,8 @@ class MainWindow(QMainWindow):
             mods=lambda: [name for name, _rank in self.mods_tab.roster.members()],
         )
         self.server._bans_tab = self.bans_tab  # Players tab + mods' !ban go through the list
+        self.bans_tab.zone_capture = self.spree_tab.announce_zone_capture
+        self.map_voting_tab.zones_left = self.bans_tab.zones_left
 
         # Wire up cross-tab references
         self.missions_tab._main_window = self
