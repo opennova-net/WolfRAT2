@@ -60,9 +60,12 @@ def test_ban_from_the_online_table_then_punt_on_sight_with_cooldown(tmp_path):
     assert rig.tab.bans.entries[0].expires_at == rig.now + 7 * 86400
     assert rig.punts == [("Troll", "Banned: griefing")]
     rig.punts.clear()
-    rig.poll(("Dale", "82.68.58.92"), ("Troll", "5.6.7.8"))
+    rig.poll(("Dale", "82.68.58.92"), ("Troll", "5.6.7.8"))            # 5 s on, still leaving: no double punt
+    assert rig.punts == []
+    rig.poll(("Dale", "82.68.58.92"))                                  # gone - the punt worked
+    rig.poll(("Dale", "82.68.58.92"), ("Troll", "5.6.7.8"))            # back: out again straight away
     assert rig.punts == [("Troll", "Banned: griefing")] and rig.said == ["Troll removed - banned: griefing"]
-    rig.poll(("Dale", "82.68.58.92"), ("Troll", "5.6.7.8"))            # 10 s later: cooldown
+    rig.poll(("Dale", "82.68.58.92"), ("Troll", "5.6.7.8"))            # still there 5 s later: cooldown holds
     assert len(rig.punts) == 1
     assert rig.tab.bans.entries[0].hits == 1 and rig.tab.bans.entries[0].last_hit_ip == "5.6.7.8"
 
