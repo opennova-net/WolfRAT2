@@ -29,20 +29,23 @@ class FakeReader:
 class Rig:
     def __init__(self, folder):
         self.now = NOW
-        self.punts, self.said, self.logged = [], [], []
+        self.punts, self.said, self.logged, self.punted_records = [], [], [], []
         self.reader = FakeReader()
         self.folder = str(folder)
         self.tab = self.build()
 
     def build(self):
-        return BansTab(self.folder, punt=lambda p, why: self.punts.append((p["name"], why)),
+        return BansTab(self.folder,
+                       punt=lambda p, why: (self.punts.append((p["name"], why)), self.punted_records.append(p)),
                        announce=self.said.append, log=self.logged.append, reader=self.reader,
                        clock=lambda: self.now, admin_name="Dale")
 
     def poll(self, *players, seconds=5):
         self.now += seconds
         self.reader.slots = [SlotInfo(0, "Host", "")] + [SlotInfo(i + 1, n, ip) for i, (n, ip) in enumerate(players)]
-        self.tab.on_players([{"id": str(i + 1), "name": n} for i, (n, _ip) in enumerate(players)])
+        self.tab.on_players([{"id": str(i + 1), "name": n, "team": "1", "class": "R",
+                              "kills": "0", "deaths": "0", "ping": "20"}
+                             for i, (n, _ip) in enumerate(players)])
 
 
 def test_ban_from_the_online_table_then_punt_on_sight_with_cooldown(tmp_path):
@@ -136,3 +139,22 @@ def test_expired_entries_drop_off_in_housekeeping(tmp_path):
     rig.now = NOW + 11
     rig.tab._housekeeping()
     assert rig.tab.bans.entries == [] and "expired" in rig.logged[-1]
+
+
+def test_punt_on_sight_hands_over_the_whole_player_record(tmp_path):
+    """Live 2026-09-22: a cut-down {id, name} record made the dispatcher refuse with
+    "displayed player is missing 'team'" and a banned player stayed on."""
+    rig = Rig(tmp_path)
+    rig.tab.bans.add(br.BanEntry("name", "Troll", added_at=NOW))
+    rig.poll(("Troll", "5.6.7.8"))
+    assert rig.punts == [("Troll", "Banned: Troll")]
+    assert rig.punted_records[-1] == {"id": "1", "name": "Troll", "team": "1", "class": "R",
+                                      "kills": "0", "deaths": "0", "ping": "20"}
+
+
+def test_pages_scroll_instead_of_squashing(tmp_path):
+    from PyQt6.QtWidgets import QScrollArea
+    rig = Rig(tmp_path)
+    assert all(isinstance(rig.tab.pages.widget(i), QScrollArea) for i in range(3))
+    rig.tab.resize(900, 500); rig.tab.show(); _app.processEvents()
+    assert rig.tab.ban_table.minimumHeight() >= 200

@@ -18,10 +18,11 @@ from typing import Callable, Optional
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox,
-                             QDialog, QDialogButtonBox, QFileDialog, QGroupBox,
+                             QDialog, QDialogButtonBox, QFileDialog, QFrame, QGroupBox,
                              QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox,
-                             QPlainTextEdit, QPushButton, QSplitter, QTableWidget,
-                             QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget)
+                             QPlainTextEdit, QPushButton, QScrollArea, QSplitter,
+                             QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout,
+                             QWidget)
 
 from wolfrat import ban_rules as br
 from wolfrat.ban_rules import BanEntry, BanList, Enforcer, KIND_IP, KIND_NAME
@@ -43,6 +44,12 @@ _HELP = (
     "cannot even reach the game. Unblock the same way. WolfRAT never touches the "
     "firewall itself, so it needs no admin rights.<br>"
     "<b>Whitelist</b> entries are never removed, whatever else matches."
+)
+
+_HELP_SHORT = (
+    "WolfRAT's own ban list - by name or IP, removed the moment they are seen. "
+    "IPs come from the server on this PC. Firewall lines are copy-paste for PowerShell "
+    "(as administrator, on the server PC). Hover here for the full story."
 )
 
 _TABLE_STYLE = "QTableWidget { background: #0a0a00; color: #d0c060; gridline-color: #2a2a00; }"
@@ -167,16 +174,25 @@ class BansTab(QWidget):
         self.history.dirty = False
 
     # ---- UI ------------------------------------------------------------------
+    @staticmethod
+    def _scrolling(page: QWidget) -> QScrollArea:
+        """Small screens scroll the page instead of squashing it (like the other tabs)."""
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(page)
+        return scroll
+
     def _build_ui(self):
         root = QVBoxLayout(self)
         root.setContentsMargins(4, 4, 4, 4)
         self.pages = QTabWidget()
         root.addWidget(self.pages, 1)
-        self.pages.addTab(self._build_bans_page(), "Ban list")
-        self.pages.addTab(self._build_whitelist_page(), "Whitelist")
-        self.pages.addTab(self._build_history_page(), "Player history")
+        self.pages.addTab(self._scrolling(self._build_bans_page()), "Ban list")
+        self.pages.addTab(self._scrolling(self._build_whitelist_page()), "Whitelist")
+        self.pages.addTab(self._scrolling(self._build_history_page()), "Player history")
         self.log_text = QPlainTextEdit(); self.log_text.setReadOnly(True)
-        self.log_text.setMaximumHeight(110)
+        self.log_text.setMaximumHeight(90)
         self.log_text.setStyleSheet("font-family: Consolas, monospace; font-size: 9pt; background-color: #0a0a00; "
                                     "color: #a89830; border: 1px solid #3a3a00;")
         root.addWidget(self.log_text)
@@ -197,8 +213,9 @@ class BansTab(QWidget):
     def _build_bans_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
-        help_lbl = QLabel(_HELP); help_lbl.setWordWrap(True)
-        help_lbl.setStyleSheet("color: #a89830; font-size: 9pt; padding: 4px;")
+        help_lbl = QLabel(_HELP_SHORT); help_lbl.setWordWrap(True)
+        help_lbl.setToolTip(_HELP)
+        help_lbl.setStyleSheet("color: #a89830; font-size: 9pt; padding: 2px 4px;")
         layout.addWidget(help_lbl)
         self.status_lbl = QLabel("IPs: not looked yet.")
         self.status_lbl.setStyleSheet("color: #e8c840; padding: 2px 4px;")
@@ -212,6 +229,7 @@ class BansTab(QWidget):
         online_box = QGroupBox("On the server now")
         online_layout = QVBoxLayout(online_box)
         self.online_table = self._table(["Name", "IP", "Visits", "Other names seen on this IP"], 3)
+        self.online_table.setMinimumHeight(150)
         online_layout.addWidget(self.online_table)
         online_row = QHBoxLayout()
         self.ban_name_btn = self._button_cls("Ban name"); self.ban_name_btn.clicked.connect(lambda: self._ban_selected(KIND_NAME))
@@ -232,6 +250,7 @@ class BansTab(QWidget):
         list_box = QGroupBox("Banned")
         list_layout = QVBoxLayout(list_box)
         self.ban_table = self._table(["Kind", "Name / address", "Reason", "By", "Added", "Expires", "Hits", "Last seen trying"], 2)
+        self.ban_table.setMinimumHeight(220)
         self.ban_table.itemSelectionChanged.connect(self._sync_buttons)
         list_layout.addWidget(self.ban_table)
         add_row = QHBoxLayout()
@@ -272,6 +291,7 @@ class BansTab(QWidget):
         note.setWordWrap(True); note.setStyleSheet("color: #a89830; padding: 4px;")
         layout.addWidget(note)
         self.white_table = self._table(["Kind", "Name / address", "Note", "By", "Added"], 2)
+        self.white_table.setMinimumHeight(220)
         layout.addWidget(self.white_table, 1)
         row = QHBoxLayout()
         self.white_value = QLineEdit(); self.white_value.setPlaceholderText("name or IP pattern")
@@ -296,6 +316,7 @@ class BansTab(QWidget):
         layout.addLayout(top)
         splitter = QSplitter(Qt.Orientation.Horizontal)
         self.hist_table = self._table(["Name", "Last IP", "IPs", "Visits", "First seen", "Last seen"], 0)
+        self.hist_table.setMinimumHeight(260)
         self.hist_table.itemSelectionChanged.connect(self._show_history_detail)
         splitter.addWidget(self.hist_table)
         self.hist_detail = QPlainTextEdit(); self.hist_detail.setReadOnly(True)
@@ -319,7 +340,7 @@ class BansTab(QWidget):
             why = removal.why()
             self.log(f"Removed {why}")
             try:
-                self._punt({"id": removal.player_id, "name": removal.name}, f"Banned: {removal.entry.reason or removal.entry.value}")
+                self._punt(removal.player, f"Banned: {removal.entry.reason or removal.entry.value}")
             except Exception as exc:
                 self.log(f"Punt failed for {removal.name}: {exc}")
             if self.announce_cb.isChecked():

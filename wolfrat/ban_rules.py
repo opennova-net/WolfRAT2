@@ -213,6 +213,7 @@ class Removal:
     name: str
     ip: str
     entry: BanEntry
+    player: dict = field(default_factory=dict)   # the FULL admin-port record - punting needs all of it
 
     def why(self) -> str:
         what = f"IP {self.entry.value}" if self.entry.kind == KIND_IP else f"name {self.entry.value}"
@@ -244,7 +245,7 @@ class Enforcer:
             self._recent[mark] = now
             entry.hits += 1
             entry.last_hit_at, entry.last_hit_name, entry.last_hit_ip = now, name, ip
-            removals.append(Removal(str(player.get("id", "")), name, ip, entry))
+            removals.append(Removal(str(player.get("id", "")), name, ip, entry, dict(player)))
         return removals
 
 
