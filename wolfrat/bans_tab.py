@@ -848,7 +848,7 @@ class BansTab(QWidget):
             lines.append(f"  {self._with_country(ip)}  last {describe_when(seen, now)}" + (f"   also: {', '.join(others[:8])}" if others else ""))
         lines.append("")
         lines.append("Chat:" if rec.chat else "Chat: nothing recorded yet")
-        for stamp, text in list(rec.chat)[-60:]:
+        for stamp, text in list(rec.chat):          # every kept line (200), Dale 2026-09-22
             lines.append(f"  [{time.strftime('%d %b %H:%M', time.localtime(stamp))}] {text}")
         self.hist_detail.setPlainText("\n".join(lines))
 
