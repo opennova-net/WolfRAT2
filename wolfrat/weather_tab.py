@@ -46,6 +46,9 @@ _HELP = (
     "a few seconds for as long as it is active."
     "<br>• Fog can only come closer than the map's own view distance, never "
     "further."
+    "<br>• <b>Wind</b> is how fast the clouds race across the sky. The game has no wind "
+    "direction players can see - the clouds always drift the same way, only faster or slower. "
+    "Maps use 15 to about 200. Untick Wind and the map keeps its own."
     "<br>• Earthquake really does nudge players and vehicles about a little."
     "<br>• <b>Lightning and thunder</b> need one tiny script file on the server. Press "
     "<b>Install lightning add-on</b> below (or <b>Link WolfRAT to the server</b> on the Server "
@@ -113,7 +116,8 @@ class WeatherTab(QWidget):
         self._settings = {
             "mods_enabled": False, "announce": True, "minutes": 10,
             "precip": 60, "snow": False, "overcast": 80, "fog_on": False,
-            "fog_metres": 300, "fade": 25, "dynamic": {}, "seen_maps": {},
+            "fog_metres": 300, "fade": 25, "wind_on": False, "wind": 150,
+            "dynamic": {}, "seen_maps": {},
             "linked": False,
         }
         try:
@@ -210,6 +214,16 @@ class WeatherTab(QWidget):
         self.overcast_slider, self.overcast_val = self._slider(0, 100, self._settings["overcast"], "%")
         self.fog_slider, self.fog_val = self._slider(50, 1500, self._settings["fog_metres"], " m")
         self.fade_slider, self.fade_val = self._slider(1, 120, self._settings["fade"], " s")
+        self.wind_slider, self.wind_val = self._slider(0, weather.WIND_MAX, self._settings["wind"], "")
+        self.wind_val.setMinimumWidth(96)
+        self.wind_slider.valueChanged.connect(lambda v: self.wind_val.setText(weather.wind_text(v)))
+        self.wind_val.setText(weather.wind_text(self.wind_slider.value()))
+        self.wind_cb = QCheckBox("Wind")
+        self.wind_cb.setToolTip("How fast the clouds race across the sky. Unticked = the map's own wind.")
+        self.wind_cb.setChecked(bool(self._settings["wind_on"]))
+        self.wind_cb.toggled.connect(self.wind_slider.setEnabled)
+        self.wind_cb.toggled.connect(self._save)
+        self.wind_slider.setEnabled(self.wind_cb.isChecked())
         self.snow_cb = QCheckBox("as snow")
         self.snow_cb.setChecked(bool(self._settings["snow"]))
         self.snow_cb.toggled.connect(self._save)
@@ -229,12 +243,15 @@ class WeatherTab(QWidget):
         custom.addWidget(self.fog_cb, 2, 0)
         custom.addWidget(self.fog_slider, 2, 1)
         custom.addWidget(self.fog_val, 2, 2)
-        custom.addWidget(QLabel("Fade over"), 3, 0)
-        custom.addWidget(self.fade_slider, 3, 1)
-        custom.addWidget(self.fade_val, 3, 2)
+        custom.addWidget(self.wind_cb, 3, 0)
+        custom.addWidget(self.wind_slider, 3, 1)
+        custom.addWidget(self.wind_val, 3, 2, 1, 2)
+        custom.addWidget(QLabel("Fade over"), 4, 0)
+        custom.addWidget(self.fade_slider, 4, 1)
+        custom.addWidget(self.fade_val, 4, 2)
         self.apply_btn = self._button_cls("Apply")
         self.apply_btn.clicked.connect(self._start_custom)
-        custom.addWidget(self.apply_btn, 3, 3)
+        custom.addWidget(self.apply_btn, 4, 3)
         self._action_widgets.append(self.apply_btn)
         custom.setColumnStretch(1, 1)
         custom_group.setLayout(custom)
@@ -369,6 +386,8 @@ class WeatherTab(QWidget):
             "fog_on": self.fog_cb.isChecked(),
             "fog_metres": self.fog_slider.value(),
             "fade": self.fade_slider.value(),
+            "wind_on": self.wind_cb.isChecked(),
+            "wind": self.wind_slider.value(),
             "dynamic": self.dynamic_page.config().to_json(),
             "seen_maps": self.dynamic_page.seen(),
         })
@@ -448,7 +467,8 @@ class WeatherTab(QWidget):
         self.sky_lbl.setText(
             f"Sky right now:  {kind} {reading.precip_percent}%   ·   overcast "
             f"{reading.overcast_percent}%   ·   you can see {reading.fog_metres} m "
-            f"(map allows {reading.map_fog_metres} m)   ·   game clock {reading.clock}"
+            f"(map allows {reading.map_fog_metres} m)   ·   wind {weather.wind_text(reading.cloud_speed)}"
+            f"   ·   game clock {reading.clock}"
         )
         self.fog_slider.setMaximum(max(100, reading.map_fog_metres))
         active = self._schedule.active
@@ -526,6 +546,8 @@ class WeatherTab(QWidget):
                     controller.apply(decision.sky)
                 if handing_back:
                     self._sky_before = None
+            if settled:                              # a fade waits out a map load
+                controller.step_wind()
             if decision.quake_seconds:
                 used = controller.quake(decision.quake_seconds)
                 self.log(f"Dynamic weather: {used} s earthquake.")
@@ -601,6 +623,7 @@ class WeatherTab(QWidget):
             snow=self.snow_cb.isChecked(),
             overcast_percent=self.overcast_slider.value(),
             fog_metres=self.fog_slider.value() if self.fog_cb.isChecked() else None,
+            cloud_speed=self.wind_slider.value() if self.wind_cb.isChecked() else None,
             fade_seconds=self.fade_slider.value(),
         )
         self._start(sky, "custom weather", self.minutes_spin.value() or None, "WolfRAT")

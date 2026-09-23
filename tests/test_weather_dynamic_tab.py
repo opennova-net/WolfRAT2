@@ -248,7 +248,17 @@ def test_after_our_front_the_maps_own_rain_comes_back(qtbot, tmp_path, monkeypat
     # handed back AS FOUND (the map script's rain), not as the .env says (no rain)
     assert server.peek(Addr.PRECIP_TARGET) == 0x10000
     assert server.peek(Addr.FOG_TARGET) == 350 << 16
+    tab._dynamic._next_front_at = clock[0] + 3600            # no next front while we watch
+    for _ in range(int(150 / 5)):                            # the wind fades back, it does not jump
+        clock[0] += 5
+        server.tick(5)
+        tab._poll()
     assert server.peek(Addr.CLOUD_SPEED_TARGET) == 50 << 10
+    server.writes.clear()
+    for _ in range(4):                                       # and then it is the map's again
+        clock[0] += 5
+        tab._poll()
+    assert Addr.CLOUD_SPEED_TARGET not in server.writes
     server.tick(30)                                          # and it really does come back
     assert server.client_sees()["precip"] > 60
 

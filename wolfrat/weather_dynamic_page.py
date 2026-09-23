@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
+from wolfrat import weather
 from wolfrat import weather_dynamic as dyn
 
 _HELP = (
@@ -179,7 +180,7 @@ class DynamicPage(QWidget):
         left.addWidget(types_group)
 
         # -- extras
-        extras_group = QGroupBox("Fog, earthquakes and chat")
+        extras_group = QGroupBox("Fog, wind, earthquakes and chat")
         extras = QGridLayout()
         self.fog_min = _spin(20, 2000, config.fog_min, " m")
         self.fog_max = _spin(20, 2000, config.fog_max, " m")
@@ -191,30 +192,49 @@ class DynamicPage(QWidget):
                          "out at 150-200 m. Every front rolls its own.")
         extras.addWidget(fog_note, 1, 0, 1, 5)
 
+        self.wind_cb = QCheckBox("Fronts bring wind, from")
+        self.wind_cb.setChecked(config.wind)
+        self.wind_cb.setToolTip(
+            "Wind in Joint Ops is how fast the clouds race across the sky. Every front rolls "
+            "its own: it picks up as the front arrives, is strongest at the peak and dies "
+            "down with it. Fog comes with still air. Off = every map keeps its own wind."
+        )
+        self.wind_min = _spin(0, weather.WIND_MAX, config.wind_min)
+        self.wind_max = _spin(0, weather.WIND_MAX, config.wind_max)
+        extras.addWidget(self.wind_cb, 2, 0)
+        extras.addWidget(self.wind_min, 2, 1)
+        extras.addWidget(QLabel("to"), 2, 2)
+        extras.addWidget(self.wind_max, 2, 3)
+        for widget in (self.wind_min, self.wind_max):
+            widget.setEnabled(config.wind)
+            self.wind_cb.toggled.connect(widget.setEnabled)
+        self.wind_lbl = _note()
+        extras.addWidget(self.wind_lbl, 3, 0, 1, 5)
+
         self.quake_cb = QCheckBox("Rare earthquakes, about one every")
         self.quake_cb.setChecked(config.quake_enabled)
         self.quake_cb.setToolTip("They really shake the screen and nudge players and vehicles.")
         self.quake_every = _spin(5, 1440, config.quake_every, " min")
         self.quake_max = _spin(2, 40, config.quake_max_seconds, " s")
-        extras.addWidget(self.quake_cb, 2, 0)
-        extras.addWidget(self.quake_every, 2, 1)
-        extras.addWidget(QLabel("up to"), 2, 2)
-        extras.addWidget(self.quake_max, 2, 3)
+        extras.addWidget(self.quake_cb, 4, 0)
+        extras.addWidget(self.quake_every, 4, 1)
+        extras.addWidget(QLabel("up to"), 4, 2)
+        extras.addWidget(self.quake_max, 4, 3)
         for widget in (self.quake_every, self.quake_max):
             widget.setEnabled(config.quake_enabled)
             self.quake_cb.toggled.connect(widget.setEnabled)
 
         self.announce_cb = QCheckBox("Tell players in chat when a front moves in")
         self.announce_cb.setChecked(config.announce)
-        extras.addWidget(self.announce_cb, 3, 0, 1, 4)
+        extras.addWidget(self.announce_cb, 5, 0, 1, 4)
         self.empty_cb = QCheckBox("Pause while nobody is on the server")
         self.empty_cb.setChecked(config.pause_when_empty)
-        extras.addWidget(self.empty_cb, 4, 0, 1, 4)
+        extras.addWidget(self.empty_cb, 6, 0, 1, 4)
         self.lightning_cb = QCheckBox("Lightning and thunder in storms")
         self.lightning_cb.setChecked(config.lightning)
-        extras.addWidget(self.lightning_cb, 5, 0, 1, 4)
+        extras.addWidget(self.lightning_cb, 7, 0, 1, 4)
         self.lightning_lbl = _note()
-        extras.addWidget(self.lightning_lbl, 6, 0, 1, 5)
+        extras.addWidget(self.lightning_lbl, 8, 0, 1, 5)
         extras.setColumnStretch(4, 1)
         extras_group.setLayout(extras)
         left.addWidget(extras_group)
@@ -273,10 +293,12 @@ class DynamicPage(QWidget):
         right.addWidget(maps_group, 1)
 
         # -- wiring
-        for box in (self.enabled_cb, self.quake_cb, self.announce_cb, self.empty_cb, self.lightning_cb):
+        for box in (self.enabled_cb, self.quake_cb, self.announce_cb, self.empty_cb, self.lightning_cb,
+                    self.wind_cb):
             box.toggled.connect(self._emit)
         for spin in (self.clear_min, self.clear_max, self.hold_min, self.hold_max, self.fade_min,
-                     self.fade_max, self.fog_min, self.fog_max, self.quake_every, self.quake_max):
+                     self.fade_max, self.fog_min, self.fog_max, self.quake_every, self.quake_max,
+                     self.wind_min, self.wind_max):
             spin.valueChanged.connect(self._emit)
         for box, spin in self._type_widgets.values():
             box.toggled.connect(self._emit)
@@ -295,6 +317,8 @@ class DynamicPage(QWidget):
             weights={name: (spin.value() if box.isChecked() else 0)
                      for name, (box, spin) in self._type_widgets.items()},
             fog_min=self.fog_min.value(), fog_max=self.fog_max.value(),
+            wind=self.wind_cb.isChecked(), wind_min=self.wind_min.value(),
+            wind_max=self.wind_max.value(),
             quake_enabled=self.quake_cb.isChecked(), quake_every=self.quake_every.value(),
             quake_max_seconds=self.quake_max.value(), announce=self.announce_cb.isChecked(),
             pause_when_empty=self.empty_cb.isChecked(), lightning=self.lightning_cb.isChecked(),
@@ -321,6 +345,14 @@ class DynamicPage(QWidget):
                 f"{dyn.FREQUENCY_LABELS[config.frequency]} = clear spells {clear_min}-{clear_max} min, "
                 f"peaks {hold_min}-{hold_max} min. Pick Custom to set your own."
             )
+        if config.wind:
+            low, high = sorted((config.wind_min, config.wind_max))
+            self.wind_lbl.setText(
+                f"The peak's wind: {weather.wind_text(low)} to {weather.wind_text(high)}. Maps use "
+                "15 to about 200. Players see the clouds speed up; they always drift the same way."
+            )
+        else:
+            self.wind_lbl.setText("Off: every map keeps its own wind.")
         total = sum(config.weights.values())
         if total <= 0:
             self.mix_lbl.setText("Nothing is ticked, so the sky will stay clear.")

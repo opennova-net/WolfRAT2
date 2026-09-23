@@ -48,6 +48,28 @@ FOG_MIN = 0x20000              # the engine refuses fog closer than 2 m
 QUAKE_MAX_SECONDS = 40         # same cap the engine's own host command uses
 QUAKE_TICKS_PER_SECOND = 6     # WAC 'quake n' stores 6 * n
 
+# Wind = how fast the clouds race across the sky (WAC 'skyspeed', the .env
+# 'sky_speed').  Players get it as one unsigned byte, so 0-255, never negative:
+# the clouds always drift the same way, only the speed can change.  Maps use
+# anything from 15 to about 200 (Villa Valley TAC is 206).
+WIND_MAX = 255
+
+
+def wind_word(speed: int) -> str:
+    if speed <= 0:
+        return "still"
+    if speed < 40:
+        return "light"
+    if speed < 100:
+        return "breezy"
+    if speed < 170:
+        return "windy"
+    return "gale"
+
+
+def wind_text(speed: int) -> str:
+    return f"{speed} ({wind_word(speed)})"
+
 
 class Addr:
     """Globals in the retail 1.7.5.7 image (no ASLR; image base 0x400000)."""
@@ -58,7 +80,8 @@ class Addr:
     FOG_TARGET = 0x026C6820
     FOG_STEP = 0x026C6828
     CLOUD_SPEED = 0x026C686C
-    CLOUD_SPEED_TARGET = 0x026C6870    # skyspeed << 10
+    CLOUD_SPEED_TARGET = 0x026C6870    # skyspeed << 10; sent to players as one byte
+    SKY_SPEED_MAP = 0x026C6874         # Env_SkySpeedFixed: the map's .env sky_speed << 10
     PRECIP_CURRENT = 0x026C6880        # 0 .. 0x10000, this is what clients are sent
     PRECIP_TARGET = 0x026C6884
     PRECIP_STEP = 0x026C688C
@@ -236,11 +259,12 @@ class Weather:
     snow: bool = False
     overcast_percent: int = 0
     fog_metres: Optional[int] = None     # None = the map's own distance
-    cloud_speed: Optional[int] = None    # 0-255, WAC 'skyspeed'
+    cloud_speed: Optional[int] = None    # wind, 0-255 (WAC 'skyspeed'); None = the map's own
     fade_seconds: int = 20
 
     def describe(self) -> str:
-        if self.precip_percent <= 0 and self.overcast_percent <= 0 and self.fog_metres is None:
+        if self.precip_percent <= 0 and self.overcast_percent <= 0 and self.fog_metres is None \
+                and self.cloud_speed is None:
             return "clear"
         parts = []
         if self.precip_percent > 0:
@@ -249,6 +273,8 @@ class Weather:
             parts.append(f"overcast {self.overcast_percent}%")
         if self.fog_metres is not None:
             parts.append(f"fog {self.fog_metres} m")
+        if self.cloud_speed is not None:
+            parts.append(f"wind {wind_text(self.cloud_speed)}")
         return ", ".join(parts)
 
 
@@ -258,11 +284,12 @@ PRESETS: dict[str, Weather] = {
     "clear": CLEAR,
     "drizzle": Weather(precip_percent=25, overcast_percent=50, fade_seconds=30),
     "rain": Weather(precip_percent=60, overcast_percent=80, fade_seconds=30),
+    # Storm winds used to be 60, which CALMED windy maps (Villa Valley TAC is 206).
     "storm": Weather(precip_percent=100, overcast_percent=100, fog_metres=350,
-                     cloud_speed=60, fade_seconds=25),
+                     cloud_speed=230, fade_seconds=25),
     "snow": Weather(precip_percent=50, snow=True, overcast_percent=70, fade_seconds=30),
     "blizzard": Weather(precip_percent=100, snow=True, overcast_percent=100,
-                        fog_metres=200, cloud_speed=60, fade_seconds=25),
+                        fog_metres=200, cloud_speed=245, fade_seconds=25),
     "fog": Weather(overcast_percent=40, fog_metres=150, fade_seconds=40),
     "overcast": Weather(overcast_percent=100, fade_seconds=40),
 }
@@ -319,11 +346,19 @@ class Reading:
 class WeatherController:
     """Reads and sets the sky through a ``Memory``.  Verifies before any write."""
 
-    def __init__(self, memory: Memory):
+    def __init__(self, memory: Memory, clock: Optional[Callable[[], float]] = None):
         self._mem = memory
         self._verified = False
         self._addon: Optional[bool] = None     # None = not asked yet
         self._ping_pending = False
+        # time.monotonic looked up per call, so a test patching it reaches us too
+        self._clock = clock or (lambda: time.monotonic())
+        # Wind.  The engine glides the clouds to a new speed in about half a
+        # second, so a fade has to be walked by us: step_wind() every poll.
+        self._wind_ramp: Optional[tuple] = None    # (from, to, started, seconds), raw << 10
+        self._wind_ours = False        # True while the wind showing is one WE chose
+        self._wind_home: Optional[int] = None      # the map's wind before we touched it
+        self._wind_written: Optional[int] = None   # what we last wrote
 
     # -- plumbing ----------------------------------------------------------
     def _get(self, address: int) -> int:
@@ -409,7 +444,59 @@ class WeatherController:
             self._ramp(Addr.FOG_CURRENT, Addr.FOG_TARGET, Addr.FOG_STEP, fog, seconds)
 
         if weather.cloud_speed is not None:
-            self._put(Addr.CLOUD_SPEED_TARGET, max(0, min(255, weather.cloud_speed)) << 10)
+            self._wind_to(max(0, min(WIND_MAX, int(weather.cloud_speed))) << 10, seconds, ours=True)
+        elif self._wind_ours:
+            self._wind_to(self._wind_home_value(), seconds, ours=False)
+        self.step_wind()
+
+    # -- wind ----------------------------------------------------------------
+    def _wind_home_value(self) -> int:
+        if self._wind_home is not None:
+            return self._wind_home
+        return max(0, min(WIND_MAX << 10, self._get(Addr.SKY_SPEED_MAP)))
+
+    def _wind_value(self, now: float) -> int:
+        start, goal, started, seconds = self._wind_ramp
+        if seconds <= 0 or now - started >= seconds:
+            return goal
+        fraction = max(0.0, (now - started) / seconds)
+        return round((start >> 10) + ((goal >> 10) - (start >> 10)) * fraction) << 10
+
+    def _wind_to(self, goal: int, seconds: float, ours: bool) -> None:
+        """Start a fade to `goal` (raw, speed << 10).  ours=False = on the way
+        back to the map's own wind; once there, WolfRAT stops writing it."""
+        if ours and not self._wind_ours:
+            self._wind_home = self._get(Addr.CLOUD_SPEED_TARGET)   # as we found it
+        self._wind_ours = ours
+        if self._wind_ramp is not None and self._wind_ramp[1] == goal:
+            return                     # already heading there: re-asserting must not restart it
+        now = self._clock()
+        start = self._wind_value(now) if self._wind_ramp is not None \
+            else self._get(Addr.CLOUD_SPEED_TARGET)
+        self._wind_ramp = (start, goal, now, max(0.0, float(seconds)))
+
+    def step_wind(self) -> None:
+        """Walk the wind fade one step.  Call every poll: a fade outlives the
+        weather call that started it (a clear is a single call)."""
+        if self._wind_ramp is None:
+            return
+        live = self._get(Addr.CLOUD_SPEED_TARGET)
+        if self._wind_written is not None and live != self._wind_written:
+            # Someone else moved it - a map load, or the map's own script
+            # (Trench Warfare: skyspeed(50)).  That is the map's wind now.
+            self._wind_home = live
+            if not self._wind_ours:
+                self._wind_ramp = self._wind_written = None     # it is home already
+                return
+        now = self._clock()
+        value = self._wind_value(now)
+        if value != live:
+            self._put(Addr.CLOUD_SPEED_TARGET, value)
+        self._wind_written = value
+        start, goal, started, seconds = self._wind_ramp
+        if not self._wind_ours and now - started >= seconds:
+            # Home: hands off, the map (and its script) own the wind again.
+            self._wind_ramp = self._wind_written = self._wind_home = None
 
     def snapshot(self) -> dict:
         """Where the sky is HEADING right now - taken before our first write so the
@@ -421,7 +508,9 @@ class WeatherController:
             "snow": self._get(Addr.PRECIP_IS_SNOW),
             "overcast": self._get(Addr.OVERCAST_TARGET),
             "fog": self._get(Addr.FOG_TARGET),
-            "cloud": self._get(Addr.CLOUD_SPEED_TARGET),
+            # the map's wind, not one of ours still fading out
+            "cloud": self._wind_home if self._wind_ramp is not None and self._wind_home is not None
+            else self._get(Addr.CLOUD_SPEED_TARGET),
         }
 
     def restore(self, saved: dict, fade_seconds: int = 90) -> None:
@@ -439,7 +528,11 @@ class WeatherController:
         if reference >= FOG_MIN:
             fog = max(FOG_MIN, min(int(saved["fog"]), reference))
             self._ramp(Addr.FOG_CURRENT, Addr.FOG_TARGET, Addr.FOG_STEP, fog, seconds)
-        self._put(Addr.CLOUD_SPEED_TARGET, int(saved["cloud"]))
+        cloud = max(0, min(WIND_MAX << 10, int(saved["cloud"])))
+        if self._wind_ramp is not None or self._get(Addr.CLOUD_SPEED_TARGET) != cloud:
+            self._wind_home = cloud
+            self._wind_to(cloud, seconds, ours=False)
+            self.step_wind()
 
     def map_info(self) -> MapInfo:
         if not self._verified:

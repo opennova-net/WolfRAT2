@@ -36,7 +36,8 @@ blocks at 0xC87CA8 (Joint Ops) / 0xC87DFC (Rebels), field n = dword at
 +4*(n+1) (CRenderState_GetFieldByIndex @ 0x52D7D0); captures = field 11.
 CTF: team 1 wins at field 11 >= [0xC8FF00], team 2 at >= [0xC8FEFC] (the
 enemy flags on the map, counted at map load).  Flagball: field 11 >= MaxScore
-[0x24D2138] (65000 = no limit).  Code-read; to be proven in a live CTF/FB game.
+[0x24D2138] (65000 = no limit).  Proven live 2026-09-23 on Flagball and CTF
+(Dale scored for Rebels -> team 2 +1; CTF goal 12 matched the game's own).
 
 Co-op AI left: the mission's unit groups, 64 x 48 bytes at 0xA33FA4
 (+4 = count when the mission loaded, EntityPool_RecountByType; +8 = alive
@@ -243,6 +244,16 @@ class LocalServerPlayers:
         except Exception:
             return None
 
+
+    def read_team_caps(self, game_type) -> Optional[dict]:
+        """{1: Joint Ops captures, 2: Rebels captures} on CTF / Flagball, else None."""
+        if game_type not in (GAME_CTF, GAME_FB) or not self._attach():
+            return None
+        try:
+            return {t: struct.unpack("<i", self._memory.read(va + CAPS_OFFSET, 4))[0]
+                    for t, va in TEAM_SCORE_VA.items()}
+        except Exception:
+            return None
 
     def read_caps_to_go(self, game_type) -> Optional[int]:
         """caps_to_go() from the live server, None off CTF/Flagball."""

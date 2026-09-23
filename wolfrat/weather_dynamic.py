@@ -21,7 +21,7 @@ import re
 from dataclasses import dataclass, field, replace
 from typing import Callable, Optional
 
-from wolfrat.weather import CLEAR, Weather
+from wolfrat.weather import CLEAR, WIND_MAX, Weather
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -45,15 +45,16 @@ LADDERS = {
     "blizzard": ("overcast", "snow", "blizzard"),
 }
 
-# (precipitation %, overcast %, brings fog, cloud speed) at full strength
+# (precipitation %, overcast %, brings fog, share of the front's wind) at full
+# strength.  Wind builds with the front and dies with it; fog comes with still air.
 _SHAPES = {
-    "overcast": (0, 100, False, None),
-    "drizzle": (25, 55, False, None),
-    "rain": (60, 80, False, None),
-    "storm": (100, 100, True, 60),
-    "fog": (0, 40, True, None),
-    "snow": (50, 70, False, None),
-    "blizzard": (100, 100, True, 60),
+    "overcast": (0, 100, False, 0.5),
+    "drizzle": (25, 55, False, 0.55),
+    "rain": (60, 80, False, 0.75),
+    "storm": (100, 100, True, 1.0),
+    "fog": (0, 40, True, 0.15),
+    "snow": (50, 70, False, 0.6),
+    "blizzard": (100, 100, True, 1.0),
 }
 _SNOWY = {"snow", "blizzard"}
 
@@ -111,6 +112,9 @@ class DynamicConfig:
     })
     fog_min: int = 120             # metres, rolled per foggy front
     fog_max: int = 400
+    wind: bool = True              # fronts bring their own wind (cloud speed)
+    wind_min: int = 60             # 0-255, rolled per front, the peak's wind
+    wind_max: int = 220
     quake_enabled: bool = False
     quake_every: int = 90          # about one every N minutes
     quake_max_seconds: int = 6
@@ -135,6 +139,7 @@ class DynamicConfig:
             "hold_min": self.hold_min, "hold_max": self.hold_max,
             "fade_min": self.fade_min, "fade_max": self.fade_max,
             "weights": dict(self.weights), "fog_min": self.fog_min, "fog_max": self.fog_max,
+            "wind": self.wind, "wind_min": self.wind_min, "wind_max": self.wind_max,
             "quake_enabled": self.quake_enabled, "quake_every": self.quake_every,
             "quake_max_seconds": self.quake_max_seconds, "announce": self.announce,
             "pause_when_empty": self.pause_when_empty, "lightning": self.lightning,
@@ -269,14 +274,15 @@ class Front:
         return self.kind in _SNOWY
 
 
-def _sky(name: str, strength: float, fog_metres: int, fade: int) -> Weather:
-    precip, overcast, foggy, cloud = _SHAPES[name]
+def _sky(name: str, strength: float, fog_metres: int, fade: int,
+         wind: Optional[int] = None) -> Weather:
+    precip, overcast, foggy, wind_share = _SHAPES[name]
     return Weather(
         precip_percent=round(precip * strength),
         snow=name in _SNOWY,
         overcast_percent=round(overcast * (0.6 + 0.4 * strength)),
         fog_metres=fog_metres if foggy else None,
-        cloud_speed=cloud,
+        cloud_speed=None if wind is None else round(wind * wind_share),
         fade_seconds=fade,
     )
 
@@ -300,7 +306,16 @@ def build_front(kind: str, config: DynamicConfig, rng: random.Random) -> Front:
     climb = [step(name) for name in ladder[:-1]]
     peak = step(ladder[-1], rng.randint(hold_min * 60, hold_max * 60), peak=True)
     descent = [step(name) for name in reversed(ladder[:-1])]
-    return Front(kind, strength, tuple(climb + [peak] + descent))
+    stages = climb + [peak] + descent
+    if config.wind:
+        # rolled last, so the rest of the front is what it always was
+        wind_low, wind_high = sorted((max(0, min(WIND_MAX, config.wind_min)),
+                                      max(0, min(WIND_MAX, config.wind_max))))
+        wind = rng.randint(wind_low, wind_high)
+        stages = [replace(stage, sky=_sky(stage.label.lower(), strength, fog,
+                                           stage.sky.fade_seconds, wind))
+                  for stage in stages]
+    return Front(kind, strength, tuple(stages))
 
 
 def pick_kind(config: DynamicConfig, rng: random.Random) -> Optional[str]:

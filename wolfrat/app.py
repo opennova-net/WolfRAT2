@@ -1,5 +1,5 @@
 """
-WolfRAT 2.8.0 - Modern Joint Operations Server Admin Tool
+WolfRAT 2.8.1 - Modern Joint Operations Server Admin Tool
 Replaces the original WolfRAT v0.95 (2005, MFC70)
 """
 
@@ -22,6 +22,7 @@ from PyQt6.QtGui import QColor, QIcon, QTextCursor
 from wolfrat import vote_rules
 from wolfrat import weather
 from wolfrat import coop_guard
+from wolfrat import score_lead
 from wolfrat.weather_tab import WeatherTab, scroll_column
 from wolfrat.mod_entrance_panel import ModEntrancePanel
 from wolfrat.mod_ranks import ModRoster
@@ -4305,6 +4306,15 @@ class SpreeTab(QWidget):
             "Lead change! {team} hold {owned} of {total}",
             "{team} push ahead - {owned} zones to their name",
         ]
+        # CTF / Flagball / TDM / DM lead lines (2.8.1, Dale 2026-09-23)
+        self._score_lead_enabled = {m: True for m in score_lead.MODES}
+        self._score_lead_lines = {m: list(v) for m, v in score_lead.DEFAULT_LINES.items()}
+        self._score_first_enabled = True
+        self._score_first_lines = dict(score_lead.DEFAULT_FIRST)
+        self._lead_watch = score_lead.LeadWatch(time.time)
+        self._lead_rng = random.Random()
+        self.score_mode_source = lambda: None     # vote_rules family, wired by the main window
+        self.team_caps_source = lambda: None      # {1: caps, 2: caps} on CTF / Flagball
         self._spree_table_loading = False
         self._player_stats = {}
         self._load_config()
@@ -4330,6 +4340,17 @@ class SpreeTab(QWidget):
                     lines = [str(x).strip() for x in (cfg.get('lead_lines') or []) if str(x).strip()]
                     if lines:
                         self._lead_lines = lines
+                    for mode, on in (cfg.get('score_lead_enabled') or {}).items():
+                        if mode in self._score_lead_enabled:
+                            self._score_lead_enabled[mode] = bool(on)
+                    for mode, mode_lines in (cfg.get('score_lead_lines') or {}).items():
+                        mode_lines = [str(x).strip() for x in (mode_lines or []) if str(x).strip()]
+                        if mode in self._score_lead_lines and mode_lines:
+                            self._score_lead_lines[mode] = mode_lines
+                    self._score_first_enabled = bool(cfg.get('score_first_enabled', True))
+                    for mode, line in (cfg.get('score_first_lines') or {}).items():
+                        if mode in self._score_first_lines and str(line).strip():
+                            self._score_first_lines[mode] = str(line).strip()
                     raw_thresholds = cfg.get('spree_thresholds', None)
                     if raw_thresholds is not None:
                         self._spree_thresholds = {int(k): v for k, v in raw_thresholds.items()}
@@ -4356,6 +4377,10 @@ class SpreeTab(QWidget):
                 'zone_line_team': self._zone_line_team,
                 'lead_enabled': self._lead_enabled,
                 'lead_lines': self._lead_lines,
+                'score_lead_enabled': self._score_lead_enabled,
+                'score_lead_lines': self._score_lead_lines,
+                'score_first_enabled': self._score_first_enabled,
+                'score_first_lines': self._score_first_lines,
                 'spree_thresholds': {str(k): v for k, v in sorted(self._spree_thresholds.items())}
             }
             with open(self._config_path(), 'w') as f:
@@ -4389,13 +4414,14 @@ class SpreeTab(QWidget):
         self.first_blood_checkbox.stateChanged.connect(self._toggle_first_blood)
         spree_layout.addWidget(self.first_blood_checkbox)
 
-        lead_page = QWidget()
-        lead_layout = QVBoxLayout(lead_page)
+        # Scrolls when the window is short: AAS + four more modes do not fit 1024x768.
+        lead_page, lead_layout = scroll_column()
         self.pages.addTab(lead_page, "Lead announcer")
         lead_intro = QLabel(
-            "Advance and Secure only. WolfRAT reads every zone's owner from the server running on "
-            "this PC (the same way the Bans tab reads IPs), so it can say who took the first zone "
-            "and when the lead changes hands. Nothing here works with the server on another machine.")
+            "Advance and Secure: WolfRAT reads every zone's owner from the server running on this PC "
+            "(the same way the Bans tab reads IPs), so it can say who took the first zone and when the "
+            "lead changes hands. Capture the Flag and Flagball captures are read the same way; Team "
+            "Deathmatch and Deathmatch use the kills in the player list, so they work from any PC.")
         lead_intro.setWordWrap(True); lead_intro.setStyleSheet("color: #a89830; font-size: 9pt; padding: 4px;")
         lead_layout.addWidget(lead_intro)
         capture_group = QGroupBox("First zone of the map")
@@ -4438,6 +4464,7 @@ class SpreeTab(QWidget):
         lead_hint.setWordWrap(True); lead_hint.setStyleSheet("font-size: 9pt; color: #a89830;")
         lead_box.addWidget(lead_hint)
         lead_layout.addWidget(lead_group)
+        lead_layout.addWidget(self._build_score_lead_group())
         lead_layout.addStretch(1)
 
         spree_layout.addWidget(QLabel("Streak Thresholds (kill count → announcement message):"))
@@ -4563,6 +4590,7 @@ class SpreeTab(QWidget):
             self._first_blood_pending = False
             for stat in self._player_stats.values():
                 stat['streak'] = 0
+            self._lead_watch.reset()
             wire_log(f"[SPREE] Map changed to {current} - first blood + streaks reset")
 
     def _toggle_zone_capture(self, state):
@@ -4583,6 +4611,121 @@ class SpreeTab(QWidget):
         if lines:
             self._lead_lines = lines
             self._save_config()
+
+    def _build_score_lead_group(self):
+        """CTF / Flagball / TDM / DM lead lines (2.8.1)."""
+        group = QGroupBox("Capture the Flag, Flagball, Team Deathmatch and Deathmatch")
+        box = QVBoxLayout(group)
+        modes_row = QHBoxLayout()
+        modes_row.addWidget(QLabel("Announce lead changes in:"))
+        self._score_mode_boxes = {}
+        for mode in score_lead.MODES:
+            cb = QCheckBox(score_lead.LABELS[mode])
+            cb.setChecked(self._score_lead_enabled[mode])
+            cb.toggled.connect(lambda on, m=mode: self._score_mode_toggled(m, on))
+            modes_row.addWidget(cb)
+            self._score_mode_boxes[mode] = cb
+        modes_row.addStretch()
+        box.addLayout(modes_row)
+
+        first_row = QHBoxLayout()
+        self.score_first_checkbox = QCheckBox("First flag / goal of each map:")
+        self.score_first_checkbox.setChecked(self._score_first_enabled)
+        self.score_first_checkbox.toggled.connect(self._score_first_toggled)
+        first_row.addWidget(self.score_first_checkbox)
+        self._score_first_edits = {}
+        for mode in score_lead.CAPS_MODES:
+            edit = QLineEdit(self._score_first_lines[mode])
+            edit.setMaxLength(62)
+            edit.editingFinished.connect(self._score_lines_changed)
+            first_row.addWidget(edit, 1)
+            self._score_first_edits[mode] = edit
+        box.addLayout(first_row)
+
+        lines_row = QHBoxLayout()
+        lines_row.addWidget(QLabel("Lead lines for:"))
+        self.score_lines_mode = QComboBox()
+        for mode in score_lead.MODES:
+            self.score_lines_mode.addItem(score_lead.LABELS[mode], mode)
+        self.score_lines_mode.currentIndexChanged.connect(self._show_score_lines)
+        lines_row.addWidget(self.score_lines_mode)
+        lines_row.addStretch()
+        box.addLayout(lines_row)
+        self.score_lines_edit = QPlainTextEdit()
+        self.score_lines_edit.setMinimumHeight(70)
+        self.score_lines_edit.textChanged.connect(self._score_lines_changed)
+        box.addWidget(self.score_lines_edit)
+        self._show_score_lines()
+        hint = QLabel("One line per row, picked at random. {team} = Joint Ops / Rebels ({player} in "
+                      "Deathmatch), {score} = the leader's score, {other} = the next best. Lines longer "
+                      "than 62 characters once filled in are skipped. A tie is nobody's lead. Team "
+                      "Deathmatch and Deathmatch wait until a new leader has held it for 30 seconds "
+                      "and say at most one lead line a minute.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("font-size: 9pt; color: #a89830;")
+        box.addWidget(hint)
+        return group
+
+    def _score_mode_toggled(self, mode, on):
+        self._score_lead_enabled[mode] = bool(on)
+        self._save_config()
+
+    def _score_first_toggled(self, on):
+        self._score_first_enabled = bool(on)
+        self._save_config()
+
+    def _show_score_lines(self, *_args):
+        mode = self.score_lines_mode.currentData()
+        self._showing_score_mode = None                 # don't save while refilling the box
+        self.score_lines_edit.setPlainText("\n".join(self._score_lead_lines[mode]))
+        self._showing_score_mode = mode
+
+    def _score_lines_changed(self):
+        mode = getattr(self, '_showing_score_mode', None)
+        if mode is not None:
+            lines = [row.strip() for row in self.score_lines_edit.toPlainText().splitlines() if row.strip()]
+            if lines:
+                self._score_lead_lines[mode] = lines
+        for m, edit in getattr(self, '_score_first_edits', {}).items():
+            self._score_first_lines[m] = edit.text().strip() or score_lead.DEFAULT_FIRST[m]
+        self._save_config()
+
+    def score_tick(self, players):
+        """Every player poll: CTF / Flagball / TDM / DM lead changes."""
+        try:
+            mode = self.score_mode_source()
+        except Exception:
+            mode = None
+        if mode not in score_lead.MODES:
+            return
+        if mode in score_lead.CAPS_MODES:
+            try:
+                scores = self.team_caps_source()
+            except Exception:
+                scores = None
+            if scores is None:
+                return                                  # server not on this PC
+        elif mode == score_lead.TDM:
+            scores = score_lead.team_kills(players)
+        else:
+            scores = score_lead.player_kills(players)
+        events = self._lead_watch.update(mode, scores)
+        for event in score_lead.announce(events, self._score_first_enabled,
+                                         self._score_lead_enabled.get(mode, False)):
+            if isinstance(event, score_lead.FirstScore):
+                templates = [self._score_first_lines.get(mode, "")]
+            else:
+                templates = self._score_lead_lines.get(mode, [])
+            msg = score_lead.pick_line(templates, event, mode, self._lead_rng)
+            if not msg:
+                continue
+            submit_admin(
+                self,
+                lambda message=msg: self.server.send_chat(message),
+                lambda _result, message=msg: self.log_text.append(
+                    f"[{time.strftime('%H:%M:%S')}] LEAD: {message}"),
+                "Announce lead change",
+            )
 
     def announce_zone_capture(self, event):
         """From the Bans tab's zone watch: the first capture of a map, and lead changes."""
@@ -7882,7 +8025,7 @@ class DownloadWorker(QThread):
 
 
 class MainWindow(QMainWindow):
-    """WolfRAT 2.8.0 Main Window."""
+    """WolfRAT 2.8.1 Main Window."""
 
     def __init__(self, runtime: DesktopRuntime | None = None):
         super().__init__()
@@ -7901,7 +8044,7 @@ class MainWindow(QMainWindow):
         self._sync_led_timer = QTimer(self)
         self._sync_led_timer.setSingleShot(True)
         self._sync_led_timer.timeout.connect(self._clear_sync_led)
-        self.setWindowTitle("WolfRAT 2.8.0 - Joint Operations Server Admin")
+        self.setWindowTitle("WolfRAT 2.8.1 - Joint Operations Server Admin")
 
         # Set Window Icon
         icon_path = os.path.join(os.path.dirname(__file__), 'icon.ico')
@@ -7975,7 +8118,7 @@ class MainWindow(QMainWindow):
         self.signals.connected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.connected_signal.connect(lambda: sounds.play("connect"))
         self.signals.disconnected_signal.connect(lambda: self.set_connected(False, 'Disconnected'))
-        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.8.0 - Joint Operations Server Admin"))
+        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.8.1 - Joint Operations Server Admin"))
         self.signals.disconnected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.disconnected_signal.connect(lambda: self.server_tab.handle_disconnect_ui())
         self.signals.disconnected_signal.connect(lambda: self.mods_tab.entrance_panel.on_disconnected())
@@ -7987,9 +8130,9 @@ class MainWindow(QMainWindow):
     def _update_title(self, server_name=""):
         """Update window title with server name when connected."""
         if server_name:
-            self.setWindowTitle(f"WolfRAT 2.8.0 \u2014 {server_name}")
+            self.setWindowTitle(f"WolfRAT 2.8.1 \u2014 {server_name}")
         else:
-            self.setWindowTitle("WolfRAT 2.8.0 - Joint Operations Server Admin")
+            self.setWindowTitle("WolfRAT 2.8.1 - Joint Operations Server Admin")
 
     def _build_ui(self):
         central = QWidget()
@@ -7997,7 +8140,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(central)
 
         # Header
-        header = QLabel("WolfRAT 2.8.0")
+        header = QLabel("WolfRAT 2.8.1")
         header.setStyleSheet("font-size: 22pt; font-weight: bold; color: #e8c840; padding: 12px; letter-spacing: 4px;")
         header.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(header)
@@ -8093,6 +8236,13 @@ class MainWindow(QMainWindow):
         self.map_voting_tab.game_type_now = self.bans_tab.game_type_now
         self.map_voting_tab.caps_to_go = self.bans_tab.caps_to_go_now
         self.map_voting_tab.coop_ai_left = self.bans_tab.ai_left_now
+
+        def _score_mode():
+            family = vote_rules.family_from_game_type(self.bans_tab.game_type_now())
+            return family or vote_rules.game_mode(self.map_voting_tab._current_map)
+
+        self.spree_tab.score_mode_source = _score_mode
+        self.spree_tab.team_caps_source = self.bans_tab.team_caps_now
         self.chatbot_tab.coop_guard.game_type_source = self.bans_tab.game_type_now
 
         def _balance_move(player, _to_team):
@@ -8141,6 +8291,7 @@ class MainWindow(QMainWindow):
         self.signals.chat_signal.connect(self.map_voting_tab.on_chat)
         self.signals.players_signal.connect(self.bans_tab.on_players)
         self.signals.players_signal.connect(self.auto_balance_panel.on_players)
+        self.signals.players_signal.connect(self.spree_tab.score_tick)
         self.signals.chat_signal.connect(self.auto_balance_panel.on_chat)
         self.signals.settings_signal.connect(self.auto_balance_panel.on_settings)
         self.signals.connected_signal.connect(self.auto_balance_panel.reset_chat)
@@ -8231,7 +8382,7 @@ class MainWindow(QMainWindow):
 
         status_bar.addSpacing(10)
 
-        ver_label = QLabel("v2.8.0 · Built by BadgerLove · FMJ Squad")
+        ver_label = QLabel("v2.8.1 · Built by BadgerLove · FMJ Squad")
         ver_label.setStyleSheet("font-size: 9pt; color: #444;")
         status_bar.addWidget(ver_label)
 
@@ -8287,7 +8438,7 @@ class MainWindow(QMainWindow):
     # ---- Auto-updater ---------------------------------------------------
 
     _VERSION_URL = "https://fmj-squad.com/version.json"
-    _CURRENT_VERSION = "2.8.0"
+    _CURRENT_VERSION = "2.8.1"
 
     @staticmethod
     def _is_newer(latest: str, current: str) -> bool:
@@ -8531,7 +8682,7 @@ def start_desktop(
 
     runtime = runtime or DesktopRuntime.production()
     app.setStyleSheet(DARK_STYLE)
-    app.setApplicationName("WolfRAT 2.8.0")
+    app.setApplicationName("WolfRAT 2.8.1")
     sounds.set_enabled(runtime.audio_enabled)
     if runtime.audio_enabled:
         sounds.initialize()
@@ -8640,7 +8791,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
         print(f"WolfRAT startup error: {error}")
         return 2
     runtime = runtime or launch.runtime
-    wire_log("=== WolfRAT 2.8.0 STARTED ===")
+    wire_log("=== WolfRAT 2.8.1 STARTED ===")
 
     # Catch-all exception handler for debugging
     import traceback
@@ -8693,7 +8844,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
 
             bstats.bstats_start(
                 "wolfrat",
-                "2.8.0",
+                "2.8.1",
                 data_dir=runtime.data_dir,
             )
         except Exception:

@@ -155,6 +155,7 @@ class BansTab(QWidget):
         self.game_type: Optional[int] = None              # g_GameType, None when not on this PC
         self.objectives: Optional[tuple] = None           # (done, total) on a co-op map
         self.caps_to_go: Optional[int] = None             # CTF / Flagball: fewest a team still needs
+        self.team_caps: Optional[dict] = None             # CTF / Flagball: {1: caps, 2: caps}
         self.ai_left: Optional[tuple] = None              # co-op: (AI alive, AI at mission start)
         self._zone_watch = zone_rules.ZoneWatch()
         self.zone_capture: Optional[Callable] = None      # set by the main window (Sprees tab)
@@ -421,6 +422,10 @@ class BansTab(QWidget):
     def ai_left_now(self) -> Optional[tuple]:
         """(alive, at start) co-op AI at the last poll, None off co-op."""
         return self.ai_left
+
+    def team_caps_now(self) -> Optional[dict]:
+        """Each team's CTF / Flagball captures at the last poll, None otherwise."""
+        return self.team_caps
 
     def caps_to_go_now(self) -> Optional[int]:
         """CTF flags / Flagball goals the closest team still needs, at the last poll."""
@@ -698,6 +703,9 @@ class BansTab(QWidget):
         self.ai_left = (self._reader.read_ai_left()
                         if coop_guard.is_coop(self.game_type) and hasattr(self._reader, "read_ai_left")
                         else None)
+        self.team_caps = (self._reader.read_team_caps(self.game_type)
+                          if self.game_type is not None and hasattr(self._reader, "read_team_caps")
+                          else None)
         self.caps_to_go = (self._reader.read_caps_to_go(self.game_type)
                            if self.game_type is not None and hasattr(self._reader, "read_caps_to_go")
                            else None)
