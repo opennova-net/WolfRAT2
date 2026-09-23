@@ -1,5 +1,5 @@
 """
-WolfRAT 2.8.1 - Modern Joint Operations Server Admin Tool
+WolfRAT 2.8.2 - Modern Joint Operations Server Admin Tool
 Replaces the original WolfRAT v0.95 (2005, MFC70)
 """
 
@@ -23,6 +23,7 @@ from wolfrat import vote_rules
 from wolfrat import weather
 from wolfrat import coop_guard
 from wolfrat import score_lead
+from wolfrat import whisper
 from wolfrat.weather_tab import WeatherTab, scroll_column
 from wolfrat.mod_entrance_panel import ModEntrancePanel
 from wolfrat.mod_ranks import ModRoster
@@ -273,7 +274,7 @@ QLineEdit:focus, QSpinBox:focus {
 QLineEdit::placeholder {
     color: #4a4a10;
 }
-QTextEdit {
+QTextEdit, QPlainTextEdit {
     background-color: #050500;
     color: #a89830;
     border: 1px solid #1a1a00;
@@ -5106,6 +5107,14 @@ class ModsTab(QWidget):
                 f"[{time.strftime('%H:%M:%S')}] ERROR: {message}"
             )
 
+    def _reply_privately(self, sender, kind, public_text, context):
+        """Whisper when the server can (whisper.py); public chat otherwise."""
+        whisperer = getattr(self, 'whisperer', None)
+        if sender and sender != 'web_admin' and whisperer is not None and whisperer.whisper_to(sender, kind):
+            wire_log(f"[MODS] whispered '{kind}' reply to {sender}")
+            return None
+        return self._send_mod_chat(public_text, context)
+
     def _send_mod_chat(self, message, context="Send moderator chat"):
         return submit_admin(
             self,
@@ -5867,8 +5876,8 @@ class ModsTab(QWidget):
         # If it's a ! command but not recognized, tell them
         valid_commands = {'!warn', '!kick', '!ban', '!swap', '!kill', '!next', '!map', '!add', '!remove', '!1', '!2', '!3', '!startvote', '!mixteams', '!balanceteams', '!time', '!gametime', *weather.CHAT_COMMANDS}
         if cmd not in valid_commands:
-            self._send_mod_chat(
-                f"Unknown command: {cmd}", "Send unknown command response"
+            self._reply_privately(
+                sender, whisper.UNKNOWN, f"Unknown command: {cmd}", "Send unknown command response"
             )
             return
 
@@ -5896,8 +5905,8 @@ class ModsTab(QWidget):
             self.mod_log.addItem(
                 f"[{now}] {sender} ({rank}) tried {cmd} - not allowed for that rank"
             )
-            self._send_mod_chat(
-                f"{cmd} is not allowed for {rank}.", "Send rank refusal"
+            self._reply_privately(
+                sender, whisper.DENIED, f"{cmd} is not allowed for {rank}.", "Send rank refusal"
             )
             return
 
@@ -8025,7 +8034,7 @@ class DownloadWorker(QThread):
 
 
 class MainWindow(QMainWindow):
-    """WolfRAT 2.8.1 Main Window."""
+    """WolfRAT 2.8.2 Main Window."""
 
     def __init__(self, runtime: DesktopRuntime | None = None):
         super().__init__()
@@ -8044,7 +8053,7 @@ class MainWindow(QMainWindow):
         self._sync_led_timer = QTimer(self)
         self._sync_led_timer.setSingleShot(True)
         self._sync_led_timer.timeout.connect(self._clear_sync_led)
-        self.setWindowTitle("WolfRAT 2.8.1 - Joint Operations Server Admin")
+        self.setWindowTitle("WolfRAT 2.8.2 - Joint Operations Server Admin")
 
         # Set Window Icon
         icon_path = os.path.join(os.path.dirname(__file__), 'icon.ico')
@@ -8118,7 +8127,7 @@ class MainWindow(QMainWindow):
         self.signals.connected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.connected_signal.connect(lambda: sounds.play("connect"))
         self.signals.disconnected_signal.connect(lambda: self.set_connected(False, 'Disconnected'))
-        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.8.1 - Joint Operations Server Admin"))
+        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.8.2 - Joint Operations Server Admin"))
         self.signals.disconnected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.disconnected_signal.connect(lambda: self.server_tab.handle_disconnect_ui())
         self.signals.disconnected_signal.connect(lambda: self.mods_tab.entrance_panel.on_disconnected())
@@ -8127,12 +8136,18 @@ class MainWindow(QMainWindow):
 
         # Status bar
 
+    def _whisper_tick(self):
+        try:
+            self.whisperer.tick()
+        except Exception as exc:                       # never let the timer die
+            wire_log(f"[WHISPER] tick failed: {exc}")
+
     def _update_title(self, server_name=""):
         """Update window title with server name when connected."""
         if server_name:
-            self.setWindowTitle(f"WolfRAT 2.8.1 \u2014 {server_name}")
+            self.setWindowTitle(f"WolfRAT 2.8.2 \u2014 {server_name}")
         else:
-            self.setWindowTitle("WolfRAT 2.8.1 - Joint Operations Server Admin")
+            self.setWindowTitle("WolfRAT 2.8.2 - Joint Operations Server Admin")
 
     def _build_ui(self):
         central = QWidget()
@@ -8140,7 +8155,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(central)
 
         # Header
-        header = QLabel("WolfRAT 2.8.1")
+        header = QLabel("WolfRAT 2.8.2")
         header.setStyleSheet("font-size: 22pt; font-weight: bold; color: #e8c840; padding: 12px; letter-spacing: 4px;")
         header.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(header)
@@ -8241,6 +8256,12 @@ class MainWindow(QMainWindow):
             family = vote_rules.family_from_game_type(self.bans_tab.game_type_now())
             return family or vote_rules.game_mode(self.map_voting_tab._current_map)
 
+        # Private replies ride on the Weather tab's writable handle (whisper.py).
+        self.whisperer = whisper.Whisperer(self.weather_tab.writable_memory)
+        self.mods_tab.whisperer = self.whisperer
+        self._whisper_timer = QTimer(self)
+        self._whisper_timer.timeout.connect(self._whisper_tick)
+        self._whisper_timer.start(250)
         self.spree_tab.score_mode_source = _score_mode
         self.spree_tab.team_caps_source = self.bans_tab.team_caps_now
         self.chatbot_tab.coop_guard.game_type_source = self.bans_tab.game_type_now
@@ -8382,7 +8403,7 @@ class MainWindow(QMainWindow):
 
         status_bar.addSpacing(10)
 
-        ver_label = QLabel("v2.8.1 · Built by BadgerLove · FMJ Squad")
+        ver_label = QLabel("v2.8.2 · Built by BadgerLove · FMJ Squad")
         ver_label.setStyleSheet("font-size: 9pt; color: #444;")
         status_bar.addWidget(ver_label)
 
@@ -8438,7 +8459,7 @@ class MainWindow(QMainWindow):
     # ---- Auto-updater ---------------------------------------------------
 
     _VERSION_URL = "https://fmj-squad.com/version.json"
-    _CURRENT_VERSION = "2.8.1"
+    _CURRENT_VERSION = "2.8.2"
 
     @staticmethod
     def _is_newer(latest: str, current: str) -> bool:
@@ -8682,7 +8703,7 @@ def start_desktop(
 
     runtime = runtime or DesktopRuntime.production()
     app.setStyleSheet(DARK_STYLE)
-    app.setApplicationName("WolfRAT 2.8.1")
+    app.setApplicationName("WolfRAT 2.8.2")
     sounds.set_enabled(runtime.audio_enabled)
     if runtime.audio_enabled:
         sounds.initialize()
@@ -8791,7 +8812,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
         print(f"WolfRAT startup error: {error}")
         return 2
     runtime = runtime or launch.runtime
-    wire_log("=== WolfRAT 2.8.1 STARTED ===")
+    wire_log("=== WolfRAT 2.8.2 STARTED ===")
 
     # Catch-all exception handler for debugging
     import traceback
@@ -8844,7 +8865,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
 
             bstats.bstats_start(
                 "wolfrat",
-                "2.8.1",
+                "2.8.2",
                 data_dir=runtime.data_dir,
             )
         except Exception:

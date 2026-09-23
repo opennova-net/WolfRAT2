@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
 )
 
 from wolfrat import weather
+from wolfrat import whisper
 from wolfrat import server_link
 from wolfrat import weather_dynamic
 from wolfrat.weather_dynamic_page import DynamicPage
@@ -462,6 +463,8 @@ class WeatherTab(QWidget):
         if not self._settings.get("linked") and folder and weather.addon_installed(folder):
             self._settings["linked"] = True       # installed from this tab before linking existed
             self._save()
+        if self._settings.get("linked") and self._writable:
+            self._ensure_whisper_block(folder)
         self.status_lbl.setText(f"🟢 Game server found on this PC (process {self._memory.pid}).")
         kind = "snow" if reading.snow else "rain"
         self.sky_lbl.setText(
@@ -691,6 +694,25 @@ class WeatherTab(QWidget):
         self._poll()
 
     # ------------------------------------------------------ server link
+    def writable_memory(self):
+        """The writable handle to the server, if this tab holds one (the
+        private replies borrow it - one owner, see whisper.py)."""
+        return self._memory if (self._writable and self._controller is not None) else None
+
+    def _ensure_whisper_block(self, folder: str) -> None:
+        """Private replies need their few lines in server.wac; put them in once
+        per session for a linked server (they switch on at the next map)."""
+        if not folder or getattr(self, "_whisper_checked", None) == folder:
+            return
+        self._whisper_checked = folder
+        try:
+            result = whisper.install(folder)
+        except Exception as exc:                       # server_wac.ServerWacError, OSError
+            wire_log(f"[WHISPER] could not add the private-reply lines to server.wac: {exc}")
+            return
+        if result != "unchanged":
+            wire_log(f"[WHISPER] private replies {result} in {folder}\server.wac - live from the next map")
+
     def link_state(self) -> server_link.LinkState:
         """What the Server tab's 'Link WolfRAT to the server' box shows."""
         folder = self._server_dir()
@@ -732,6 +754,7 @@ class WeatherTab(QWidget):
                 return False, str(exc)
             self._settings["linked"] = True
             self._save()
+            self._ensure_whisper_block(folder)
             if result == "installed":
                 self.log(f"Linked to the server - script added to server.wac in {folder}.")
                 return True, (f"Linked. The server script is in {folder} and switches on at "
