@@ -94,6 +94,7 @@ class Verdict:
     kind: str = ""             # provider's word for it: VPN, TOR, Hosting, ...
     country: str = ""          # ISO code
     country_name: str = ""
+    region: str = ""           # Scotland, Texas, ... (not in caches from before 2.8.3)
     provider: str = ""         # ISP / org
     source: str = ""
     error: str = ""            # lookup failed - never act on an error
@@ -123,7 +124,7 @@ class Verdict:
             return None
         for name in ("proxy", "hosting"):
             setattr(v, name, bool(data.get(name)))
-        for name in ("kind", "country", "country_name", "provider", "source", "error"):
+        for name in ("kind", "country", "country_name", "region", "provider", "source", "error"):
             setattr(v, name, str(data.get(name) or ""))
         return v
 
@@ -176,7 +177,7 @@ def _get_json(url: str) -> dict:
 def lookup_ipapi(ip: str, api_key: str = "", fetch: Callable[[str], dict] = _get_json) -> Verdict:
     now = time.time()
     url = ("http://ip-api.com/json/" + urllib.parse.quote(ip)
-           + "?fields=status,message,country,countryCode,isp,org,proxy,hosting")
+           + "?fields=status,message,country,countryCode,regionName,isp,org,proxy,hosting")
     try:
         data = fetch(url)
     except Exception as exc:
@@ -185,7 +186,8 @@ def lookup_ipapi(ip: str, api_key: str = "", fetch: Callable[[str], dict] = _get
         return Verdict(ip, now, source="ip-api", error=str(data.get("message") or "no answer"))
     return Verdict(ip, now, proxy=bool(data.get("proxy")), hosting=bool(data.get("hosting")),
                    kind="VPN/proxy" if data.get("proxy") else "", country=str(data.get("countryCode") or ""),
-                   country_name=str(data.get("country") or ""), provider=str(data.get("isp") or data.get("org") or ""),
+                   country_name=str(data.get("country") or ""), region=str(data.get("regionName") or ""),
+                   provider=str(data.get("isp") or data.get("org") or ""),
                    source="ip-api")
 
 
@@ -209,7 +211,7 @@ def lookup_proxycheck(ip: str, api_key: str = "", fetch: Callable[[str], dict] =
     hosting = kind.lower() in ("hosting", "business") and not is_proxy and kind.lower() == "hosting"
     return Verdict(ip, now, proxy=is_proxy, hosting=hosting, kind=kind if is_proxy else "",
                    country=str(row.get("isocode") or ""), country_name=str(row.get("country") or ""),
-                   provider=str(row.get("provider") or ""), source="proxycheck")
+                   region=str(row.get("region") or ""), provider=str(row.get("provider") or ""), source="proxycheck")
 
 
 LOOKUPS = {PROVIDER_IPAPI: lookup_ipapi, PROVIDER_PROXYCHECK: lookup_proxycheck}

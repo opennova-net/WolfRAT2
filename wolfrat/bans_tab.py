@@ -439,6 +439,31 @@ class BansTab(QWidget):
         """Game type read at the last poll (coop_guard), or None."""
         return self.game_type
 
+    def _ip_of(self, name: str) -> str:
+        ip = self._ips.get(name, "")
+        if not ip:
+            wanted = (name or "").strip().lower()
+            ip = next((v for k, v in self._ips.items() if str(k).strip().lower() == wanted), "")
+        return ip or ""
+
+    def connection_for(self, name: str) -> tuple:
+        """(ip, cached Verdict or None) for someone online - never looks anything up."""
+        ip = self._ip_of(name)
+        return ip, (self.verdicts.get(ip, self._clock()) if ip else None)
+
+    def look_up(self, name: str) -> None:
+        """Queue one connection check for this player on the shared checker, only
+        if nothing is cached or already queued (ip-api's 45/min is precious)."""
+        ip = self._ip_of(name)
+        if ip and not ip_checks.is_private(ip) and self.verdicts.get(ip, self._clock()) is None:
+            self._checker.submit(ip, self.checks.provider, self.checks.api_key)
+
+    def returning_player(self, name: str, min_age: float = 600) -> bool:
+        """True when the player history already knew this name before this visit -
+        a guard so a fresh welcome list doesn't treat regulars as first-timers."""
+        rec = self.history.get(name)
+        return rec is not None and (rec.visits >= 2 or self._clock() - rec.first_seen > min_age)
+
     def zones_left(self):
         """(leading team, zones it still needs) on an AAS map, else None."""
         return zone_rules.zones_left(self.zones)

@@ -24,7 +24,7 @@ def test_ipapi_parses_success_and_failure():
 def test_ipapi_url_asks_for_exactly_the_fields_we_read():
     seen = {}
     ic.lookup_ipapi("8.8.8.8", fetch=lambda url: seen.setdefault("url", url) and {"status": "success"})
-    assert seen["url"] == "http://ip-api.com/json/8.8.8.8?fields=status,message,country,countryCode,isp,org,proxy,hosting"
+    assert seen["url"] == "http://ip-api.com/json/8.8.8.8?fields=status,message,country,countryCode,regionName,isp,org,proxy,hosting"
 
 
 def test_proxycheck_parses_type_and_key_goes_in_the_query():

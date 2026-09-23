@@ -1,5 +1,5 @@
 """
-WolfRAT 2.8.2 - Modern Joint Operations Server Admin Tool
+WolfRAT 2.8.3 - Modern Joint Operations Server Admin Tool
 Replaces the original WolfRAT v0.95 (2005, MFC70)
 """
 
@@ -24,6 +24,7 @@ from wolfrat import weather
 from wolfrat import coop_guard
 from wolfrat import score_lead
 from wolfrat import whisper
+from wolfrat import join_country
 from wolfrat.weather_tab import WeatherTab, scroll_column
 from wolfrat.mod_entrance_panel import ModEntrancePanel
 from wolfrat.mod_ranks import ModRoster
@@ -3974,7 +3975,21 @@ class MessagesTab(QWidget):
         self._player_stats = {}
         self._recurring_interval_idx = 2
         self._recurring_running = False
+        self._country_enabled = False
+        self._country_message = join_country.DEFAULT_TEMPLATE
+        self._country_vpn_enabled = False
+        self._country_vpn_message = join_country.DEFAULT_VPN_TEMPLATE
+        self.bans_tab = None      # set by the main window; the country line reads its checks
+        self.country = join_country.CountryAnnouncer(
+            connection=lambda name: self.bans_tab.connection_for(name) if self.bans_tab else ("", None),
+            request=lambda name: self.bans_tab.look_up(name) if self.bans_tab else None,
+            say=self._send_country,
+            log=lambda text: self.log_text.append(f"[{time.strftime('%H:%M:%S')}] {text}"),
+        )
+        self._country_timer = QTimer(self)
+        self._country_timer.timeout.connect(self._country_tick)
         self._load_config()
+        self._apply_country_settings()
         self._build_ui()
         # Auto-start recurring messages if they were running
         if self._recurring_running and self._recurring_messages:
@@ -3996,6 +4011,10 @@ class MessagesTab(QWidget):
                     self._kd_enabled = cfg.get('kd_enabled', True)
                     self._recurring_interval_idx = cfg.get('recurring_interval_idx', 2)
                     self._recurring_running = cfg.get('recurring_running', False)
+                    self._country_enabled = bool(cfg.get('country_enabled', False))
+                    self._country_message = cfg.get('country_msg') or self._country_message
+                    self._country_vpn_enabled = bool(cfg.get('country_vpn_enabled', False))
+                    self._country_vpn_message = cfg.get('country_vpn_msg') or self._country_vpn_message
         except Exception:
             pass
 
@@ -4013,6 +4032,10 @@ class MessagesTab(QWidget):
                 'kd_enabled': self._kd_enabled,
                 'recurring_interval_idx': interval_idx,
                 'recurring_running': is_running,
+                'country_enabled': self._country_enabled,
+                'country_msg': self._country_message,
+                'country_vpn_enabled': self._country_vpn_enabled,
+                'country_vpn_msg': self._country_vpn_message,
             }
             with open(self._config_path(), 'w') as f:
                 json.dump(cfg, f, indent=2)
@@ -4088,6 +4111,39 @@ class MessagesTab(QWidget):
         self.welcome_input.setMaxLength(CHAT_MAX_LEN)
         self.welcome_input.textChanged.connect(self._update_welcome_msg)
         welcome_layout.addWidget(self.welcome_input)
+
+        # Second line: where they're from, read from the Bans tab's connection checks.
+        self.country_cb = QCheckBox("Then say where they're from (a second line everyone sees)")
+        self.country_cb.setChecked(self._country_enabled)
+        self.country_cb.toggled.connect(self._country_edited)
+        welcome_layout.addWidget(self.country_cb)
+        self.country_input = QLineEdit(self._country_message)
+        self.country_input.setMaxLength(CHAT_MAX_LEN)
+        self.country_input.setPlaceholderText(join_country.DEFAULT_TEMPLATE)
+        self.country_input.textChanged.connect(self._country_edited)
+        welcome_layout.addWidget(self.country_input)
+        country_hint = QLabel(
+            "{place} = Scotland / England / Wales for UK players, \"Texas, United States\" "
+            "for others ({country} and {region} work too). Uses the Bans tab's connection "
+            "check, so no extra lookups; needs the game server on this PC."
+        )
+        country_hint.setWordWrap(True)
+        country_hint.setStyleSheet("color: #6a6a30; font-size: 8pt;")
+        welcome_layout.addWidget(country_hint)
+        self.country_vpn_cb = QCheckBox("VPN players: say this instead of keeping quiet")
+        self.country_vpn_cb.setChecked(self._country_vpn_enabled)
+        self.country_vpn_cb.toggled.connect(self._country_edited)
+        welcome_layout.addWidget(self.country_vpn_cb)
+        self.country_vpn_input = QLineEdit(self._country_vpn_message)
+        self.country_vpn_input.setMaxLength(CHAT_MAX_LEN)
+        self.country_vpn_input.setPlaceholderText(join_country.DEFAULT_VPN_TEMPLATE)
+        self.country_vpn_input.textChanged.connect(self._country_edited)
+        welcome_layout.addWidget(self.country_vpn_input)
+        self.country_last = QLabel("Last: nobody new yet.")
+        self.country_last.setWordWrap(True)
+        self.country_last.setStyleSheet("color: #e8c840;")
+        welcome_layout.addWidget(self.country_last)
+        self._country_edited()
 
         welcome_layout.addWidget(QLabel("Recently welcomed:"))
         self.welcome_log = QListWidget()
@@ -4227,15 +4283,64 @@ class MessagesTab(QWidget):
         super().showEvent(event)
         self._refresh_kd_hint()
 
+    def _country_edited(self, *_args):
+        if not hasattr(self, 'country_vpn_input'):
+            return
+        self._country_enabled = self.country_cb.isChecked()
+        self._country_message = self.country_input.text().strip() or join_country.DEFAULT_TEMPLATE
+        self._country_vpn_enabled = self.country_vpn_cb.isChecked()
+        self._country_vpn_message = self.country_vpn_input.text().strip() or join_country.DEFAULT_VPN_TEMPLATE
+        self.country_input.setEnabled(self._country_enabled)
+        self.country_vpn_cb.setEnabled(self._country_enabled)
+        self.country_vpn_input.setEnabled(self._country_enabled and self._country_vpn_enabled)
+        self._apply_country_settings()
+        if not self._country_enabled:
+            self.country.clear()
+        self._save_config()
+
+    def _apply_country_settings(self):
+        self.country.template = self._country_message
+        self.country.mention_vpn = self._country_vpn_enabled
+        self.country.vpn_template = self._country_vpn_message
+
+    def _country_tick(self):
+        self.country.tick()
+        if self.country.last and hasattr(self, 'country_last'):
+            self.country_last.setText(f"Last: {self.country.last}")
+        if not self.country.pending():
+            self._country_timer.stop()
+
+    def _send_country(self, text):
+        submit_admin(
+            self,
+            lambda: self.server.announce(text),
+            lambda _result: None,
+            "Send where-from line",
+        )
+
     def check_new_players(self, players):
         """Called when player list updates. Detects first-time joiners."""
         self._refresh_kd_hint()
-        if not self._welcome_enabled:
+        if not (self._welcome_enabled or self._country_enabled):
             return
         for p in players:
             name = p.get('name', '').strip()
             if name and name not in self._seen_players:
                 self._seen_players.add(name)
+                if self._country_enabled:
+                    if self.bans_tab is not None and self.bans_tab.returning_player(name):
+                        self.log_text.append(
+                            f"[{time.strftime('%H:%M:%S')}] Where from: {name} - skipped, "
+                            "the Bans tab has seen them before"
+                        )
+                    else:
+                        # After the welcome (40 s), so the two lines arrive in order.
+                        self.country.queue(name, 42 if self._welcome_enabled else 40)
+                        if not self._country_timer.isActive():
+                            self._country_timer.start(2000)
+                if not self._welcome_enabled:
+                    self._save_config()
+                    continue
                 msg = self._welcome_message.replace('{player}', name)
                 self.welcome_log.addItem(f"[{time.strftime('%H:%M:%S')}] {name} (sending in 40s)")
                 self.log_text.append(f"[{time.strftime('%H:%M:%S')}] WELCOME QUEUED: {name}")
@@ -8034,7 +8139,7 @@ class DownloadWorker(QThread):
 
 
 class MainWindow(QMainWindow):
-    """WolfRAT 2.8.2 Main Window."""
+    """WolfRAT 2.8.3 Main Window."""
 
     def __init__(self, runtime: DesktopRuntime | None = None):
         super().__init__()
@@ -8053,7 +8158,7 @@ class MainWindow(QMainWindow):
         self._sync_led_timer = QTimer(self)
         self._sync_led_timer.setSingleShot(True)
         self._sync_led_timer.timeout.connect(self._clear_sync_led)
-        self.setWindowTitle("WolfRAT 2.8.2 - Joint Operations Server Admin")
+        self.setWindowTitle("WolfRAT 2.8.3 - Joint Operations Server Admin")
 
         # Set Window Icon
         icon_path = os.path.join(os.path.dirname(__file__), 'icon.ico')
@@ -8127,7 +8232,7 @@ class MainWindow(QMainWindow):
         self.signals.connected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.connected_signal.connect(lambda: sounds.play("connect"))
         self.signals.disconnected_signal.connect(lambda: self.set_connected(False, 'Disconnected'))
-        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.8.2 - Joint Operations Server Admin"))
+        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.8.3 - Joint Operations Server Admin"))
         self.signals.disconnected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.disconnected_signal.connect(lambda: self.server_tab.handle_disconnect_ui())
         self.signals.disconnected_signal.connect(lambda: self.mods_tab.entrance_panel.on_disconnected())
@@ -8145,9 +8250,9 @@ class MainWindow(QMainWindow):
     def _update_title(self, server_name=""):
         """Update window title with server name when connected."""
         if server_name:
-            self.setWindowTitle(f"WolfRAT 2.8.2 \u2014 {server_name}")
+            self.setWindowTitle(f"WolfRAT 2.8.3 \u2014 {server_name}")
         else:
-            self.setWindowTitle("WolfRAT 2.8.2 - Joint Operations Server Admin")
+            self.setWindowTitle("WolfRAT 2.8.3 - Joint Operations Server Admin")
 
     def _build_ui(self):
         central = QWidget()
@@ -8155,7 +8260,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(central)
 
         # Header
-        header = QLabel("WolfRAT 2.8.2")
+        header = QLabel("WolfRAT 2.8.3")
         header.setStyleSheet("font-size: 22pt; font-weight: bold; color: #e8c840; padding: 12px; letter-spacing: 4px;")
         header.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(header)
@@ -8245,6 +8350,7 @@ class MainWindow(QMainWindow):
             mods=lambda: [name for name, _rank in self.mods_tab.roster.members()],
         )
         self.server._bans_tab = self.bans_tab  # Players tab + mods' !ban go through the list
+        self.messages_tab.bans_tab = self.bans_tab  # where-from line reads its connection checks
         self.bans_tab.zone_capture = self.spree_tab.announce_zone_capture
         self.map_voting_tab.zones_left = self.bans_tab.zones_left
         self.map_voting_tab.coop_objectives = self.bans_tab.objectives_now
@@ -8403,7 +8509,7 @@ class MainWindow(QMainWindow):
 
         status_bar.addSpacing(10)
 
-        ver_label = QLabel("v2.8.2 · Built by BadgerLove · FMJ Squad")
+        ver_label = QLabel("v2.8.3 · Built by BadgerLove · FMJ Squad")
         ver_label.setStyleSheet("font-size: 9pt; color: #444;")
         status_bar.addWidget(ver_label)
 
@@ -8459,7 +8565,7 @@ class MainWindow(QMainWindow):
     # ---- Auto-updater ---------------------------------------------------
 
     _VERSION_URL = "https://fmj-squad.com/version.json"
-    _CURRENT_VERSION = "2.8.2"
+    _CURRENT_VERSION = "2.8.3"
 
     @staticmethod
     def _is_newer(latest: str, current: str) -> bool:
@@ -8703,7 +8809,7 @@ def start_desktop(
 
     runtime = runtime or DesktopRuntime.production()
     app.setStyleSheet(DARK_STYLE)
-    app.setApplicationName("WolfRAT 2.8.2")
+    app.setApplicationName("WolfRAT 2.8.3")
     sounds.set_enabled(runtime.audio_enabled)
     if runtime.audio_enabled:
         sounds.initialize()
@@ -8812,7 +8918,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
         print(f"WolfRAT startup error: {error}")
         return 2
     runtime = runtime or launch.runtime
-    wire_log("=== WolfRAT 2.8.2 STARTED ===")
+    wire_log("=== WolfRAT 2.8.3 STARTED ===")
 
     # Catch-all exception handler for debugging
     import traceback
@@ -8865,7 +8971,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
 
             bstats.bstats_start(
                 "wolfrat",
-                "2.8.2",
+                "2.8.3",
                 data_dir=runtime.data_dir,
             )
         except Exception:
