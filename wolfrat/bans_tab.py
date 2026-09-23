@@ -30,6 +30,7 @@ from wolfrat import idle_rules
 from wolfrat import ip_checks
 from wolfrat import zone_rules
 from wolfrat.ban_rules import BanEntry, BanList, Enforcer, KIND_IP, KIND_NAME
+from wolfrat import coop_guard
 from wolfrat.jo_players import LocalServerPlayers, ips_by_name, positions_by_name
 from wolfrat.player_history import PlayerHistory, describe_when
 
@@ -151,6 +152,10 @@ class BansTab(QWidget):
         self._positions: dict = {}
         self._current_map: Optional[str] = None
         self.zones: list = []
+        self.game_type: Optional[int] = None              # g_GameType, None when not on this PC
+        self.objectives: Optional[tuple] = None           # (done, total) on a co-op map
+        self.caps_to_go: Optional[int] = None             # CTF / Flagball: fewest a team still needs
+        self.ai_left: Optional[tuple] = None              # co-op: (AI alive, AI at mission start)
         self._zone_watch = zone_rules.ZoneWatch()
         self.zone_capture: Optional[Callable] = None      # set by the main window (Sprees tab)
         self._loading_idle = True
@@ -413,6 +418,22 @@ class BansTab(QWidget):
             self.idle.reset()
             self._zone_watch.reset()
 
+    def ai_left_now(self) -> Optional[tuple]:
+        """(alive, at start) co-op AI at the last poll, None off co-op."""
+        return self.ai_left
+
+    def caps_to_go_now(self) -> Optional[int]:
+        """CTF flags / Flagball goals the closest team still needs, at the last poll."""
+        return self.caps_to_go
+
+    def objectives_now(self) -> Optional[tuple]:
+        """(done, total) co-op objectives at the last poll, None off co-op."""
+        return self.objectives
+
+    def game_type_now(self) -> Optional[int]:
+        """Game type read at the last poll (coop_guard), or None."""
+        return self.game_type
+
     def zones_left(self):
         """(leading team, zones it still needs) on an AAS map, else None."""
         return zone_rules.zones_left(self.zones)
@@ -669,6 +690,17 @@ class BansTab(QWidget):
         self._positions = positions_by_name(slots)
         self._online = list(players or [])
         self.zones = self._reader.read_zones() if hasattr(self._reader, "read_zones") else []
+        self.game_type = (self._reader.read_game_type()
+                          if hasattr(self._reader, "read_game_type") and self._reader.available else None)
+        self.objectives = (self._reader.read_objectives()
+                           if coop_guard.is_coop(self.game_type) and hasattr(self._reader, "read_objectives")
+                           else None)
+        self.ai_left = (self._reader.read_ai_left()
+                        if coop_guard.is_coop(self.game_type) and hasattr(self._reader, "read_ai_left")
+                        else None)
+        self.caps_to_go = (self._reader.read_caps_to_go(self.game_type)
+                           if self.game_type is not None and hasattr(self._reader, "read_caps_to_go")
+                           else None)
         self.status_lbl.setText(("IPs: " + self._reader.status) if not self._reader.available
                                 else f"IPs: reading from the server on this PC ({len(self._ips)} known)")
         self.history.observe(self._online, self._ips, now)

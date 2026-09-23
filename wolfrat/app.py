@@ -1,5 +1,5 @@
 """
-WolfRAT 2.7.0 - Modern Joint Operations Server Admin Tool
+WolfRAT 2.8.0 - Modern Joint Operations Server Admin Tool
 Replaces the original WolfRAT v0.95 (2005, MFC70)
 """
 
@@ -21,6 +21,7 @@ from PyQt6.QtGui import QColor, QIcon, QTextCursor
 
 from wolfrat import vote_rules
 from wolfrat import weather
+from wolfrat import coop_guard
 from wolfrat.weather_tab import WeatherTab, scroll_column
 from wolfrat.mod_entrance_panel import ModEntrancePanel
 from wolfrat.mod_ranks import ModRoster
@@ -38,6 +39,7 @@ from wolfrat.web_server import WolfWebServer, generate_token
 from wolfrat.runtime import DesktopRuntime, parse_launch_args
 from wolfrat.qt_dispatcher import CompletionPolicy, QtAdminDispatcher
 from wolfrat.bans_tab import BansTab
+from wolfrat.auto_balance_panel import AutoBalancePanel
 from wolfrat.server_link_panel import ServerLinkPanel
 from PyQt6.QtMultimedia import QSoundEffect
 from PyQt6.QtCore import QUrl
@@ -562,6 +564,12 @@ def _build_update_batch(dest_path, current_exe, log_path):
         f'start "" "{current_exe}"\n'
         'del "%~f0"\n'
     )
+
+
+def coop_swaps_blocked(server) -> bool:
+    """True on a co-op map while co-op protection is on (coop_guard)."""
+    blocked = getattr(server, 'swaps_blocked', None)
+    return bool(blocked and blocked())
 
 
 def submit_admin(
@@ -1362,6 +1370,7 @@ class PlayersTab(QWidget):
         balance_btn_layout.addWidget(refresh_btn)
 
         balance_layout.addLayout(balance_btn_layout)
+        self.balance_layout = balance_layout   # the main window adds the Automatic row
         balance_group.setLayout(balance_layout)
         layout.addWidget(balance_group)
 
@@ -1440,9 +1449,21 @@ class PlayersTab(QWidget):
             )
 
         elif action == "swap":
+            allow_coop = False
+            if coop_swaps_blocked(self.server):
+                answer = QMessageBox.question(
+                    self, "Co-op map",
+                    f"This is a co-op map - the other team is the bots.\n\n"
+                    f"Swap {display} to the other team anyway?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    return
+                allow_coop = True
             # PLAYER SWAPTEAM handles the team change directly
             self._admin_futures.submit(
-                lambda: self.server.swap_player(player_target),
+                lambda: self.server.swap_player(player_target, allow_coop=allow_coop),
                 on_success=lambda _result: self._announce_admin_action(
                     f"{display} swapped to the other team",
                     f"swap announcement for {display}",
@@ -1462,8 +1483,22 @@ class PlayersTab(QWidget):
             context=context,
         )
 
+    def _refuse_team_moves_on_coop(self, title):
+        """True (and says why) when co-op protection stops team moves."""
+        if not coop_swaps_blocked(self.server):
+            return False
+        QMessageBox.information(
+            self, title,
+            "This is a co-op map - the other team is the bots, so WolfRAT won't "
+            "move players between teams.\n\nTo allow it, untick 'Block team swaps on "
+            "co-op maps' on the Chat Bot tab.",
+        )
+        return True
+
     def _mix_teams(self):
         """Mix teams - should only be used at round start."""
+        if self._refuse_team_moves_on_coop("Balance Teams"):
+            return
         reply = QMessageBox.question(
             self, "Balance Teams",
             "This will move players from the bigger team to even things up.\n\n"
@@ -1486,6 +1521,8 @@ class PlayersTab(QWidget):
 
     def _shuffle_teams(self):
         """Randomly shuffle all players across both teams."""
+        if self._refuse_team_moves_on_coop("Mix Teams"):
+            return
         players = self.server.players
         if len(players) < 2:
             submit_admin(
@@ -3318,6 +3355,13 @@ class ChatBotTab(QWidget):
         self._spam_kick_cooldowns = {}  # player_name -> timestamp of last kick
         self._spam_kick_pending = set()
         self._chat_config = self._load_chat_config()
+        # No team swaps on co-op maps (the other team is the bots). The main
+        # window points game_type_source at the Bans tab's memory reader.
+        self.coop_guard = coop_guard.CoopGuard(
+            enabled=self._chat_config.get('coop_block_swaps', True),
+        )
+        self.server.swap_guard = self.coop_guard
+        self._coop_refused = {}  # player_name -> timestamp of the last co-op refusal
         self._build_ui()
 
     def reset_chat(self):
@@ -3352,6 +3396,8 @@ class ChatBotTab(QWidget):
                 cfg['auto_swap_enabled'] = self.auto_swap_cb.isChecked()
             if hasattr(self, 'trigger_input'):
                 cfg['swap_trigger'] = self.trigger_input.text()
+            if hasattr(self, 'coop_block_cb'):
+                cfg['coop_block_swaps'] = self.coop_block_cb.isChecked()
             if hasattr(self, 'spam_cb'):
                 cfg['spam_enabled'] = self.spam_cb.isChecked()
             if hasattr(self, 'spam_msg_spin'):
@@ -3397,7 +3443,7 @@ class ChatBotTab(QWidget):
         layout.addWidget(chat_group)
 
         # Auto-swap feature
-        swap_group = QGroupBox("Auto Team Swap (Chat Trigger)")
+        swap_group = QGroupBox("Team Swaps")
         swap_layout = QGridLayout()
 
         self.auto_swap_cb = QCheckBox("Enable auto-swap on chat trigger")
@@ -3411,6 +3457,15 @@ class ChatBotTab(QWidget):
         self.trigger_input.setPlaceholderText("e.g. !switch, !swap, !team")
         self.trigger_input.textChanged.connect(self._save_chat_config)
         swap_layout.addWidget(self.trigger_input, 1, 1)
+
+        self.coop_block_cb = QCheckBox("Block team swaps on co-op maps (stops players joining the bots)")
+        self.coop_block_cb.setToolTip(
+            "On a co-op map this stops !switch, mods' !swap / !mixteams / !balanceteams\n"
+            "and the web admin's Swap. The Players tab's Swap button asks first.\n"
+            "WolfRAT reads the game mode from the server when both are on this PC.")
+        self.coop_block_cb.setChecked(self.coop_guard.enabled)
+        self.coop_block_cb.stateChanged.connect(self._coop_settings_changed)
+        swap_layout.addWidget(self.coop_block_cb, 2, 0, 1, 2)
 
         swap_group.setLayout(swap_layout)
         layout.addWidget(swap_group)
@@ -3557,7 +3612,9 @@ class ChatBotTab(QWidget):
                             # Cooldown: ignore if this player triggered within last 2 minutes
                             now = time.time()
                             last_swap = self._swap_cooldowns.get(name.lower(), 0)
-                            if now - last_swap < 120:
+                            if self.coop_guard.blocks_swaps():
+                                self._refuse_coop_switch(name, now)
+                            elif now - last_swap < 120:
                                 remaining = int(120 - (now - last_swap))
                                 self.chat_display.append(
                                     f"<span style='color: #a89830'>[SWAP] {name} on cooldown ({remaining}s remaining)</span>")
@@ -3691,6 +3748,23 @@ class ChatBotTab(QWidget):
         cursor = self.chat_display.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         self.chat_display.setTextCursor(cursor)
+
+    def _coop_settings_changed(self):
+        self.coop_guard.enabled = self.coop_block_cb.isChecked()
+        self._save_chat_config()
+
+    def _refuse_coop_switch(self, name, now):
+        self.chat_display.append(
+            f"<span style='color: #ff6040'>[SWAP] {name} asked to switch - "
+            f"refused, co-op map</span>"
+        )
+        key = name.lower()
+        if now - self._coop_refused.get(key, 0) < 60:
+            return  # told them already; don't let them spam the server chat
+        self._coop_refused[key] = now
+        self._send_automod_announcement(
+            f"{name}: {coop_guard.REFUSAL}"[:CHAT_MAX_LEN]
+        )
 
     def _swap_succeeded(self, name, timestamp):
         key = name.lower()
@@ -5783,7 +5857,10 @@ class ModsTab(QWidget):
 
         elif cmd == '!swap':
             target = find_player(args[0]) if args else None
-            if target:
+            if target and coop_swaps_blocked(self.server):
+                self._send_mod_chat(coop_guard.REFUSAL, "Send co-op swap refusal")
+                self.mod_log.addItem(f"[{now}] {sender} tried to swap {target['name']} - refused, co-op map")
+            elif target:
                 target_entry = player_entry_from_legacy(target)
                 self._submit_mod_action(
                     lambda: self.server.swap_and_kill(
@@ -5824,6 +5901,10 @@ class ModsTab(QWidget):
         elif cmd == '!mixteams':
             if sender not in self.mods and sender != 'web_admin':
                 return
+            if coop_swaps_blocked(self.server):
+                self._send_mod_chat(coop_guard.REFUSAL, "Send co-op swap refusal")
+                self.mod_log.addItem(f"[{now}] {sender} tried to mix teams - refused, co-op map")
+                return
             submit_team_workflow(
                 self,
                 self.server.shuffle_teams,
@@ -5835,6 +5916,10 @@ class ModsTab(QWidget):
 
         elif cmd == '!balanceteams':
             if sender not in self.mods and sender != 'web_admin':
+                return
+            if coop_swaps_blocked(self.server):
+                self._send_mod_chat(coop_guard.REFUSAL, "Send co-op swap refusal")
+                self.mod_log.addItem(f"[{now}] {sender} tried to balance teams - refused, co-op map")
                 return
             submit_team_workflow(
                 self,
@@ -6155,10 +6240,23 @@ class MapVotingTab(QWidget):
         # Optional early-vote rules, all off unless the saved file says otherwise.
         self._mode_rules = vote_rules.rules_from_json(None)
         self._kill_watch = vote_rules.KillWatch()
+        self._caps_watch = vote_rules.KillWatch()
+        self.game_type_now = lambda: None       # g_GameType, wired by the main window
+        self.caps_to_go = lambda: None          # CTF/FB flags or goals still needed, wired likewise
         self._hold_logged = False
         self._zone_rule = False
+        self._coop_rule = True                  # co-op has no timer: without this it never votes
+        self._coop_objectives_left = 1
+        self._coop_minutes_enabled = False      # co-op minutes = WolfRAT's own mission clock
+        self._coop_minutes = vote_rules.DEFAULT_MINUTES_IN
+        self._coop_ai_enabled = False
+        self._coop_ai_pct = 25
+        self.coop_ai_left = lambda: None        # (alive, at start), wired by the main window
+        self._ai_watch = vote_rules.KillWatch()
         self.zones_left = lambda: None          # the Bans tab's reader, wired by the main window
         self._zone_fired_map = None
+        self.coop_objectives = lambda: None     # (done, total) on co-op, wired by the main window
+        self._coop_fired_map = None
 
         self._recently_played_file = str(
             self.runtime.path("wolfrat_recently_played.json")
@@ -6184,6 +6282,18 @@ class MapVotingTab(QWidget):
                             data.get('mode_rules')
                         )
                         self._zone_rule = bool(data.get('zone_rule', False))
+                        self._coop_rule = bool(data.get('coop_rule', True))
+                        try:
+                            self._coop_objectives_left = max(1, min(7, int(data.get('coop_objectives_left', 1))))
+                        except (TypeError, ValueError):
+                            self._coop_objectives_left = 1
+                        self._coop_minutes_enabled = bool(data.get('coop_minutes_enabled', False))
+                        self._coop_ai_enabled = bool(data.get('coop_ai_enabled', False))
+                        try:
+                            self._coop_minutes = max(1, min(240, int(data.get('coop_minutes', vote_rules.DEFAULT_MINUTES_IN))))
+                            self._coop_ai_pct = max(1, min(99, int(data.get('coop_ai_pct', 25))))
+                        except (TypeError, ValueError):
+                            pass
                     elif isinstance(data, list):
                         self._recently_played = data
                         self._current_map = None
@@ -6364,9 +6474,10 @@ class MapVotingTab(QWidget):
         "the Flag reaching its score - so the map changes before the vote ever "
         "starts and nobody gets to vote.<br><br>"
         "Tick a rule and the vote starts earlier on those maps only. "
-        "<b>Everything here is off by default - leave it off and voting works "
-        "exactly as it always has.</b> The mode is read from the map's file "
-        "name. The first rule reached starts the vote, it runs once per map, "
+        "<b>Everything here is off by default except Co-op - leave it off and "
+        "voting works exactly as it always has.</b> (Co-op has no timer, so without "
+        "its rule a co-op mission never gets a vote.) The mode comes from the server "
+        "when it runs on this PC, otherwise from the map's file name. The first rule reached starts the vote, it runs once per map, "
         "and the winner only becomes the NEXT map - the match carries on. "
         "Mods can still type <b>!startvote</b>."
     )
@@ -6400,6 +6511,7 @@ class MapVotingTab(QWidget):
         grid.setHorizontalSpacing(8)
         grid.setVerticalSpacing(6)
         self._rule_widgets = {}
+        self._caps_widgets = {}
         row = -1
         for mode in vote_rules.SCORE_MODES:
             row += 1
@@ -6448,6 +6560,33 @@ class MapVotingTab(QWidget):
                 row += 1
                 grid.addLayout(kills_row, row, 1, 1, 4)
 
+            if mode in vote_rules.CAPS_MODES:
+                what = vote_rules.CAPS_WORD[mode]
+                caps_cb = QCheckBox("or within")
+                caps_cb.setChecked(rule.caps_watch_enabled)
+                caps_spin = QSpinBox()
+                caps_spin.setRange(1, 50)
+                caps_spin.setValue(rule.caps_before_win)
+                caps_spin.setMaximumWidth(70)
+                caps_spin.setEnabled(rule.caps_watch_enabled)
+                caps_cb.toggled.connect(caps_spin.setEnabled)
+                caps_cb.setToolTip(
+                    f"Starts the vote when a team is this many {what} from winning. "
+                    "If nobody gets that close, the vote still starts at the normal "
+                    "minutes before the end. Read from the server, so it needs the "
+                    "server on this PC."
+                )
+                caps_row = QHBoxLayout()
+                caps_row.addWidget(caps_cb)
+                caps_row.addWidget(caps_spin)
+                caps_row.addWidget(QLabel(f"{what} of the win (server on this PC)"))
+                caps_row.addStretch()
+                row += 1
+                grid.addLayout(caps_row, row, 1, 1, 4)
+                caps_cb.toggled.connect(self._save_recently_played)
+                caps_spin.valueChanged.connect(self._save_recently_played)
+                self._caps_widgets[mode] = (caps_cb, caps_spin)
+
             for widget in (minutes_cb, kills_cb):
                 if widget is not None:
                     widget.toggled.connect(self._save_recently_played)
@@ -6455,6 +6594,8 @@ class MapVotingTab(QWidget):
                 if widget is not None:
                     widget.valueChanged.connect(self._save_recently_played)
             self._rule_widgets[mode] = (minutes_cb, minutes_spin, kills_cb, kills_spin)
+            if mode == vote_rules.MODE_FB:
+                row = self._build_coop_rows(grid, row)
         grid.setColumnStretch(4, 1)
         outer.addLayout(grid)
 
@@ -6473,6 +6614,7 @@ class MapVotingTab(QWidget):
         self.zone_rule_cb.toggled.connect(self._save_recently_played)
         outer.addWidget(self.zone_rule_cb)
 
+
         self.current_mode_lbl = QLabel("Current map: -")
         self.current_mode_lbl.setStyleSheet("font-size: 9pt; color: #a89830;")
         outer.addWidget(self.current_mode_lbl)
@@ -6481,14 +6623,82 @@ class MapVotingTab(QWidget):
         group.setLayout(outer)
         return group
 
+    def _build_coop_rows(self, grid, row):
+        """Co-op, under Flagball (Dale 2026-09-23).  Co-op missions have no
+        round timer, so these read the mission from the server on this PC."""
+        def spin(low, high, value, enabled):
+            box = QSpinBox()
+            box.setRange(low, high)
+            box.setValue(value)
+            box.setMaximumWidth(70)
+            box.setEnabled(enabled)
+            return box
+
+        row += 1
+        name = QLabel("Co-op  <span style='color:#807020'>(server on this PC)</span>")
+        name.setTextFormat(Qt.TextFormat.RichText)
+        grid.addWidget(name, row, 0)
+        self.coop_minutes_cb = QCheckBox("vote")
+        self.coop_minutes_cb.setChecked(self._coop_minutes_enabled)
+        self.coop_minutes_cb.setToolTip(
+            "Co-op has no round timer, so this counts from when WolfRAT saw the "
+            "mission start.")
+        self.coop_minutes_spin = spin(1, 240, self._coop_minutes, self._coop_minutes_enabled)
+        self.coop_minutes_cb.toggled.connect(self.coop_minutes_spin.setEnabled)
+        grid.addWidget(self.coop_minutes_cb, row, 1)
+        grid.addWidget(self.coop_minutes_spin, row, 2)
+        grid.addWidget(QLabel("mins in"), row, 3)
+
+        row += 1
+        objectives_row = QHBoxLayout()
+        self.coop_rule_cb = QCheckBox("or when")
+        self.coop_rule_cb.setChecked(self._coop_rule)
+        self.coop_rule_cb.setToolTip(
+            "Reads the mission's objectives from the server - the same list players "
+            "see in game. Missions with only one objective never start it early.")
+        self.coop_left_spin = spin(1, 7, self._coop_objectives_left, self._coop_rule)
+        self.coop_rule_cb.toggled.connect(self.coop_left_spin.setEnabled)
+        objectives_row.addWidget(self.coop_rule_cb)
+        objectives_row.addWidget(self.coop_left_spin)
+        objectives_row.addWidget(QLabel("objective(s) left"))
+        objectives_row.addStretch()
+        grid.addLayout(objectives_row, row, 1, 1, 4)
+
+        row += 1
+        ai_row = QHBoxLayout()
+        self.coop_ai_cb = QCheckBox("or when AI left falls below")
+        self.coop_ai_cb.setChecked(self._coop_ai_enabled)
+        self.coop_ai_cb.setToolTip(
+            "Counts the mission's AI units that are still alive against how many "
+            "the mission started with.")
+        self.coop_ai_spin = spin(1, 99, self._coop_ai_pct, self._coop_ai_enabled)
+        self.coop_ai_spin.setSuffix(" %")
+        self.coop_ai_spin.setMaximumWidth(80)
+        self.coop_ai_cb.toggled.connect(self.coop_ai_spin.setEnabled)
+        ai_row.addWidget(self.coop_ai_cb)
+        ai_row.addWidget(self.coop_ai_spin)
+        ai_row.addStretch()
+        grid.addLayout(ai_row, row, 1, 1, 4)
+
+        for box in (self.coop_minutes_cb, self.coop_rule_cb, self.coop_ai_cb):
+            box.toggled.connect(self._save_recently_played)
+        for box in (self.coop_minutes_spin, self.coop_left_spin, self.coop_ai_spin):
+            box.valueChanged.connect(self._save_recently_played)
+        return row
+
     def _current_rules(self):
         """The early-vote rules as the tick boxes stand right now."""
         widgets = getattr(self, '_rule_widgets', None)
         if not widgets:
             return self._mode_rules
         rules = {}
+        caps = getattr(self, '_caps_widgets', {})
         for mode, (minutes_cb, minutes_spin, kills_cb, kills_spin) in widgets.items():
+            caps_cb, caps_spin = caps.get(mode, (None, None))
             rules[mode] = vote_rules.ModeRule(
+                caps_watch_enabled=bool(caps_cb and caps_cb.isChecked()),
+                caps_before_win=(caps_spin.value() if caps_spin
+                                 else vote_rules.DEFAULT_CAPS_BEFORE_WIN),
                 minutes_in_enabled=minutes_cb.isChecked(),
                 minutes_in=minutes_spin.value(),
                 kill_watch_enabled=bool(kills_cb and kills_cb.isChecked()),
@@ -6549,6 +6759,16 @@ class MapVotingTab(QWidget):
                 'min_players': self.min_players_spin.value(),
                 'mode_rules': vote_rules.rules_to_json(self._current_rules()),
                 'zone_rule': bool(getattr(self, 'zone_rule_cb', None) and self.zone_rule_cb.isChecked()),
+                'coop_rule': bool(self.coop_rule_cb.isChecked()) if hasattr(self, 'coop_rule_cb') else self._coop_rule,
+                'coop_objectives_left': (self.coop_left_spin.value() if hasattr(self, 'coop_left_spin')
+                                         else self._coop_objectives_left),
+                'coop_minutes_enabled': (self.coop_minutes_cb.isChecked() if hasattr(self, 'coop_minutes_cb')
+                                         else self._coop_minutes_enabled),
+                'coop_minutes': (self.coop_minutes_spin.value() if hasattr(self, 'coop_minutes_spin')
+                                 else self._coop_minutes),
+                'coop_ai_enabled': (self.coop_ai_cb.isChecked() if hasattr(self, 'coop_ai_cb')
+                                    else self._coop_ai_enabled),
+                'coop_ai_pct': self.coop_ai_spin.value() if hasattr(self, 'coop_ai_spin') else self._coop_ai_pct,
             }
             with open(self._recently_played_file, 'w', encoding='utf-8') as f:
                 json.dump(data, f)
@@ -6586,8 +6806,11 @@ class MapVotingTab(QWidget):
             self._vote_active = False
             self._vote_stage = 'idle'
             self._kill_watch.reset()
+            self._caps_watch.reset()
+            self._ai_watch.reset()
             self._hold_logged = False
             self._zone_fired_map = None
+            self._coop_fired_map = None
 
             # --- FIX: Clear list if it hits 50% of the total rotation ---
             mtab = getattr(self, 'missions_tab', None)
@@ -6653,6 +6876,15 @@ class MapVotingTab(QWidget):
         if self._vote_stage == 'idle':
             trigger_mins = self.trigger_spin.value()
 
+            # Co-op has no round timer, so it is decided by objectives before
+            # any of the time checks below (Dale 2026-09-23: the normal vote,
+            # once the second-last objective is done).
+            coop = self._coop_decision()
+            if coop is not None:
+                if self._act_on_auto_decision(coop) and coop.fire:
+                    self._coop_fired_map = self._current_map
+                return
+
             # No server time yet — show waiting
             if not self._server_time_updated:
                 self.status_lbl.setText("Status: Waiting for server data...")
@@ -6663,8 +6895,18 @@ class MapVotingTab(QWidget):
                 self.status_lbl.setText(f"Status: Server data stale ({self._server_game_time_remaining}m). Waiting for update...")
                 return
 
-            mode = vote_rules.game_mode(self._current_map)
+            # The server's own game type when it runs on this PC; the map
+            # filename otherwise (as before).
+            try:
+                mode = vote_rules.family_from_game_type(self.game_type_now())
+            except Exception:
+                mode = None
+            mode = mode or vote_rules.game_mode(self._current_map)
             self._show_current_mode(mode)
+            try:
+                caps_to_go = self.caps_to_go()
+            except Exception:
+                caps_to_go = None
             decision = vote_rules.decide(
                 vote_rules.MatchView(
                     self._current_map,
@@ -6673,10 +6915,12 @@ class MapVotingTab(QWidget):
                     vote_rules.leading_kills(mode, self.server.player_entries),
                     vote_rules.kill_limit(self.server.game_settings),
                     mode,
+                    caps_to_go,
                 ),
                 trigger_mins,
                 self._current_rules(),
                 self._kill_watch,
+                self._caps_watch,
             )
             if (not decision.fire and mode == vote_rules.MODE_AS
                     and self.zone_rule_cb.isChecked() and self._zone_fired_map != self._current_map):
@@ -6694,24 +6938,92 @@ class MapVotingTab(QWidget):
                     else:
                         decision = vote_rules.Decision(
                             False, "", decision.status + f"   |   AAS: {to_go} zones to go")
-            players = len(self.server.players or ())
-            held = vote_rules.hold_for_players(players, self.min_players_spin.value())
-            if held is None:
-                self.status_lbl.setText(decision.status)
-                self._hold_logged = False
-            else:
-                # Say WHY nothing is happening - a held vote used to sit on
-                # 'Auto-vote pending...' with no clue in the log either.
-                self.status_lbl.setText(held)
-                if decision.fire and not self._hold_logged:
-                    self._hold_logged = True
-                    self.log(f"Auto-vote held: {held[len('Status: '):]}")
-                    wire_log(f"[VOTE] auto-start held: {players} players, need {self.min_players_spin.value()}")
+            self._act_on_auto_decision(decision)
 
-            if self.enable_cb.isChecked() and decision.fire and held is None:
-                self.log(f"Auto-vote: {decision.reason}")
-                wire_log(f"[VOTE] auto-start: {decision.reason}")
-                self._start_vote()
+    def _coop_decision(self):
+        """The co-op rules, or None when this is not a co-op map (or every
+        Co-op box is unticked - then the normal rules apply as before)."""
+        try:
+            objectives = self.coop_objectives()
+        except Exception:
+            objectives = None
+        rules_on = (self.coop_minutes_cb.isChecked(), self.coop_rule_cb.isChecked(),
+                    self.coop_ai_cb.isChecked())
+        if objectives is None or not any(rules_on):
+            return None
+        minutes_on, objectives_on, ai_on = rules_on
+        done, total = objectives
+        try:
+            ai = self.coop_ai_left()
+        except Exception:
+            ai = None
+        pct = round(100 * ai[0] / ai[1]) if ai else None
+        elapsed = (int((time.time() - self._match_start_time) // 60)
+                   if self._match_start_time else None)
+
+        facts = [f"{done} of {total} objectives done"]
+        if pct is not None:
+            facts.append(f"{pct}% AI left")
+        if self._current_map:
+            self.current_mode_lbl.setText(
+                f"Current map: {self._current_map}  ->  Co-op ({', '.join(facts)})")
+        if elapsed is not None:
+            facts.append(f"{elapsed}m in")
+        status = "Status: Co-op - " + ", ".join(facts) + "."
+        if self._coop_fired_map == self._current_map:
+            return vote_rules.Decision(False, status="Status: Co-op - map vote already run for this mission.")
+
+        notes = []
+        if objectives_on:
+            want = self.coop_left_spin.value()
+            if total >= 2 and done >= 1 and total - done <= want:
+                return vote_rules.Decision(
+                    True, f"Co-op: {done} of {total} objectives done - {total - done} left", status)
+            if total >= 2:
+                notes.append(f"when {want} {'is' if want == 1 else 'are'} left")
+        if minutes_on and elapsed is not None:
+            if elapsed >= self.coop_minutes_spin.value():
+                return vote_rules.Decision(
+                    True, f"Co-op: {elapsed}m into the mission "
+                          f"(rule: {self.coop_minutes_spin.value()}m in)", status)
+            notes.append(f"at {self.coop_minutes_spin.value()}m in")
+        if ai_on and pct is not None:
+            below = self.coop_ai_spin.value()
+            if pct >= below:
+                self._ai_watch.armed = True
+                notes.append(f"when AI left falls below {below}%")
+            elif self._ai_watch.armed:
+                return vote_rules.Decision(
+                    True, f"Co-op: {pct}% AI left (rule: below {below}%)", status)
+            else:
+                notes.append("AI watch waiting for this mission's counts")
+        if notes:
+            status += " Vote starts " + " or ".join(notes) + "."
+        return vote_rules.Decision(False, status=status)
+
+    def _act_on_auto_decision(self, decision) -> bool:
+        """Player gate, status line and start - the same for every rule.
+        True when the vote was started."""
+        players = len(self.server.players or ())
+        held = vote_rules.hold_for_players(players, self.min_players_spin.value())
+        if held is None:
+            self.status_lbl.setText(decision.status)
+            self._hold_logged = False
+        else:
+            # Say WHY nothing is happening - a held vote used to sit on
+            # 'Auto-vote pending...' with no clue in the log either.
+            self.status_lbl.setText(held)
+            if decision.fire and not self._hold_logged:
+                self._hold_logged = True
+                self.log(f"Auto-vote held: {held[len('Status: '):]}")
+                wire_log(f"[VOTE] auto-start held: {players} players, need {self.min_players_spin.value()}")
+
+        if self.enable_cb.isChecked() and decision.fire and held is None:
+            self.log(f"Auto-vote: {decision.reason}")
+            wire_log(f"[VOTE] auto-start: {decision.reason}")
+            self._start_vote()
+            return True
+        return False
 
     def _start_vote(self):
         import time
@@ -7570,7 +7882,7 @@ class DownloadWorker(QThread):
 
 
 class MainWindow(QMainWindow):
-    """WolfRAT 2.7.0 Main Window."""
+    """WolfRAT 2.8.0 Main Window."""
 
     def __init__(self, runtime: DesktopRuntime | None = None):
         super().__init__()
@@ -7589,7 +7901,7 @@ class MainWindow(QMainWindow):
         self._sync_led_timer = QTimer(self)
         self._sync_led_timer.setSingleShot(True)
         self._sync_led_timer.timeout.connect(self._clear_sync_led)
-        self.setWindowTitle("WolfRAT 2.7.0 - Joint Operations Server Admin")
+        self.setWindowTitle("WolfRAT 2.8.0 - Joint Operations Server Admin")
 
         # Set Window Icon
         icon_path = os.path.join(os.path.dirname(__file__), 'icon.ico')
@@ -7663,7 +7975,7 @@ class MainWindow(QMainWindow):
         self.signals.connected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.connected_signal.connect(lambda: sounds.play("connect"))
         self.signals.disconnected_signal.connect(lambda: self.set_connected(False, 'Disconnected'))
-        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.7.0 - Joint Operations Server Admin"))
+        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.8.0 - Joint Operations Server Admin"))
         self.signals.disconnected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.disconnected_signal.connect(lambda: self.server_tab.handle_disconnect_ui())
         self.signals.disconnected_signal.connect(lambda: self.mods_tab.entrance_panel.on_disconnected())
@@ -7675,9 +7987,9 @@ class MainWindow(QMainWindow):
     def _update_title(self, server_name=""):
         """Update window title with server name when connected."""
         if server_name:
-            self.setWindowTitle(f"WolfRAT 2.7.0 \u2014 {server_name}")
+            self.setWindowTitle(f"WolfRAT 2.8.0 \u2014 {server_name}")
         else:
-            self.setWindowTitle("WolfRAT 2.7.0 - Joint Operations Server Admin")
+            self.setWindowTitle("WolfRAT 2.8.0 - Joint Operations Server Admin")
 
     def _build_ui(self):
         central = QWidget()
@@ -7685,7 +7997,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(central)
 
         # Header
-        header = QLabel("WolfRAT 2.7.0")
+        header = QLabel("WolfRAT 2.8.0")
         header.setStyleSheet("font-size: 22pt; font-weight: bold; color: #e8c840; padding: 12px; letter-spacing: 4px;")
         header.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(header)
@@ -7777,6 +8089,43 @@ class MainWindow(QMainWindow):
         self.server._bans_tab = self.bans_tab  # Players tab + mods' !ban go through the list
         self.bans_tab.zone_capture = self.spree_tab.announce_zone_capture
         self.map_voting_tab.zones_left = self.bans_tab.zones_left
+        self.map_voting_tab.coop_objectives = self.bans_tab.objectives_now
+        self.map_voting_tab.game_type_now = self.bans_tab.game_type_now
+        self.map_voting_tab.caps_to_go = self.bans_tab.caps_to_go_now
+        self.map_voting_tab.coop_ai_left = self.bans_tab.ai_left_now
+        self.chatbot_tab.coop_guard.game_type_source = self.bans_tab.game_type_now
+
+        def _balance_move(player, _to_team):
+            try:
+                player_target = player_entry_from_legacy(player)
+            except (TypeError, ValueError) as error:
+                wire_log(f"[BALANCE] cannot target {player.get('name')!r}: {error}")
+                return
+            submit_admin(
+                self.players_tab,
+                lambda: self.server.swap_and_kill(player_target, player_target.name),
+                context=f"Auto-balance {player_target.name}",
+            )
+
+        self.auto_balance_panel = AutoBalancePanel(
+            os.path.dirname(str(self.runtime.path("wolfrat_balance.json"))),
+            say=lambda text: submit_admin(
+                self.players_tab,
+                lambda: self.server.send_chat(text),
+                context="Auto-balance announcement",
+                policy=CompletionPolicy.ACCEPTED,
+            ),
+            move=_balance_move,
+            set_jo_balance=lambda on: submit_admin(
+                self.players_tab,
+                lambda: self.server.set_setting("AutoBalanceOnRecycle", on),
+                context="Joint Ops auto-balance on map start",
+            ),
+        )
+        self.auto_balance_panel.game_type_source = self.bans_tab.game_type_now
+        self.auto_balance_panel.current_map_source = lambda: self.map_voting_tab._current_map
+        self.auto_balance_panel.vote_active_source = lambda: self.map_voting_tab._vote_active
+        self.players_tab.balance_layout.addWidget(self.auto_balance_panel)
 
         # Wire up cross-tab references
         self.missions_tab._main_window = self
@@ -7791,6 +8140,10 @@ class MainWindow(QMainWindow):
         self.signals.missions_signal.connect(self.spree_tab.on_missions_updated)
         self.signals.chat_signal.connect(self.map_voting_tab.on_chat)
         self.signals.players_signal.connect(self.bans_tab.on_players)
+        self.signals.players_signal.connect(self.auto_balance_panel.on_players)
+        self.signals.chat_signal.connect(self.auto_balance_panel.on_chat)
+        self.signals.settings_signal.connect(self.auto_balance_panel.on_settings)
+        self.signals.connected_signal.connect(self.auto_balance_panel.reset_chat)
         self.signals.chat_signal.connect(self.bans_tab.on_chat)
         self.signals.missions_signal.connect(self.bans_tab.on_missions_updated)
         self.signals.missions_signal.connect(self.weather_tab.on_missions_updated)
@@ -7878,7 +8231,7 @@ class MainWindow(QMainWindow):
 
         status_bar.addSpacing(10)
 
-        ver_label = QLabel("v2.7.0 · Built by BadgerLove · FMJ Squad")
+        ver_label = QLabel("v2.8.0 · Built by BadgerLove · FMJ Squad")
         ver_label.setStyleSheet("font-size: 9pt; color: #444;")
         status_bar.addWidget(ver_label)
 
@@ -7934,7 +8287,7 @@ class MainWindow(QMainWindow):
     # ---- Auto-updater ---------------------------------------------------
 
     _VERSION_URL = "https://fmj-squad.com/version.json"
-    _CURRENT_VERSION = "2.7.0"
+    _CURRENT_VERSION = "2.8.0"
 
     @staticmethod
     def _is_newer(latest: str, current: str) -> bool:
@@ -8178,7 +8531,7 @@ def start_desktop(
 
     runtime = runtime or DesktopRuntime.production()
     app.setStyleSheet(DARK_STYLE)
-    app.setApplicationName("WolfRAT 2.7.0")
+    app.setApplicationName("WolfRAT 2.8.0")
     sounds.set_enabled(runtime.audio_enabled)
     if runtime.audio_enabled:
         sounds.initialize()
@@ -8287,7 +8640,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
         print(f"WolfRAT startup error: {error}")
         return 2
     runtime = runtime or launch.runtime
-    wire_log("=== WolfRAT 2.7.0 STARTED ===")
+    wire_log("=== WolfRAT 2.8.0 STARTED ===")
 
     # Catch-all exception handler for debugging
     import traceback
@@ -8340,7 +8693,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
 
             bstats.bstats_start(
                 "wolfrat",
-                "2.7.0",
+                "2.8.0",
                 data_dir=runtime.data_dir,
             )
         except Exception:

@@ -1008,6 +1008,12 @@ class WolfWebServer:
 
             if action not in {'kick', 'ban', 'kill', 'swap', 'zero'}:
                 return web.json_response({'error': f'Unknown action: {action}'}, status=400)
+            swaps_blocked = getattr(self.sm, 'swaps_blocked', None)
+            if action == 'swap' and swaps_blocked and swaps_blocked():
+                return web.json_response({'error': (
+                    'No team swaps on co-op maps - the other team is the bots. '
+                    'Use the Swap button in WolfRAT on the PC, or turn off '
+                    "'Block team swaps on co-op maps' on the Chat Bot tab.")}, status=409)
 
             player = self._find_player_entry(
                 pid_num, player_name, revision

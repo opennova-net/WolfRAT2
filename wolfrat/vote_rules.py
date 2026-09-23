@@ -52,9 +52,35 @@ MODE_LABELS = {
 SCORE_MODES = (MODE_TDM, MODE_DM, MODE_TKOTH, MODE_CTF, MODE_FB, MODE_OTHER)
 # Modes whose score is the kill count the admin port reports per player.
 KILL_MODES = (MODE_TDM, MODE_DM)
+# Modes won on captures, read from the server on this PC (jo_players.caps_to_go).
+CAPS_MODES = (MODE_CTF, MODE_FB)
+CAPS_WORD = {MODE_CTF: "flags", MODE_FB: "goals"}
+
+
+def caps_words(mode: str, count: int) -> str:
+    """'1 flag', '2 flags', '1 goal'..."""
+    word = CAPS_WORD[mode]
+    return f"{count} {word[:-1] if count == 1 else word}"
 
 DEFAULT_MINUTES_IN = 10
 DEFAULT_KILLS_BEFORE_LIMIT = 15
+DEFAULT_CAPS_BEFORE_WIN = 1
+
+# The server's own game type (g_GameType, coop_guard.GAME_TYPES) -> family.
+# 0 (Deathmatch) is left to the filename: it is also what an unloaded server reads.
+_GAME_TYPE_FAMILIES = {
+    0x10000: MODE_TDM,
+    0x10001: MODE_TKOTH,
+    0x10004: MODE_CTF,
+    0x10008: MODE_FB,
+    0x10010: MODE_AS,
+    0x50010: MODE_AS,
+}
+
+
+def family_from_game_type(game_type) -> str | None:
+    """The mode family the server itself reports, or None to fall back to the filename."""
+    return _GAME_TYPE_FAMILIES.get(game_type) if game_type is not None else None
 
 
 def game_mode(filename: str | None) -> str:
@@ -82,6 +108,8 @@ class ModeRule:
     minutes_in: int = DEFAULT_MINUTES_IN
     kill_watch_enabled: bool = False
     kills_before_limit: int = DEFAULT_KILLS_BEFORE_LIMIT
+    caps_watch_enabled: bool = False
+    caps_before_win: int = DEFAULT_CAPS_BEFORE_WIN
 
     @classmethod
     def from_json(cls, data) -> "ModeRule":
@@ -101,6 +129,8 @@ class ModeRule:
             kills_before_limit=number(
                 "kills_before_limit", DEFAULT_KILLS_BEFORE_LIMIT, 1, 500
             ),
+            caps_watch_enabled=bool(data.get("caps_watch_enabled", False)),
+            caps_before_win=number("caps_before_win", DEFAULT_CAPS_BEFORE_WIN, 1, 50),
         )
 
     def to_json(self) -> dict:
@@ -109,6 +139,8 @@ class ModeRule:
             "minutes_in": self.minutes_in,
             "kill_watch_enabled": self.kill_watch_enabled,
             "kills_before_limit": self.kills_before_limit,
+            "caps_watch_enabled": self.caps_watch_enabled,
+            "caps_before_win": self.caps_before_win,
         }
 
 
@@ -202,6 +234,7 @@ class MatchView:
     leading_kills: int | None = None
     kill_limit: int | None = None
     mode: str = field(default="")
+    caps_to_go: int | None = None     # fewest flags/goals any team still needs (CTF/FB)
 
     def family(self) -> str:
         return self.mode or game_mode(self.filename)
@@ -212,6 +245,7 @@ def decide(
     trigger_mins: int,
     rules: Mapping[str, ModeRule],
     watch: KillWatch,
+    caps_watch: KillWatch | None = None,
 ) -> Decision:
     """Should the vote start on this tick?
 
@@ -274,6 +308,28 @@ def decide(
             )
         else:
             notes.append("kill watch waiting for this map's scores to reset")
+
+    if (
+        rule.caps_watch_enabled
+        and mode in CAPS_MODES
+        and view.caps_to_go is not None
+    ):
+        caps_watch = caps_watch if caps_watch is not None else KillWatch()
+        if view.caps_to_go > rule.caps_before_win:
+            caps_watch.armed = True
+            notes.append(
+                f"when a team is {caps_words(mode, rule.caps_before_win)} from winning "
+                f"(closest now: {view.caps_to_go})"
+            )
+        elif caps_watch.armed:
+            return Decision(
+                True,
+                f"{label}: a team is {caps_words(mode, view.caps_to_go)} from winning "
+                f"(rule: within {rule.caps_before_win})",
+                base_status,
+            )
+        else:
+            notes.append(f"{CAPS_WORD[mode]} watch waiting for this map's scores to reset")
 
     status = base_status
     if notes:

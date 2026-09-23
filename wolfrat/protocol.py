@@ -29,6 +29,7 @@ from .admin_commands import (
     WeaponEntry,
     WeaponMode,
 )
+from .coop_guard import REFUSAL as COOP_REFUSAL
 from .admin_session import (
     CommandResult,
     RawResult,
@@ -161,6 +162,8 @@ class ServerManager:
         self._on_log = None
         self._on_disconnect_ui = None
         self._on_connect_done = None
+        # coop_guard.CoopGuard, set by the Chat Bot tab. Every swap asks it.
+        self.swap_guard = None
 
     @property
     def proto(self) -> _ProtocolView:
@@ -830,17 +833,28 @@ class ServerManager:
             expected_session=session,
         )
 
-    def swap_player(self, player_id) -> Future:
+    def swap_player(self, player_id, *, allow_coop: bool = False) -> Future:
         target = self._resolve_player(player_id)
         return self._serialize_mutation(
-            lambda session: self._swap_player_now(target, session)
+            lambda session: self._swap_player_now(
+                target, session, allow_coop=allow_coop
+            )
         )
+
+    def swaps_blocked(self) -> bool:
+        """True on a co-op map while co-op protection is on."""
+        guard = self.swap_guard
+        return bool(guard is not None and guard.blocks_swaps())
 
     def _swap_player_now(
         self,
         target: PlayerEntry,
         session: RetailAdminSession,
+        *,
+        allow_coop: bool = False,
     ) -> Future:
+        if self.swap_guard is not None:
+            self.swap_guard.check(allow_coop)
         player = self._resolve_current_player(target)
         if player.team != target.team:
             raise ValueError(
@@ -931,19 +945,23 @@ class ServerManager:
         attempt(self._verification_attempts)
         return output
 
-    def swap_and_kill(self, player_id, name="") -> Future:
+    def swap_and_kill(self, player_id, name="", *, allow_coop: bool = False) -> Future:
         target = self._resolve_player(player_id)
         return self._serialize_mutation(
-            lambda session: self._move_player_now(target, session)
+            lambda session: self._move_player_now(
+                target, session, allow_coop=allow_coop
+            )
         )
 
     def _move_player_now(
         self,
         target: PlayerEntry,
         session: RetailAdminSession,
+        *,
+        allow_coop: bool = False,
     ) -> Future:
         return self._then(
-            self._swap_player_now(target, session),
+            self._swap_player_now(target, session, allow_coop=allow_coop),
             lambda _result: self._kill_player_now(
                 self._rebind_owned_player(target, session),
                 session,
@@ -1511,6 +1529,8 @@ class ServerManager:
         )
 
     def mix_teams(self) -> TeamWorkflow:
+        if self.swaps_blocked():
+            return self._completed_team_workflow(COOP_REFUSAL)
         players = [
             player
             for player in self.player_entries
@@ -1544,6 +1564,8 @@ class ServerManager:
 
     def shuffle_teams(self) -> TeamWorkflow:
         """Randomly shuffle ALL players across both teams."""
+        if self.swaps_blocked():
+            return self._completed_team_workflow(COOP_REFUSAL)
         all_players = [
             player
             for player in self.player_entries

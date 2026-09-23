@@ -22,6 +22,29 @@ AAS zones (GameEvent_FlagCapture @ 0x50F6F0, ZoneSlotChain_* helpers; proven
     element = ZoneEntry*  ->  +0 = PSP entity*
     PSP entity +354 = owning team byte (0 / 1 Joint Ops / 2 Rebels), +538 = tier,
                +4 = int32 X/Y/Z like a player
+
+Game type: g_GameType @ 0x24D2128, one dword (values in coop_guard.GAME_TYPES).
+Live read 2026-09-23 on the TAC server = 0x10010 (AAS).
+
+Co-op objectives (HUD_DrawWinConditions @ 0x5BA940, the in-game objectives
+list): objective ids are bytes at 0xA7628B+1 .. +8, the list ends at 0 or 255;
+objective n is done when bit n of dword 0xAC86F4 is set.  Code-read only - no
+co-op map has been played on our server yet.
+
+CTF / Flagball captures (Server_CheckWinConditions @ 0x51AD40): team score
+blocks at 0xC87CA8 (Joint Ops) / 0xC87DFC (Rebels), field n = dword at
++4*(n+1) (CRenderState_GetFieldByIndex @ 0x52D7D0); captures = field 11.
+CTF: team 1 wins at field 11 >= [0xC8FF00], team 2 at >= [0xC8FEFC] (the
+enemy flags on the map, counted at map load).  Flagball: field 11 >= MaxScore
+[0x24D2138] (65000 = no limit).  Code-read; to be proven in a live CTF/FB game.
+
+Co-op AI left: the mission's unit groups, 64 x 48 bytes at 0xA33FA4
+(+4 = count when the mission loaded, EntityPool_RecountByType; +8 = alive
+now, recounted every tick by EntityPool_RecountLiveByGroup @ 0x40E8D0 - the
+same numbers the mission's own "group dead" triggers test).  Group 0 is
+ungrouped and zeroed by the game.  Live read 2026-09-23 on an AAS map: one
+group held 1 live / 0 initial (probably a player spawned after load), so only
+groups with a starting count are used, never counted above their start.
 """
 
 from __future__ import annotations
@@ -48,6 +71,19 @@ RETRY_SECONDS = 10
 ZONE_CHAIN_VA = 0x24D1EBC
 ZONE_TEAM_OFFSET, ZONE_TIER_OFFSET = 354, 538
 MAX_ZONES = 64
+GAME_TYPE_VA = 0x24D2128     # g_GameType (SpawnPoint_FindNearestEnemyCapturePoint @ 0x4DD180)
+OBJECTIVE_IDS_VA = 0xA7628B  # byte_A7628B[1..8]
+OBJECTIVES_DONE_VA = 0xAC86F4
+MAX_OBJECTIVES = 8
+TEAM_SCORE_VA = {1: 0xC87CA8, 2: 0xC87DFC}
+CAPS_OFFSET = 4 * (11 + 1)
+CTF_GOAL_VA = {1: 0xC8FF00, 2: 0xC8FEFC}
+MAX_SCORE_VA = 0x24D2138
+GAME_CTF, GAME_FB = 0x10004, 0x10008
+NO_LIMIT = 65000
+AI_GROUPS_VA = 0xA33FA4
+AI_GROUP_STRIDE, AI_GROUP_COUNT = 48, 64
+AI_INITIAL_OFFSET, AI_LIVE_OFFSET = 4, 8
 
 
 @dataclass(frozen=True)
@@ -196,6 +232,88 @@ class LocalServerPlayers:
                 continue
             zones.append(ZoneInfo(tier, team, pos))
         return zones
+
+
+    def read_game_type(self) -> Optional[int]:
+        """The running game type (coop_guard.GAME_TYPES), or None with no process."""
+        if not self._attach():
+            return None
+        try:
+            return struct.unpack("<I", self._memory.read(GAME_TYPE_VA, 4))[0]
+        except Exception:
+            return None
+
+
+    def read_caps_to_go(self, game_type) -> Optional[int]:
+        """caps_to_go() from the live server, None off CTF/Flagball."""
+        if game_type not in (GAME_CTF, GAME_FB) or not self._attach():
+            return None
+        dword = lambda va: struct.unpack("<i", self._memory.read(va, 4))[0]
+        try:
+            caps = {t: dword(va + CAPS_OFFSET) for t, va in TEAM_SCORE_VA.items()}
+            goal = {t: dword(va) for t, va in CTF_GOAL_VA.items()}
+            max_score = dword(MAX_SCORE_VA)
+        except Exception:
+            return None
+        return caps_to_go(game_type, caps, goal, max_score)
+
+    def read_ai_left(self) -> Optional[tuple]:
+        """ai_left() from the live server."""
+        if not self._attach():
+            return None
+        try:
+            table = self._memory.read(AI_GROUPS_VA, AI_GROUP_STRIDE * AI_GROUP_COUNT)
+        except Exception:
+            return None
+        return ai_left(table)
+
+    def read_objectives(self) -> Optional[tuple]:
+        """(done, total) for the co-op mission's objectives, or None."""
+        if not self._attach():
+            return None
+        try:
+            ids = self._memory.read(OBJECTIVE_IDS_VA, MAX_OBJECTIVES + 1)
+            done_mask = struct.unpack("<I", self._memory.read(OBJECTIVES_DONE_VA, 4))[0]
+        except Exception:
+            return None
+        return count_objectives(ids, done_mask)
+
+
+def caps_to_go(game_type, caps: dict, ctf_goal: dict, max_score: int):
+    """Fewest flags (CTF) or goals (Flagball) any team still needs, or None."""
+    if game_type == GAME_CTF:
+        left = [ctf_goal[t] - caps[t] for t in (1, 2) if ctf_goal.get(t, 0) > 0]
+        return max(0, min(left)) if left else None
+    if game_type == GAME_FB:
+        if not 0 < max_score < NO_LIMIT:
+            return None
+        return max(0, max_score - max(caps.values()))
+    return None
+
+
+def ai_left(table: bytes):
+    """(alive, at start) summed over the mission's groups, or None without AI."""
+    alive = start = 0
+    for group in range(1, AI_GROUP_COUNT):
+        base = group * AI_GROUP_STRIDE
+        initial = struct.unpack_from("<i", table, base + AI_INITIAL_OFFSET)[0]
+        live = struct.unpack_from("<i", table, base + AI_LIVE_OFFSET)[0]
+        if initial > 0:
+            start += initial
+            alive += min(max(live, 0), initial)
+    return (alive, start) if start else None
+
+
+def count_objectives(ids: bytes, done_mask: int) -> tuple:
+    """Walk slots 1..8 the way the in-game objectives list does."""
+    total = done = 0
+    for n in range(1, MAX_OBJECTIVES + 1):
+        if ids[n] in (0, 255):
+            break
+        total += 1
+        if done_mask & (1 << n):
+            done += 1
+    return done, total
 
 
 def ips_by_name(slots) -> dict:
