@@ -1938,11 +1938,20 @@ class MissionsTab(QWidget):
         self.rotation_table.setItem(row, 2, file_item)
 
         if is_current:
+            # Running / queued-next map: green + marker + bold, so it never
+            # looks like the row the admin clicked (selection is gold).  The
+            # marker and bold survive selection; the colour does not.
+            running = mission is None or mission.is_current or not mission.is_next
+            marker = "▶" if running else "▷"   # ▶ running, ▷ next
+            name_item.setText(f"{marker} {name}")
             for col in range(3):
                 item = self.rotation_table.item(row, col)
                 if item:
-                    item.setBackground(QColor("#2a2a00"))
-                    item.setForeground(QColor("#ffd700"))
+                    item.setBackground(QColor("#0a2a08"))
+                    item.setForeground(QColor("#9dff70"))
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
 
     def update_missions(self, missions: list):
         """Update the current rotation from mission list response."""
