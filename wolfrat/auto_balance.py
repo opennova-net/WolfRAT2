@@ -7,8 +7,7 @@ volunteers on the bigger team first, then at random from everyone else on it.
 No exemptions: an owner who turns this on wants it automatic.
 
 Joint Ops has its own balance (``AutoBalanceOnRecycle``) but it only runs as a
-new map starts (Server_InitAllPlayerEntitiesForRound -> Server_AutoBalanceTeams
-@ 0x4FCC30) and never mid-round.  The panel offers one or the other.
+new map starts, never mid-round.  The panel offers one or the other.
 
 Every line WolfRAT says fits the 62-character chat limit.
 """

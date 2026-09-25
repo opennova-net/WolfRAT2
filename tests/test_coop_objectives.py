@@ -1,8 +1,8 @@
 """Co-op map vote (Dale, 2026-09-23): co-op has no round timer, so the normal
 map vote starts once the second-last objective is done.  The vote itself uses
 Map Voting's own configuration; the Co-op row (on by default, "[1] objective(s)
-left") makes the rule visible and adjustable.  Objective layout is read from
-HUD_DrawWinConditions @ 0x5BA940; no co-op map has been played live yet."""
+left") makes the rule visible and adjustable.  No co-op map has been played
+live yet."""
 
 import struct
 import sys

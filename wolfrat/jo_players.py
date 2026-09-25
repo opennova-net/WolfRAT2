@@ -1,51 +1,15 @@
-"""Each player's IP, read from the Joint Ops server process on this PC.
+"""Each player's IP and position, read from the Joint Ops server process on this PC.
 
-The admin port never sends an IP, so this is the only way WolfRAT can see one.
-Proven live 2026-09-22 (spike ``wolfcontrol/spike_jo_ip_read.py``): the read
-needs no elevation when WolfRAT runs as the same Windows user as the server.
+The admin port never sends an IP or a position, so this is the only way
+WolfRAT can see them.  The read needs no elevation when WolfRAT runs as the
+same Windows user as the server, and this module never opens the process for
+writing.  Slot 0 is the host itself (no network player).
 
-Chain (Jointops.exe.kong.c, Server_PlayerPuntCRCMisMatch @ 0x50F380):
-    capacity  = dword [0x24C0CA4]
-    slotPtr   = dword [0x24C0CA8]          one slot = 0x188E8 bytes
-    slot+4    = active byte
-    slot+40   = name, 32 bytes
-    slot+28   = CNetPlayer*  ->  +196 = IPv4, network byte order
-    slot+0    = GamePlayerEntity*  ->  +0x04/+0x08/+0x0C = int32 X/Y/Z position
-                (Entity_ValidatePtr @ 0x500910; proven 2026-09-22 with Dale walking:
-                 ~400k units/s moving, exactly constant standing still)
-Slot 0 is the host itself (null CNetPlayer).  Read-only: this module never
-opens the process for writing.
+Also read here, for the vote and announcer rules: AAS zone owners, the game
+type (values in coop_guard.GAME_TYPES), co-op objectives and AI left, and
+CTF / Flagball captures against the win target.
 
-AAS zones (GameEvent_FlagCapture @ 0x50F6F0, ZoneSlotChain_* helpers; proven
-2026-09-22 with Dale capturing Charlie then Bravo on Doslin Oblast):
-    g_zone_slot_chain @ 0x24D1EBC: dword +44 = vector begin, +48 = vector end
-    element = ZoneEntry*  ->  +0 = PSP entity*
-    PSP entity +354 = owning team byte (0 / 1 Joint Ops / 2 Rebels), +538 = tier,
-               +4 = int32 X/Y/Z like a player
-
-Game type: g_GameType @ 0x24D2128, one dword (values in coop_guard.GAME_TYPES).
-Live read 2026-09-23 on the TAC server = 0x10010 (AAS).
-
-Co-op objectives (HUD_DrawWinConditions @ 0x5BA940, the in-game objectives
-list): objective ids are bytes at 0xA7628B+1 .. +8, the list ends at 0 or 255;
-objective n is done when bit n of dword 0xAC86F4 is set.  Code-read only - no
-co-op map has been played on our server yet.
-
-CTF / Flagball captures (Server_CheckWinConditions @ 0x51AD40): team score
-blocks at 0xC87CA8 (Joint Ops) / 0xC87DFC (Rebels), field n = dword at
-+4*(n+1) (CRenderState_GetFieldByIndex @ 0x52D7D0); captures = field 11.
-CTF: team 1 wins at field 11 >= [0xC8FF00], team 2 at >= [0xC8FEFC] (the
-enemy flags on the map, counted at map load).  Flagball: field 11 >= MaxScore
-[0x24D2138] (65000 = no limit).  Proven live 2026-09-23 on Flagball and CTF
-(Dale scored for Rebels -> team 2 +1; CTF goal 12 matched the game's own).
-
-Co-op AI left: the mission's unit groups, 64 x 48 bytes at 0xA33FA4
-(+4 = count when the mission loaded, EntityPool_RecountByType; +8 = alive
-now, recounted every tick by EntityPool_RecountLiveByGroup @ 0x40E8D0 - the
-same numbers the mission's own "group dead" triggers test).  Group 0 is
-ungrouped and zeroed by the game.  Live read 2026-09-23 on an AAS map: one
-group held 1 live / 0 initial (probably a player spawned after load), so only
-groups with a starting count are used, never counted above their start.
+Addresses and how each was found: WolfRAT vault, Systems/Memory Map.md.
 """
 
 from __future__ import annotations
@@ -72,8 +36,8 @@ RETRY_SECONDS = 10
 ZONE_CHAIN_VA = 0x24D1EBC
 ZONE_TEAM_OFFSET, ZONE_TIER_OFFSET = 354, 538
 MAX_ZONES = 64
-GAME_TYPE_VA = 0x24D2128     # g_GameType (SpawnPoint_FindNearestEnemyCapturePoint @ 0x4DD180)
-OBJECTIVE_IDS_VA = 0xA7628B  # byte_A7628B[1..8]
+GAME_TYPE_VA = 0x24D2128
+OBJECTIVE_IDS_VA = 0xA7628B     # ids at [1..8]
 OBJECTIVES_DONE_VA = 0xAC86F4
 MAX_OBJECTIVES = 8
 TEAM_SCORE_VA = {1: 0xC87CA8, 2: 0xC87DFC}

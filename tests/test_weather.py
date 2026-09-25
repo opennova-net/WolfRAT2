@@ -9,7 +9,7 @@ from wolfrat.weather import Addr, Weather, WeatherController, WeatherError, Weat
 
 
 class FakeServer:
-    """Sparse memory plus the ramp from Environment_UpdateWeatherTick @0x57E9B0."""
+    """Sparse memory plus the server's own weather ramp."""
 
     def __init__(self, dedicated=1, map_fog_m=1000, fingerprint=True, addon=False):
         self.cells = {}
@@ -108,7 +108,7 @@ class FakeServer:
 # ---- the arithmetic is the engine's own ----------------------------------
 
 def engine_percent(pct):
-    """0x4EDF60: shl 16, imul 0x51EB851F, sar 5, sign fix, cap 0x10000."""
+    """The engine's own integer percent conversion."""
     value = (pct << 16) & 0xFFFFFFFF
     if value & 0x80000000:
         value -= 1 << 32

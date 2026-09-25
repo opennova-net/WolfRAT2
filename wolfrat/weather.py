@@ -1,19 +1,14 @@
 """Live weather control for a Joint Operations dedicated server.
 
-How it works (traced in Jointops.exe.kong.c, 2026-09-21)
---------------------------------------------------------
-The server simulates the environment every game tick
-(``Environment_UpdateWeatherTick`` @ 0x57E9B0) from a handful of globals, and
-``NetPacket_WritePlayerState`` @ 0x4FF6B0 sends them to every client in the
-"phase 2" block of the per-player update: fog distance, time of day, quake,
-cloud speed, rain/snow amount, overcast and the rain-or-snow switch.  Clients
-copy those straight into their own globals (``NapiNPClientMsg_0x00A``).
-
-So changing the numbers *on the server* changes the weather for everybody,
-with stock clients and no client-side anything.  The mission script engine
-already owns setters for them (WAC actions ``rain``, ``snow``, ``overcast``,
-``movefog``, ``skyspeed``, ``quake`` - table @ 0x82D290); this module writes
-exactly what those setters write, from outside the process.
+How it works
+------------
+The server simulates the weather every tick and sends the numbers to every
+player: fog distance, time of day, quake, cloud speed, rain/snow amount,
+overcast and the rain-or-snow switch.  So changing them *on the server*
+changes the weather for everybody, with stock clients and nothing installed
+on the players' side.  This module writes exactly what the game's own mission
+script weather actions (``rain``, ``snow``, ``overcast``, ``movefog``,
+``skyspeed``, ``quake``) write, from outside the process.
 
 That needs WolfRAT to run on the same PC as the server.  The admin port has no
 weather command (``CMD`` reaches the key-binding parser, never the script
@@ -21,7 +16,9 @@ engine), so there is no remote route without patching the server exe.
 
 Not reachable this way: lightning.  It is not in the synced block - the engine
 broadcasts it as a net text command (``SETFLASH1``), which needs code running
-inside the server.  See the vault page "Weather Control".
+inside the server (see the server.wac add-on below).
+
+Addresses and how each was found: WolfRAT vault, Systems/Memory Map.md.
 
 This module has no Qt in it, and everything except ``ProcessMemory`` runs
 against the ``Memory`` protocol so tests use a fake.
@@ -74,14 +71,14 @@ def wind_text(speed: int) -> str:
 class Addr:
     """Globals in the retail 1.7.5.7 image (no ASLR; image base 0x400000)."""
 
-    IS_AUTHORITY = 0x00B5CC28      # g_napi_np_ctx.is_authority: this process hosts the game
+    IS_AUTHORITY = 0x00B5CC28      # non-zero: this process hosts the game
     TIME_OF_DAY = 0x026C6448       # hours << 24, keeps advancing - liveness check
     FOG_CURRENT = 0x026C681C       # metres << 16
     FOG_TARGET = 0x026C6820
     FOG_STEP = 0x026C6828
     CLOUD_SPEED = 0x026C686C
     CLOUD_SPEED_TARGET = 0x026C6870    # skyspeed << 10; sent to players as one byte
-    SKY_SPEED_MAP = 0x026C6874         # Env_SkySpeedFixed: the map's .env sky_speed << 10
+    SKY_SPEED_MAP = 0x026C6874         # the map's own sky_speed << 10
     PRECIP_CURRENT = 0x026C6880        # 0 .. 0x10000, this is what clients are sent
     PRECIP_TARGET = 0x026C6884
     PRECIP_STEP = 0x026C688C
@@ -89,25 +86,17 @@ class Addr:
     OVERCAST_TARGET = 0x026C6898
     OVERCAST_STEP = 0x026C68A0
     FOG_REFERENCE = 0x026C68A8         # the furthest the map lets anyone see
-    # What the map itself authored.  The engine's map-load "snap" (0x57D2B1..)
-    # copies exactly these three into the targets, so "clear" means these.
-    FOG_MAP = 0x026C6824               # Env_FogLevelFixed
+    # What the map itself authored ("clear" means back to these).
+    FOG_MAP = 0x026C6824
     PRECIP_MAP = 0x026C6888
     OVERCAST_MAP = 0x026C689C
     QUAKE_TICKS = 0x026C68AC
     PRECIP_IS_SNOW = 0x02C059D0        # 0 rain, 1 snow
 
-    # Lightning needs code inside the server (the flash is a broadcast net
-    # message, not a synced number).  The contract with that future patch:
-    # its per-tick cave stamps MARKER with LIGHTNING_MAGIC every tick - proof
-    # that it is present AND running - and, when MAILBOX is non-zero, clears
-    # it and broadcasts "SETFLASH1 16".  These twelve bytes are the unused
-    # tail of the .data section's last page: zero in the file, zero in the
-    # live server, referenced by no code (checked 2026-09-21).
-    # The loaded map's 616-byte BMS header (layout: OpenNova libs/mission bms.h,
-    # matched field by field against the live server 2026-09-21).
+    # The loaded map's 616-byte BMS header (OpenNova libs/mission bms.h).
     BMS_HEADER = 0x00A761D0
 
+    # Lightning handshake slots: unused .data, zero until something writes them.
     LIGHTNING_MARKER = 0x0334BF00
     LIGHTNING_VERSION = 0x0334BF04
     LIGHTNING_MAILBOX = 0x0334BF08
@@ -116,9 +105,8 @@ class Addr:
 LIGHTNING_MAGIC = 0x544C5257           # "WRLT"
 
 # The server.wac add-on.  WAC script variables are plain memory (G# lives at
-# 0xC6BA40 + 4n) and script actions flagged 0x08 - `flash`, `farflash` - are
-# broadcast to every client by the engine itself (net msg 0x23).  The add-on
-# watches G250: 1 = flash, 2 = farflash, 3 = "are you there?" -> it answers 4.
+# 0xC6BA40 + 4n).  The add-on watches G250: 1 = flash, 2 = farflash,
+# 3 = "are you there?" -> it answers 4.
 ADDON_REQUEST = 0x00C6BA40 + 4 * 250
 ADDON_FLASH, ADDON_FARFLASH, ADDON_PING, ADDON_PONG = 1, 2, 3, 4
 
@@ -143,13 +131,11 @@ endif
 """
 
 
-# Proof that the process is the build this address map was traced from: the
-# first bytes of the engine's own `rain` setter, which end in the very write
-# we imitate, plus its name in the script action table.  Every community
-# patched exe (tick rate, LAA, spawn protection...) leaves these alone.
+# Proof that the process is the build this address map belongs to.  Every
+# community patched exe (tick rate, LAA, spawn protection...) leaves these alone.
 FINGERPRINT = (
     (0x004EDF60, bytes.fromhex("8b4c2404c1e110b81f85eb51f7e9")),
-    (0x004EDFB0, bytes.fromhex("893584686c02")),    # mov [PRECIP_TARGET], esi
+    (0x004EDFB0, bytes.fromhex("893584686c02")),
     (0x0082E2E5, b"rain\x00"),
 )
 
@@ -368,7 +354,7 @@ class WeatherController:
         self._mem.write(address, struct.pack("<i", int(value)))
 
     def verify(self) -> None:
-        """Refuse anything that is not the traced build hosting a game."""
+        """Refuse anything that is not the known build hosting a game."""
         for address, expected in FINGERPRINT:
             if self._mem.read(address, len(expected)) != expected:
                 raise WeatherError(

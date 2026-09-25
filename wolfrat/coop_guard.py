@@ -3,13 +3,12 @@
 On a co-op map the other team is the bots.  Players used ``!switch`` to join
 them, kill their own side and switch back.  The admin port never says which
 game mode is running, so the mode is read from the server process on the same
-PC (``g_GameType`` @ 0x24D2128, jo_players.LocalServerPlayers.read_game_type).
-When the server is on another PC the mode is unknown and swaps are allowed; a
-co-op-only server simply turns ``!switch`` off (Dale, 2026-09-23).
+PC (jo_players.LocalServerPlayers.read_game_type).  When the server is on
+another PC the mode is unknown and swaps are allowed; a co-op-only server
+simply turns ``!switch`` off (Dale, 2026-09-23).
 
-Game type values (Jointops.exe.kong.c, GameType_FormatTypeString @ 0x4A4F90):
-co-op is ``(value & 0xFFFDFFFF) == 0x10020``.  Live read 2026-09-23 on the TAC
-server = 0x10010 (AAS); a co-op value has not been seen live yet.
+Co-op is ``(value & 0xFFFDFFFF) == 0x10020``; a co-op value has not been seen
+live yet.
 
 Every swap ends in ServerManager._swap_player_now, which calls ``check()`` -
 the safety net.  The chat commands and buttons ask ``blocks_swaps()`` first so
@@ -22,7 +21,7 @@ from typing import Callable, Optional
 
 COOP_MASK, COOP_VALUE = 0xFFFDFFFF, 0x10020
 
-# The engine's own names (GameType_FormatTypeString); the long names are ours.
+# The engine's own short names; the long names are ours.
 GAME_TYPES = {
     0x00000: "Deathmatch",
     0x00001: "King of the Hill",

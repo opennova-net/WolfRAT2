@@ -7,16 +7,17 @@ player only.  The text is fixed when the script compiles, so the lines live in
 server.wac; WolfRAT only pulls the trigger.
 
 The trigger is the game's own per-player script flags, ``pisvar(i)`` /
-``psetvar(i)`` - bytes at ``player slot + 0x188 + i`` (handlers 0x4F0BD0 /
-0x4F0CB0, i <= 16; psetvar can only set 1).  WolfRAT sets the "say" flag on
-the player's slot; the script whispers and sets the "done" flag; WolfRAT sees
-"done" and clears both.  The flags are wiped with the whole slot on every map
-change, so nothing lingers.
+``psetvar(i)`` (i <= 16; psetvar can only set 1).  WolfRAT sets the "say" flag
+on the player's slot; the script whispers and sets the "done" flag; WolfRAT
+sees "done" and clears both.  The flags are wiped with the whole slot on
+every map change, so nothing lingers.
 
 G249 is this block's "are you there?" slot (WolfRAT writes 3, the block
 answers 4), the same handshake the lightning add-on uses on G250.  Until the
 block answers on the current map - it is compiled when a map loads - and
 whenever the server is not on this PC, the caller falls back to public chat.
+
+Addresses and how each was found: WolfRAT vault, Systems/Memory Map.md.
 """
 
 from __future__ import annotations
