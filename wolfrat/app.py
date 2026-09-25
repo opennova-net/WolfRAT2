@@ -1,5 +1,5 @@
 """
-WolfRAT 2.8.3 - Modern Joint Operations Server Admin Tool
+WolfRAT 2.8.4 - Modern Joint Operations Server Admin Tool
 Replaces the original WolfRAT v0.95 (2005, MFC70)
 """
 
@@ -8148,7 +8148,7 @@ class DownloadWorker(QThread):
 
 
 class MainWindow(QMainWindow):
-    """WolfRAT 2.8.3 Main Window."""
+    """WolfRAT 2.8.4 Main Window."""
 
     def __init__(self, runtime: DesktopRuntime | None = None):
         super().__init__()
@@ -8167,7 +8167,7 @@ class MainWindow(QMainWindow):
         self._sync_led_timer = QTimer(self)
         self._sync_led_timer.setSingleShot(True)
         self._sync_led_timer.timeout.connect(self._clear_sync_led)
-        self.setWindowTitle("WolfRAT 2.8.3 - Joint Operations Server Admin")
+        self.setWindowTitle("WolfRAT 2.8.4 - Joint Operations Server Admin")
 
         # Set Window Icon
         icon_path = os.path.join(os.path.dirname(__file__), 'icon.ico')
@@ -8241,7 +8241,7 @@ class MainWindow(QMainWindow):
         self.signals.connected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.connected_signal.connect(lambda: sounds.play("connect"))
         self.signals.disconnected_signal.connect(lambda: self.set_connected(False, 'Disconnected'))
-        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.8.3 - Joint Operations Server Admin"))
+        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.8.4 - Joint Operations Server Admin"))
         self.signals.disconnected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.disconnected_signal.connect(lambda: self.server_tab.handle_disconnect_ui())
         self.signals.disconnected_signal.connect(lambda: self.mods_tab.entrance_panel.on_disconnected())
@@ -8259,9 +8259,9 @@ class MainWindow(QMainWindow):
     def _update_title(self, server_name=""):
         """Update window title with server name when connected."""
         if server_name:
-            self.setWindowTitle(f"WolfRAT 2.8.3 \u2014 {server_name}")
+            self.setWindowTitle(f"WolfRAT 2.8.4 \u2014 {server_name}")
         else:
-            self.setWindowTitle("WolfRAT 2.8.3 - Joint Operations Server Admin")
+            self.setWindowTitle("WolfRAT 2.8.4 - Joint Operations Server Admin")
 
     def _build_ui(self):
         central = QWidget()
@@ -8269,7 +8269,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(central)
 
         # Header
-        header = QLabel("WolfRAT 2.8.3")
+        header = QLabel("WolfRAT 2.8.4")
         header.setStyleSheet("font-size: 22pt; font-weight: bold; color: #e8c840; padding: 12px; letter-spacing: 4px;")
         header.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(header)
@@ -8448,7 +8448,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.mods_tab, "🛡️ Mods")
         self.tabs.addTab(self.bans_tab, "🚫 Bans")
         self.tabs.addTab(self.map_voting_tab, "🌐 Map Voting")
-        self.tabs.addTab(self.weather_tab, "⛈️ Weather")
+        self.tabs.addTab(self.weather_tab, "⛈️ Weather/Wildlife")
         self.tabs.addTab(self.web_admin_tab, "🌐 Web Admin")
 
         layout.addWidget(self.tabs)
@@ -8518,7 +8518,7 @@ class MainWindow(QMainWindow):
 
         status_bar.addSpacing(10)
 
-        ver_label = QLabel("v2.8.3 · Built by BadgerLove · FMJ Squad")
+        ver_label = QLabel("v2.8.4 · Built by BadgerLove · FMJ Squad")
         ver_label.setStyleSheet("font-size: 9pt; color: #444;")
         status_bar.addWidget(ver_label)
 
@@ -8574,7 +8574,7 @@ class MainWindow(QMainWindow):
     # ---- Auto-updater ---------------------------------------------------
 
     _VERSION_URL = "https://fmj-squad.com/version.json"
-    _CURRENT_VERSION = "2.8.3"
+    _CURRENT_VERSION = "2.8.4"
 
     @staticmethod
     def _is_newer(latest: str, current: str) -> bool:
@@ -8818,7 +8818,7 @@ def start_desktop(
 
     runtime = runtime or DesktopRuntime.production()
     app.setStyleSheet(DARK_STYLE)
-    app.setApplicationName("WolfRAT 2.8.3")
+    app.setApplicationName("WolfRAT 2.8.4")
     sounds.set_enabled(runtime.audio_enabled)
     if runtime.audio_enabled:
         sounds.initialize()
@@ -8927,7 +8927,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
         print(f"WolfRAT startup error: {error}")
         return 2
     runtime = runtime or launch.runtime
-    wire_log("=== WolfRAT 2.8.3 STARTED ===")
+    wire_log("=== WolfRAT 2.8.4 STARTED ===")
 
     # Catch-all exception handler for debugging
     import traceback
@@ -8980,7 +8980,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
 
             bstats.bstats_start(
                 "wolfrat",
-                "2.8.3",
+                "2.8.4",
                 data_dir=runtime.data_dir,
             )
         except Exception:

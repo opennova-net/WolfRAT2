@@ -19,6 +19,8 @@ from wolfrat import whisper
 from wolfrat import server_link
 from wolfrat import weather_dynamic
 from wolfrat.weather_dynamic_page import DynamicPage
+from wolfrat import wildlife
+from wolfrat.weather_wildlife_page import WildlifePage
 from wolfrat.protocol import wire_log
 from wolfrat.runtime import DesktopRuntime
 
@@ -120,7 +122,9 @@ class WeatherTab(QWidget):
             "fog_metres": 300, "fade": 25, "wind_on": False, "wind": 150,
             "dynamic": {}, "seen_maps": {},
             "linked": False,
+            "wildlife": {},
         }
+        self._sharks = wildlife.SharkKeeper()
         try:
             if self._settings_file.exists():
                 saved = json.loads(self._settings_file.read_text(encoding="utf-8"))
@@ -162,6 +166,9 @@ class WeatherTab(QWidget):
         self.dynamic_page.changed.connect(self._dynamic_changed)
         self.pages.addTab(self.dynamic_page, "Dynamic")
         self._dynamic_was_on = self.dynamic_page.config().enabled
+        self.wildlife_page = WildlifePage(self._settings.get("wildlife"))
+        self.wildlife_page.changed.connect(self._wildlife_changed)
+        self.pages.addTab(self.wildlife_page, "🦈 Wildlife")
 
         # Some servers sit on a 1024x768 desktop: each column scrolls on its
         # own instead of squeezing its buttons and cutting the help text off.
@@ -367,6 +374,7 @@ class WeatherTab(QWidget):
     def _set_available(self, available: bool):
         for widget in self._action_widgets:
             widget.setEnabled(available)
+        self.wildlife_page.set_available(available)
 
     # ------------------------------------------------------------ plumbing
     def log(self, message: str):
@@ -391,6 +399,7 @@ class WeatherTab(QWidget):
             "wind": self.wind_slider.value(),
             "dynamic": self.dynamic_page.config().to_json(),
             "seen_maps": self.dynamic_page.seen(),
+            "wildlife": self.wildlife_page.config(),
         })
         try:
             self._settings_file.write_text(json.dumps(self._settings, indent=2), encoding="utf-8")
@@ -429,6 +438,7 @@ class WeatherTab(QWidget):
         self._set_available(False)
         self.status_lbl.setText("⚪ " + text)
         self.sky_lbl.setText("")
+        self.wildlife_page.set_status("⚪ " + text)
         if text != self._last_problem:
             self._last_problem = text
             wire_log(f"[WEATHER] unavailable: {text}")
@@ -445,7 +455,8 @@ class WeatherTab(QWidget):
         # linked, the add-on check needs it too.
         controller = self._ensure(
             writable=bool(self._writable or self._schedule.active is not None
-                          or self.dynamic_page.config().enabled or self._settings.get("linked"))
+                          or self.dynamic_page.config().enabled or self._settings.get("linked")
+                          or self.wildlife_page.enabled())
         )
         if controller is None:
             return
@@ -482,6 +493,40 @@ class WeatherTab(QWidget):
             tail = "until cleared" if left is None else f"{left // 60}:{left % 60:02d} left"
             self.active_lbl.setText(f"Holding: {active.describe()}  -  {tail}")
         self._dynamic_tick(controller, reading)
+        self._wildlife_tick(controller)
+
+    # ------------------------------------------------------------ wildlife
+    def _wildlife_tick(self, controller):
+        """Keep the sharks hunting.  Never raises: a wildlife problem must not
+        take the weather down with it."""
+        try:
+            map_name, _players, settled = self._server_context()
+            status = self._sharks.tick(
+                controller._mem,
+                enabled=self.wildlife_page.enabled(),
+                attack_m=self.wildlife_page.attack_m(),
+                writable=self._writable and settled,     # never write into a loading server
+                map_name=map_name,
+                linked=True,                             # a found server is enough for the sharks
+            )
+        except Exception as exc:                          # pragma: no cover - belt and braces
+            self.wildlife_page.set_status(f"⚪ Wildlife check failed: {exc}")
+            wire_log(f"[WILDLIFE] {exc}")
+            return
+        if status.reapplied != getattr(self, "_sharks_logged", 0):
+            self._sharks_logged = status.reapplied
+            self.log(f"Sharks: {len(status.sharks)} set to hunt "
+                     f"(hostile, {self.wildlife_page.attack_m()} m) on {map_name or 'this map'}.")
+        self.wildlife_page.set_status(status.text)
+
+    def _wildlife_changed(self):
+        self._save()
+        config = self.wildlife_page.config()
+        self._sharks.reset()
+        self._sharks_logged = 0
+        self.log("Hunting sharks switched " + ("on" if config["enabled"] else "off")
+                 + f" (attack distance {config['attack_m']} m).")
+        self._poll()
 
     # ------------------------------------------------------------- dynamic
     def _server_context(self) -> tuple[Optional[str], int, bool]:
