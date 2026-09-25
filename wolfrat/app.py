@@ -1,5 +1,5 @@
 """
-WolfRAT 2.8.4 - Modern Joint Operations Server Admin Tool
+WolfRAT 2.8.5 - Modern Joint Operations Server Admin Tool
 Replaces the original WolfRAT v0.95 (2005, MFC70)
 """
 
@@ -5988,24 +5988,19 @@ class ModsTab(QWidget):
             return
 
         # If it's a ! command but not recognized, tell them
-        valid_commands = {'!warn', '!kick', '!ban', '!swap', '!kill', '!next', '!map', '!add', '!remove', '!1', '!2', '!3', '!startvote', '!mixteams', '!balanceteams', '!time', '!gametime', *weather.CHAT_COMMANDS}
+        valid_commands = {'!warn', '!kick', '!ban', '!swap', '!kill', '!next', '!map', '!add', '!remove', '!1', '!2', '!3', '!4', '!5', '!startvote', '!mixteams', '!balanceteams', '!time', '!gametime', *weather.CHAT_COMMANDS}
         if cmd not in valid_commands:
             self._reply_privately(
                 sender, whisper.UNKNOWN, f"Unknown command: {cmd}", "Send unknown command response"
             )
             return
 
-        # Map voting commands (!1, !2, !3) - any player can vote
-        if cmd in ('!1', '!2', '!3'):
-            try:
-                map_tab = getattr(self.server, '_map_voting_tab', None)
-                if map_tab:
-                    map_tab.on_vote(sender, int(cmd[1:]))
-                    wire_log(f"[VOTE] Forwarded {cmd} from {sender}")
-                else:
-                    wire_log("[VOTE] No map_voting_tab found")
-            except Exception as e:
-                wire_log(f"[VOTE] Error forwarding vote: {e}")
+        # Map votes (!1 .. !5) are counted by the Map Voting tab's own raw-chat
+        # listener.  They are only listed in valid_commands so a voter is not
+        # whispered "Unknown command".  Do NOT forward them from here: this
+        # path lower-cases the sender, and forwarding a second copy under a
+        # different key is exactly what double-counted every vote up to v2.8.4.
+        if cmd in ('!1', '!2', '!3', '!4', '!5'):
             return
 
         # All other commands require mod status...
@@ -7582,16 +7577,30 @@ class MapVotingTab(QWidget):
             pass
 
     def on_vote(self, sender, opt):
-        """Process a single vote from a player (!1, !2, !3)."""
+        """Record one player's vote (!1 .. !5).
+
+        This is the ONLY place a vote is written.  Every feed (raw chat, parsed
+        chat, anything added later) must come through here so the "already
+        voted" guard is checked once, on one canonical key.  The key is the
+        lower-cased name: v2.8.4 and earlier counted every vote twice because
+        the Mods tab forwarded ``fmj-badgerlove`` while the raw-chat listener
+        recorded ``FMJ-BadgerLove`` - two keys, one player.
+        """
         if not self._vote_active:
             return
-        if not sender or sender == 'Server':
+        sender = (sender or '').strip()
+        if not sender or sender.lower() == 'server':
             return
-        if sender in self._votes:
-            return  # already voted
+        try:
+            opt = int(opt)
+        except (TypeError, ValueError):
+            return
         if opt < 1 or opt > len(self._map_choices):
             return
-        self._votes[sender] = opt
+        key = sender.lower()
+        if key in self._votes:
+            return  # already voted
+        self._votes[key] = opt
         self.log(f"Vote recorded: {sender} -> {opt}")
 
     def on_chat(self, chat_messages):
@@ -7610,11 +7619,7 @@ class MapVotingTab(QWidget):
                     continue
 
                 if text in ['!1', '!2', '!3', '!4', '!5']:
-                    if sender not in self._votes:
-                        opt = int(text[1:])
-                        if opt <= len(self._map_choices):
-                            self._votes[sender] = opt
-                            self.log(f"Vote recorded: {sender} -> {opt}")
+                    self.on_vote(sender, int(text[1:]))
             except Exception:
                 continue
 
@@ -8148,7 +8153,7 @@ class DownloadWorker(QThread):
 
 
 class MainWindow(QMainWindow):
-    """WolfRAT 2.8.4 Main Window."""
+    """WolfRAT 2.8.5 Main Window."""
 
     def __init__(self, runtime: DesktopRuntime | None = None):
         super().__init__()
@@ -8167,7 +8172,7 @@ class MainWindow(QMainWindow):
         self._sync_led_timer = QTimer(self)
         self._sync_led_timer.setSingleShot(True)
         self._sync_led_timer.timeout.connect(self._clear_sync_led)
-        self.setWindowTitle("WolfRAT 2.8.4 - Joint Operations Server Admin")
+        self.setWindowTitle("WolfRAT 2.8.5 - Joint Operations Server Admin")
 
         # Set Window Icon
         icon_path = os.path.join(os.path.dirname(__file__), 'icon.ico')
@@ -8241,7 +8246,7 @@ class MainWindow(QMainWindow):
         self.signals.connected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.connected_signal.connect(lambda: sounds.play("connect"))
         self.signals.disconnected_signal.connect(lambda: self.set_connected(False, 'Disconnected'))
-        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.8.4 - Joint Operations Server Admin"))
+        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.8.5 - Joint Operations Server Admin"))
         self.signals.disconnected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.disconnected_signal.connect(lambda: self.server_tab.handle_disconnect_ui())
         self.signals.disconnected_signal.connect(lambda: self.mods_tab.entrance_panel.on_disconnected())
@@ -8259,9 +8264,9 @@ class MainWindow(QMainWindow):
     def _update_title(self, server_name=""):
         """Update window title with server name when connected."""
         if server_name:
-            self.setWindowTitle(f"WolfRAT 2.8.4 \u2014 {server_name}")
+            self.setWindowTitle(f"WolfRAT 2.8.5 \u2014 {server_name}")
         else:
-            self.setWindowTitle("WolfRAT 2.8.4 - Joint Operations Server Admin")
+            self.setWindowTitle("WolfRAT 2.8.5 - Joint Operations Server Admin")
 
     def _build_ui(self):
         central = QWidget()
@@ -8269,7 +8274,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(central)
 
         # Header
-        header = QLabel("WolfRAT 2.8.4")
+        header = QLabel("WolfRAT 2.8.5")
         header.setStyleSheet("font-size: 22pt; font-weight: bold; color: #e8c840; padding: 12px; letter-spacing: 4px;")
         header.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(header)
@@ -8518,7 +8523,7 @@ class MainWindow(QMainWindow):
 
         status_bar.addSpacing(10)
 
-        ver_label = QLabel("v2.8.4 · Built by BadgerLove · FMJ Squad")
+        ver_label = QLabel("v2.8.5 · Built by BadgerLove · FMJ Squad")
         ver_label.setStyleSheet("font-size: 9pt; color: #444;")
         status_bar.addWidget(ver_label)
 
@@ -8574,7 +8579,7 @@ class MainWindow(QMainWindow):
     # ---- Auto-updater ---------------------------------------------------
 
     _VERSION_URL = "https://fmj-squad.com/version.json"
-    _CURRENT_VERSION = "2.8.4"
+    _CURRENT_VERSION = "2.8.5"
 
     @staticmethod
     def _is_newer(latest: str, current: str) -> bool:
@@ -8818,7 +8823,7 @@ def start_desktop(
 
     runtime = runtime or DesktopRuntime.production()
     app.setStyleSheet(DARK_STYLE)
-    app.setApplicationName("WolfRAT 2.8.4")
+    app.setApplicationName("WolfRAT 2.8.5")
     sounds.set_enabled(runtime.audio_enabled)
     if runtime.audio_enabled:
         sounds.initialize()
@@ -8927,7 +8932,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
         print(f"WolfRAT startup error: {error}")
         return 2
     runtime = runtime or launch.runtime
-    wire_log("=== WolfRAT 2.8.4 STARTED ===")
+    wire_log("=== WolfRAT 2.8.5 STARTED ===")
 
     # Catch-all exception handler for debugging
     import traceback
@@ -8980,7 +8985,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
 
             bstats.bstats_start(
                 "wolfrat",
-                "2.8.4",
+                "2.8.5",
                 data_dir=runtime.data_dir,
             )
         except Exception:
